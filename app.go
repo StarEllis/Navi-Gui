@@ -1522,6 +1522,10 @@ func (a *App) syncMediaFromNFO(mediaID string, nfoPath string) {
 	}
 	if err := a.db.Model(&model.Media{}).Where("id = ?", mediaID).Updates(updates).Error; err != nil {
 		a.logger.Warnf("sync media from nfo update failed: %v", err)
+		return
+	}
+	if a.scanner != nil {
+		a.scanner.SyncActorsForMedia(&updated)
 	}
 }
 
@@ -1617,16 +1621,13 @@ func (a *App) resolveMediaActors(media *model.Media) ([]model.MediaActor, string
 		}
 	}
 
-	if mediaPeople, err := a.repos.MediaPerson.ListByMediaID(media.ID); err == nil {
-		for idx, mediaPerson := range mediaPeople {
-			if !strings.EqualFold(mediaPerson.Role, "actor") {
-				continue
+	var mediaPeople []model.MediaPerson
+	if rows, err := a.repos.MediaPerson.ListByMediaID(media.ID); err == nil {
+		mediaPeople = rows
+		for _, mediaPerson := range mediaPeople {
+			if strings.EqualFold(mediaPerson.Role, "actor") && mediaPerson.PersonID != "" {
+				linkByPersonID[mediaPerson.PersonID] = true
 			}
-			sortOrder := mediaPerson.SortOrder
-			if sortOrder == 0 {
-				sortOrder = idx
-			}
-			register(mediaPerson.Person.Name, mediaPerson.PersonID, sortOrder, 1)
 		}
 	}
 
@@ -1637,6 +1638,7 @@ func (a *App) resolveMediaActors(media *model.Media) ([]model.MediaActor, string
 	} else {
 		nfoPath = nfoService.FindNFOForMedia(media.FilePath)
 	}
+	hasNFOActors := false
 	if nfoPath != "" {
 		if nfoActors, _, err := nfoService.GetActorsFromNFO(nfoPath); err == nil {
 			for idx, nfoActor := range nfoActors {
@@ -1644,8 +1646,24 @@ func (a *App) resolveMediaActors(media *model.Media) ([]model.MediaActor, string
 				if sortOrder == 0 {
 					sortOrder = idx
 				}
+				before := len(resolved)
 				register(nfoActor.Name, "", sortOrder, 0)
+				if len(resolved) > before {
+					hasNFOActors = true
+				}
 			}
+		}
+	}
+	if !hasNFOActors {
+		for idx, mediaPerson := range mediaPeople {
+			if !strings.EqualFold(mediaPerson.Role, "actor") {
+				continue
+			}
+			sortOrder := mediaPerson.SortOrder
+			if sortOrder == 0 {
+				sortOrder = idx
+			}
+			register(mediaPerson.Person.Name, mediaPerson.PersonID, sortOrder, 1)
 		}
 	}
 

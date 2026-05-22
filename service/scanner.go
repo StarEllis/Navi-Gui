@@ -979,6 +979,23 @@ func updateMediaSyncFingerprints(media *model.Media, mediaPath string, info os.F
 	media.SidecarFingerprint = buildSidecarFingerprint(mediaPath, sidecars)
 }
 
+func shouldRefreshExistingMovieMedia(options ScanOptions, signature repository.MediaFileSignature, mediaPath string, info os.FileInfo, sidecars *directorySidecarFiles) (bool, bool) {
+	currentVideoFingerprint := buildVideoFingerprintFromInfo(info)
+	currentSidecarFingerprint := buildSidecarFingerprint(mediaPath, sidecars)
+	storedVideoFingerprint := buildVideoFingerprintFromStored(signature)
+	storedSidecarFingerprint := strings.TrimSpace(signature.SidecarFingerprint)
+
+	videoChanged := currentVideoFingerprint != storedVideoFingerprint
+	sidecarChanged := currentSidecarFingerprint != storedSidecarFingerprint
+	if !videoChanged && !sidecarChanged {
+		return false, false
+	}
+	if options.Incremental && !sidecarChanged {
+		return false, false
+	}
+	return true, videoChanged
+}
+
 /*
 func (s *ScannerService) ScanLibraryWithOptions(library *model.Library, options ScanOptions) (int, error) {
 	s.logger.Infof("寮€濮嬫壂鎻忓獟浣撳簱: %s (%s), mode=%s", library.Name, library.Path, options.Mode)
@@ -1306,7 +1323,7 @@ func (s *ScannerService) completeMediaMetadataByID(mediaID string) error {
 	}
 
 	if media.MediaType == "movie" {
-		s.persistActorsForMedia(media)
+		s.SyncActorsForMedia(media)
 	}
 	s.broadcastMediaMetadataEvent(media.ID, media.LibraryID, media.MetadataPhase, "metadata completed")
 	return nil
@@ -1490,7 +1507,8 @@ func (s *ScannerService) updateExistingEpisodeRecord(existing *model.Media, seri
 	return needUpdate
 }
 
-func (s *ScannerService) persistActorsForMedia(media *model.Media) {
+// SyncActorsForMedia replaces a movie's actor relations with the actors from its local NFO.
+func (s *ScannerService) SyncActorsForMedia(media *model.Media) {
 	if media == nil || media.ID == "" || media.FilePath == "" || s.personRepo == nil || s.mediaPersonRepo == nil {
 		return
 	}
@@ -1947,7 +1965,7 @@ func (s *ScannerService) scanMovieLibrary(library *model.Library) (int, error) {
 				s.logger.Warnf("保存媒体失败: %s, 错误: %v", pm.path, err)
 				continue
 			}
-			s.persistActorsForMedia(pm.media)
+			s.SyncActorsForMedia(pm.media)
 			count++
 			s.logger.Infof("发现电影: %s", pm.media.Title)
 			s.broadcastScanEvent(EventScanProgress, &ScanProgressData{
@@ -1990,7 +2008,8 @@ func (s *ScannerService) refreshExistingMovieMedia(library *model.Library, exist
 		return false
 	}
 
-	s.persistActorsForMedia(existing)
+	s.SyncActorsForMedia(existing)
+	s.broadcastMediaMetadataEvent(existing.ID, existing.LibraryID, existing.MetadataPhase, "metadata updated")
 	return true
 }
 
@@ -2175,19 +2194,9 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 
 		if existingSignatures != nil {
 			if signature, ok := existingSignatures[mediaPath]; ok {
-				if options.Incremental {
-					skippedExist++
-					s.advanceScanProgress(library, progressMessage)
-					continue
-				}
-
 				sidecars := getSidecars(mediaPath)
-				currentVideoFingerprint := buildVideoFingerprintFromInfo(info)
-				currentSidecarFingerprint := buildSidecarFingerprint(mediaPath, sidecars)
-				storedVideoFingerprint := buildVideoFingerprintFromStored(signature)
-				storedSidecarFingerprint := strings.TrimSpace(signature.SidecarFingerprint)
-
-				if currentVideoFingerprint == storedVideoFingerprint && currentSidecarFingerprint == storedSidecarFingerprint {
+				shouldRefresh, refreshVideo := shouldRefreshExistingMovieMedia(options, signature, mediaPath, info, sidecars)
+				if !shouldRefresh {
 					skippedExist++
 					s.advanceScanProgress(library, progressMessage)
 					continue
@@ -2200,7 +2209,7 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 					continue
 				}
 
-				if s.refreshExistingMovieMedia(library, existing, mediaPath, info, sidecars, currentVideoFingerprint != storedVideoFingerprint) {
+				if s.refreshExistingMovieMedia(library, existing, mediaPath, info, sidecars, refreshVideo) {
 					skippedUpdated++
 				}
 				s.advanceScanProgress(library, progressMessage)

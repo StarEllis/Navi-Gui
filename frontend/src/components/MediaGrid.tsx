@@ -207,10 +207,14 @@ const MediaGrid: React.FC<MediaGridProps> = ({
 }) => {
     const filterType = filter?.type || '';
     const filterValue = filter?.value || '';
-    const baseCacheKey = getMediaListBaseCacheKey(libraryId, sortField, sortOrder, filterType, filterValue);
-    const initialCache = getCachedMediaListEntry(baseCacheKey);
-    const initialSearchableItems = createSearchableMediaItems(initialCache?.items || []);
     const deferredKeyword = useDeferredValue(keyword);
+    const baseCacheKey = getMediaListBaseCacheKey(libraryId, sortField, sortOrder, filterType, filterValue);
+    const activeKeyword = deferredKeyword.trim();
+    const activeCacheKey = activeKeyword
+        ? getMediaListCacheKey(libraryId, activeKeyword, sortField, sortOrder, filterType, filterValue)
+        : baseCacheKey;
+    const initialCache = getCachedMediaListEntry(activeCacheKey);
+    const initialSearchableItems = createSearchableMediaItems(initialCache?.items || []);
     const containerRef = useRef<HTMLDivElement>(null);
     const latestScrollTopRef = useRef(0);
     const pendingRestoreRef = useRef<number | null>(initialScrollTop);
@@ -352,7 +356,7 @@ const MediaGrid: React.FC<MediaGridProps> = ({
     ]);
 
     useEffect(() => {
-        const cachedEntry = getCachedMediaListEntry(baseCacheKey);
+        const cachedEntry = getCachedMediaListEntry(activeCacheKey);
         const requestToken = requestTokenRef.current + 1;
         requestTokenRef.current = requestToken;
 
@@ -364,7 +368,7 @@ const MediaGrid: React.FC<MediaGridProps> = ({
             setIsLoading(true);
         }
 
-        void GetMediaList(libraryId, 1, 0, sortField, sortOrder, '', filterType, filterValue)
+        void GetMediaList(libraryId, 1, 0, sortField, sortOrder, activeKeyword, filterType, filterValue)
             .then((res: any) => {
                 if (requestTokenRef.current !== requestToken) {
                     return;
@@ -372,7 +376,7 @@ const MediaGrid: React.FC<MediaGridProps> = ({
 
                 const nextItems = Array.isArray(res?.items) ? res.items : [];
                 const nextTotal = Number(res?.total || 0);
-                persistMediaListCache(baseCacheKey, {
+                persistMediaListCache(activeCacheKey, {
                     items: nextItems,
                     total: nextTotal,
                 });
@@ -389,7 +393,7 @@ const MediaGrid: React.FC<MediaGridProps> = ({
         return () => {
             requestTokenRef.current += 1;
         };
-    }, [baseCacheKey, filterType, filterValue, libraryId, refreshVersion, sortField, sortOrder]);
+    }, [activeCacheKey, activeKeyword, filterType, filterValue, libraryId, refreshVersion, sortField, sortOrder]);
 
     useEffect(() => {
         const nextItems = filterSearchableMediaItems(baseItems, deferredKeyword);

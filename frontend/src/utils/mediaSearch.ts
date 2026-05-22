@@ -30,12 +30,8 @@ export const buildMediaSearchText = (media: any) => {
         return '';
     }
 
-    const explicitSearchText = typeof media.search_text === 'string' ? media.search_text.trim() : '';
-    if (explicitSearchText) {
-        return explicitSearchText;
-    }
-
-    return [
+    const parts = [
+        typeof media.search_text === 'string' ? media.search_text : '',
         media.title,
         media.orig_title,
         media.code,
@@ -49,7 +45,9 @@ export const buildMediaSearchText = (media: any) => {
         typeof media.year === 'number' && media.year > 0 ? String(media.year) : '',
     ]
         .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
-        .join('\n');
+        .map((value) => value.trim());
+
+    return Array.from(new Set(parts)).join('\n');
 };
 
 export const buildMediaSearchIndex = (media: any) => normalizeSearchTerm(buildMediaSearchText(media));
