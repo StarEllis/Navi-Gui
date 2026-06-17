@@ -687,22 +687,43 @@ func (a *App) handleJellyfinDisplayPreferences() http.HandlerFunc {
 		if clientName == "" {
 			clientName = "Infuse"
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"Id":                 displayPreferencesID,
-			"Client":             clientName,
-			"ViewType":           "Primary",
-			"SortBy":             "SortName",
-			"IndexBy":            "None",
-			"RememberIndexing":   false,
-			"PrimaryImageHeight": 360,
-			"PrimaryImageWidth":  240,
-			"CustomPrefs":        map[string]any{},
-			"ScrollDirection":    "Horizontal",
-			"ShowBackdrop":       true,
-			"RememberSorting":    false,
-			"SortOrder":          "Ascending",
-			"ShowSidebar":        true,
-		})
+		writeJSON(w, http.StatusOK, newJellyfinDisplayPreferences(displayPreferencesID, clientName))
+	}
+}
+
+type jellyfinDisplayPreferences struct {
+	ID                 string         `json:"Id"`
+	Client             string         `json:"Client"`
+	ViewType           string         `json:"ViewType"`
+	SortBy             string         `json:"SortBy"`
+	IndexBy            string         `json:"IndexBy"`
+	RememberIndexing   bool           `json:"RememberIndexing"`
+	PrimaryImageHeight int            `json:"PrimaryImageHeight"`
+	PrimaryImageWidth  int            `json:"PrimaryImageWidth"`
+	CustomPrefs        map[string]any `json:"CustomPrefs"`
+	ScrollDirection    string         `json:"ScrollDirection"`
+	ShowBackdrop       bool           `json:"ShowBackdrop"`
+	RememberSorting    bool           `json:"RememberSorting"`
+	SortOrder          string         `json:"SortOrder"`
+	ShowSidebar        bool           `json:"ShowSidebar"`
+}
+
+func newJellyfinDisplayPreferences(displayPreferencesID string, clientName string) jellyfinDisplayPreferences {
+	return jellyfinDisplayPreferences{
+		ID:                 displayPreferencesID,
+		Client:             clientName,
+		ViewType:           "Primary",
+		SortBy:             "SortName",
+		IndexBy:            "None",
+		RememberIndexing:   false,
+		PrimaryImageHeight: 360,
+		PrimaryImageWidth:  240,
+		CustomPrefs:        map[string]any{},
+		ScrollDirection:    "Horizontal",
+		ShowBackdrop:       true,
+		RememberSorting:    false,
+		SortOrder:          "Ascending",
+		ShowSidebar:        true,
 	}
 }
 

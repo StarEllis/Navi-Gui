@@ -9,11 +9,18 @@ import {
     Search,
     Shuffle,
 } from 'lucide-react';
-import { WindowToggleMaximise } from '../../wailsjs/runtime/runtime';
+import { ClipboardGetText, ClipboardSetText, WindowToggleMaximise } from '../../wailsjs/runtime/runtime';
 
 const CLEAR_FILTER_LABEL = '\u6e05\u9664\u7b5b\u9009';
 
 type MenuType = 'scan' | 'sort' | null;
+type SearchEditAction = 'cut' | 'copy' | 'paste' | 'selectAll' | 'undo' | 'redo';
+type SearchContextMenuState = {
+    x: number;
+    y: number;
+    hasSelection: boolean;
+    hasValue: boolean;
+} | null;
 
 type SortOption = {
     field: string;
@@ -54,8 +61,54 @@ const SCAN_OPTIONS = [
     { mode: 'incremental', label: '新增刷新' },
 ];
 
+const SEARCH_CONTEXT_MENU_WIDTH = 196;
+const SEARCH_CONTEXT_MENU_HEIGHT = 252;
+const SEARCH_CONTEXT_MENU_MARGIN = 8;
+
+const SEARCH_EDIT_ACTIONS: Array<{ action: SearchEditAction; label: string; shortcut: string }> = [
+    { action: 'cut', label: '\u526a\u5207', shortcut: 'Ctrl+X' },
+    { action: 'copy', label: '\u590d\u5236', shortcut: 'Ctrl+C' },
+    { action: 'paste', label: '\u7c98\u8d34', shortcut: 'Ctrl+V' },
+    { action: 'selectAll', label: '\u5168\u9009', shortcut: 'Ctrl+A' },
+    { action: 'undo', label: '\u64a4\u9500', shortcut: 'Ctrl+Z' },
+    { action: 'redo', label: '\u91cd\u505a', shortcut: 'Ctrl+Y' },
+];
+
 const getSortLabel = (field: string, sortOptions: SortOption[]) => {
     return sortOptions.find((option) => option.field === field)?.label || sortOptions[0]?.label || '加入日期';
+};
+
+const getClampedSearchMenuPosition = (x: number, y: number) => {
+    const maxX = Math.max(SEARCH_CONTEXT_MENU_MARGIN, window.innerWidth - SEARCH_CONTEXT_MENU_WIDTH - SEARCH_CONTEXT_MENU_MARGIN);
+    const maxY = Math.max(SEARCH_CONTEXT_MENU_MARGIN, window.innerHeight - SEARCH_CONTEXT_MENU_HEIGHT - SEARCH_CONTEXT_MENU_MARGIN);
+
+    return {
+        x: Math.max(SEARCH_CONTEXT_MENU_MARGIN, Math.min(x, maxX)),
+        y: Math.max(SEARCH_CONTEXT_MENU_MARGIN, Math.min(y, maxY)),
+    };
+};
+
+const getInputSelection = (input: HTMLInputElement) => {
+    const start = input.selectionStart ?? input.value.length;
+    const end = input.selectionEnd ?? start;
+
+    return { start, end };
+};
+
+const readClipboardText = async () => {
+    try {
+        return await ClipboardGetText();
+    } catch {
+        return '';
+    }
+};
+
+const writeClipboardText = async (text: string) => {
+    try {
+        return await ClipboardSetText(text);
+    } catch {
+        return false;
+    }
 };
 
 const shouldIgnoreHeaderDoubleClick = (target: EventTarget | null) => {
@@ -92,13 +145,21 @@ const TopBar: React.FC<TopBarProps> = ({
 }) => {
     const [openMenu, setOpenMenu] = useState<MenuType>(null);
     const [confirmScanMode, setConfirmScanMode] = useState<'overwrite' | null>(null);
+    const [searchContextMenu, setSearchContextMenu] = useState<SearchContextMenuState>(null);
     const menuRootRef = useRef<HTMLDivElement | null>(null);
+    const searchContextMenuRef = useRef<HTMLDivElement | null>(null);
     const searchInputRef = useRef<HTMLInputElement | null>(null);
 
     useEffect(() => {
         const handlePointerDown = (event: MouseEvent) => {
-            if (!menuRootRef.current?.contains(event.target as Node)) {
+            const target = event.target as Node;
+
+            if (!menuRootRef.current?.contains(target)) {
                 setOpenMenu(null);
+            }
+
+            if (!searchContextMenuRef.current?.contains(target) && target !== searchInputRef.current) {
+                setSearchContextMenu(null);
             }
         };
 
@@ -106,6 +167,7 @@ const TopBar: React.FC<TopBarProps> = ({
             if (event.key === 'Escape') {
                 setOpenMenu(null);
                 setConfirmScanMode(null);
+                setSearchContextMenu(null);
             }
         };
 
@@ -126,6 +188,7 @@ const TopBar: React.FC<TopBarProps> = ({
 
     const handleScanModeClick = (mode: string) => {
         setOpenMenu(null);
+        setSearchContextMenu(null);
         if (mode === 'overwrite') {
             setConfirmScanMode('overwrite');
             return;
@@ -139,6 +202,130 @@ const TopBar: React.FC<TopBarProps> = ({
         }
 
         WindowToggleMaximise();
+    };
+
+    const restoreSearchSelection = (input: HTMLInputElement, start: number, end = start) => {
+        window.requestAnimationFrame(() => {
+            input.focus();
+            input.setSelectionRange(start, end);
+        });
+    };
+
+    const updateSearchInputValue = (input: HTMLInputElement, nextValue: string, selectionStart: number, selectionEnd = selectionStart) => {
+        onSearch(nextValue);
+        restoreSearchSelection(input, selectionStart, selectionEnd);
+    };
+
+    const syncSearchValueFromInput = (input: HTMLInputElement) => {
+        const { start, end } = getInputSelection(input);
+        onSearch(input.value);
+        restoreSearchSelection(input, start, end);
+    };
+
+    const openSearchContextMenuAt = (x: number, y: number) => {
+        const input = searchInputRef.current;
+        if (!input || searchDisabled) {
+            return;
+        }
+
+        const { start, end } = getInputSelection(input);
+        const position = getClampedSearchMenuPosition(x, y);
+
+        setOpenMenu(null);
+        setSearchContextMenu({
+            ...position,
+            hasSelection: start !== end,
+            hasValue: input.value.length > 0,
+        });
+    };
+
+    const handleSearchContextMenu = (event: React.MouseEvent<HTMLInputElement>) => {
+        if (searchDisabled) {
+            return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+        event.currentTarget.focus();
+        openSearchContextMenuAt(event.clientX, event.clientY);
+    };
+
+    const handleSearchKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+        const isKeyboardMenuKey = event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10');
+        if (searchDisabled || !isKeyboardMenuKey) {
+            return;
+        }
+
+        event.preventDefault();
+        const rect = event.currentTarget.getBoundingClientRect();
+        openSearchContextMenuAt(rect.left + 18, rect.bottom + 6);
+    };
+
+    const handleSearchEditAction = async (action: SearchEditAction) => {
+        const input = searchInputRef.current;
+        if (!input || searchDisabled) {
+            return;
+        }
+
+        input.focus();
+        setSearchContextMenu(null);
+
+        const { start, end } = getInputSelection(input);
+        const selectedText = input.value.slice(start, end);
+
+        if (action === 'copy') {
+            if (selectedText) {
+                await writeClipboardText(selectedText);
+            }
+            return;
+        }
+
+        if (action === 'cut') {
+            if (!selectedText) {
+                return;
+            }
+
+            const copied = await writeClipboardText(selectedText);
+            if (copied) {
+                input.focus();
+                input.setSelectionRange(start, end);
+                const beforeValue = input.value;
+                const deleted = document.execCommand('delete');
+                if (deleted || input.value !== beforeValue) {
+                    syncSearchValueFromInput(input);
+                } else {
+                    updateSearchInputValue(input, `${input.value.slice(0, start)}${input.value.slice(end)}`, start);
+                }
+            }
+            return;
+        }
+
+        if (action === 'paste') {
+            const clipboardText = await readClipboardText();
+            if (!clipboardText) {
+                return;
+            }
+
+            input.focus();
+            input.setSelectionRange(start, end);
+            const beforeValue = input.value;
+            const inserted = document.execCommand('insertText', false, clipboardText);
+            if (inserted || input.value !== beforeValue) {
+                syncSearchValueFromInput(input);
+            } else {
+                const nextValue = `${input.value.slice(0, start)}${clipboardText}${input.value.slice(end)}`;
+                updateSearchInputValue(input, nextValue, start + clipboardText.length);
+            }
+            return;
+        }
+
+        if (action === 'selectAll') {
+            input.select();
+            return;
+        }
+
+        document.execCommand(action === 'undo' ? 'undo' : 'redo');
+        window.requestAnimationFrame(() => syncSearchValueFromInput(input));
     };
 
     const countLabel = `${mediaCount.toLocaleString()} 个项目`;
@@ -171,7 +358,12 @@ const TopBar: React.FC<TopBarProps> = ({
                                     className="workspace-search" ref={searchInputRef}
                                     placeholder="搜索媒体、演员、标签"
                                     value={searchValue}
-                                    onChange={(event) => onSearch(event.target.value)}
+                                    onChange={(event) => {
+                                        setSearchContextMenu(null);
+                                        onSearch(event.target.value);
+                                    }}
+                                    onContextMenu={handleSearchContextMenu}
+                                    onKeyDown={handleSearchKeyDown}
                                     disabled={searchDisabled}
                                 />
                                 {showClearAction && (
@@ -209,7 +401,10 @@ const TopBar: React.FC<TopBarProps> = ({
                                 <button
                                     type="button"
                                     className="workspace-action-btn"
-                                    onClick={() => setOpenMenu((prev) => (prev === 'sort' ? null : 'sort'))}
+                                    onClick={() => {
+                                        setSearchContextMenu(null);
+                                        setOpenMenu((prev) => (prev === 'sort' ? null : 'sort'));
+                                    }}
                                 >
                                     {sortOrder === 'asc' ? <ArrowUp size={15} /> : <ArrowDown size={15} />}
                                     <span>{`按${currentSortLabel}排序`}</span>
@@ -248,7 +443,10 @@ const TopBar: React.FC<TopBarProps> = ({
                                 <button
                                     type="button"
                                     className="workspace-action-btn compact"
-                                    onClick={() => setOpenMenu((prev) => (prev === 'scan' ? null : 'scan'))}
+                                    onClick={() => {
+                                        setSearchContextMenu(null);
+                                        setOpenMenu((prev) => (prev === 'scan' ? null : 'scan'));
+                                    }}
                                 >
                                     <RefreshCw size={15} />
                                     <span>刷新</span>
@@ -285,6 +483,39 @@ const TopBar: React.FC<TopBarProps> = ({
                     </div>
                 </div>
             </div>
+
+            {searchContextMenu && (
+                <div
+                    ref={searchContextMenuRef}
+                    className="workspace-search-context-menu"
+                    style={{ left: searchContextMenu.x, top: searchContextMenu.y }}
+                    role="menu"
+                    aria-label="\u641c\u7d22\u7f16\u8f91\u83dc\u5355"
+                    onContextMenu={(event) => event.preventDefault()}
+                >
+                    {SEARCH_EDIT_ACTIONS.map((item) => {
+                        const disabled =
+                            searchDisabled ||
+                            ((item.action === 'cut' || item.action === 'copy') && !searchContextMenu.hasSelection) ||
+                            (item.action === 'selectAll' && !searchContextMenu.hasValue);
+
+                        return (
+                            <button
+                                key={item.action}
+                                type="button"
+                                className="workspace-search-context-item"
+                                role="menuitem"
+                                disabled={disabled}
+                                onMouseDown={(event) => event.preventDefault()}
+                                onClick={() => void handleSearchEditAction(item.action)}
+                            >
+                                <span>{item.label}</span>
+                                <kbd>{item.shortcut}</kbd>
+                            </button>
+                        );
+                    })}
+                </div>
+            )}
 
             {confirmScanMode === 'overwrite' && (
                 <div className="modal-overlay" onClick={() => setConfirmScanMode(null)}>

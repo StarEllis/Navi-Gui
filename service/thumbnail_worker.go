@@ -155,7 +155,7 @@ func (w *ThumbnailWorker) processTask(task *model.Media) {
 	applyFileTimes(media, info)
 	sidecars := collectDirectorySidecarFiles(filepath.Dir(media.FilePath))
 	if w.thumbSvc.syncPrimaryArtworkPaths(media, sidecars) {
-		syncGeneratedArtworkPaths(media)
+		w.thumbSvc.syncGeneratedArtworkPaths(media)
 	}
 
 	settings := w.settings()
@@ -163,7 +163,7 @@ func (w *ThumbnailWorker) processTask(task *model.Media) {
 	if normalizeThumbnailStatus(resolveMedia.ThumbnailStatus) == ThumbnailStatusProcessing {
 		resolveMedia.ThumbnailStatus = task.ThumbnailStatus
 	}
-	status := ResolveThumbnailState(&resolveMedia, sidecars, settings)
+	status := w.thumbSvc.resolveThumbnailState(&resolveMedia, sidecars, settings)
 	currentFingerprint := CurrentThumbnailFingerprint(media)
 
 	if !ShouldWorkerProcess(&model.Media{
@@ -198,8 +198,10 @@ func (w *ThumbnailWorker) checkAndMarkExisting(media *model.Media, sidecars *dir
 	}
 	if w.thumbSvc != nil {
 		_ = w.thumbSvc.syncPrimaryArtworkPaths(media, sidecars)
+		w.thumbSvc.syncGeneratedArtworkPaths(media)
+	} else {
+		syncGeneratedArtworkPaths(media)
 	}
-	syncGeneratedArtworkPaths(media)
 	return HasAllThumbnailAssets(media, sidecars, settings)
 }
 
@@ -212,7 +214,7 @@ func (w *ThumbnailWorker) executeGeneration(media *model.Media, sidecars *direct
 	if _, err := w.thumbSvc.EnsurePrimaryArtwork(media, sidecars, settings); err != nil {
 		warnings = append(warnings, err.Error())
 	}
-	syncGeneratedArtworkPaths(media)
+	w.thumbSvc.syncGeneratedArtworkPaths(media)
 
 	if _, err := w.thumbSvc.GeneratePreviews(media, sidecars, settings); err != nil {
 		warnings = append(warnings, err.Error())
@@ -221,7 +223,7 @@ func (w *ThumbnailWorker) executeGeneration(media *model.Media, sidecars *direct
 	if HasAllThumbnailAssets(media, sidecars, settings) {
 		return ThumbnailStatusGenerated, strings.Join(warnings, "; ")
 	}
-	if HasThumbnailArtwork(media, sidecars) || CountThumbnailPreviewImages(media.FilePath, sidecars) > 0 {
+	if HasThumbnailArtwork(media, sidecars) || w.thumbSvc.countThumbnailPreviewImages(media, sidecars) > 0 {
 		return ThumbnailStatusPartial, strings.Join(warnings, "; ")
 	}
 	return ThumbnailStatusFailed, strings.Join(warnings, "; ")

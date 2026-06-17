@@ -202,6 +202,9 @@ type ScannerService struct {
 	metadataState             map[string]metadataTaskPriority
 	thumbnailService          *ThumbnailService
 	thumbnailSettingsProvider ThumbnailSettingsProvider
+	artworkCache              *ArtworkCache
+	gfriendsAvatarService     *GfriendsAvatarService
+	gfriendsAvatarsEnabled    func() bool
 	sidecarCacheMu            sync.RWMutex
 	sidecarCache              map[string]directorySidecarCacheEntry
 }
@@ -1176,6 +1179,76 @@ func (s *ScannerService) SetWSHub(hub *WSHub) {
 	s.wsHub = hub
 }
 
+func (s *ScannerService) SetArtworkCache(cache *ArtworkCache) {
+	if s == nil {
+		return
+	}
+	s.artworkCache = cache
+	if s.thumbnailService != nil {
+		s.thumbnailService.SetArtworkCache(cache)
+	}
+}
+
+func (s *ScannerService) SetGfriendsAvatarService(service *GfriendsAvatarService, enabled func() bool) {
+	if s == nil {
+		return
+	}
+	s.gfriendsAvatarService = service
+	s.gfriendsAvatarsEnabled = enabled
+}
+
+func (s *ScannerService) CachedMediaPreviews(mediaID string) []string {
+	if s == nil || s.artworkCache == nil {
+		return nil
+	}
+	return s.artworkCache.CachedMediaPreviews(mediaID)
+}
+
+func (s *ScannerService) CacheMediaPreviews(media *model.Media, sourcePaths []string, limit int) []string {
+	if s == nil || s.artworkCache == nil || media == nil || len(sourcePaths) == 0 {
+		return nil
+	}
+	paths, err := s.artworkCache.CacheMediaPreviews(media, sourcePaths, limit)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Debugf("cache media previews failed: media=%s err=%v", media.ID, err)
+		}
+		return nil
+	}
+	return paths
+}
+
+func (s *ScannerService) CacheMediaArtworkForMedia(media *model.Media) bool {
+	if s == nil || media == nil || strings.TrimSpace(media.FilePath) == "" {
+		return false
+	}
+	return s.cacheMediaArtwork(media, s.buildDirectorySidecarFiles(filepath.Dir(media.FilePath)))
+}
+
+func (s *ScannerService) cacheMediaArtwork(media *model.Media, sidecars *directorySidecarFiles) bool {
+	if s == nil || s.artworkCache == nil || media == nil {
+		return false
+	}
+	_, _, changed, err := s.artworkCache.CacheMediaArtwork(media, sidecars)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Debugf("cache media artwork failed: media=%s err=%v", media.ID, err)
+		}
+		return false
+	}
+	return changed
+}
+
+func (s *ScannerService) shouldFetchGfriendsAvatars() bool {
+	if s == nil || s.gfriendsAvatarService == nil {
+		return false
+	}
+	if s.gfriendsAvatarsEnabled == nil {
+		return true
+	}
+	return s.gfriendsAvatarsEnabled()
+}
+
 func (s *ScannerService) startMetadataWorkers() {
 	workers := runtime.NumCPU() / 4
 	if workers < 1 {
@@ -1374,6 +1447,24 @@ func (s *ScannerService) applyLocalSidecarsWithMode(media *model.Media, mediaPat
 
 	posterPath := sidecars.posterPathForMedia(mediaPath)
 	backdropPath := sidecars.backdropPathForMedia(mediaPath)
+	if s.artworkCache != nil {
+		s.cacheMediaArtwork(media, sidecars)
+		if overwrite {
+			if posterPath == "" && !s.artworkCache.IsCachedPath(media.PosterPath) {
+				media.PosterPath = ""
+			}
+			if backdropPath == "" && !s.artworkCache.IsCachedPath(media.BackdropPath) {
+				media.BackdropPath = ""
+			}
+		}
+		if posterPath != "" && media.PosterPath == "" {
+			media.PosterPath = posterPath
+		}
+		if backdropPath != "" && media.BackdropPath == "" {
+			media.BackdropPath = backdropPath
+		}
+		return
+	}
 	if overwrite {
 		media.PosterPath = posterPath
 		media.BackdropPath = backdropPath
@@ -1395,7 +1486,11 @@ func (s *ScannerService) resolveThumbnailState(media *model.Media, sidecars *dir
 		sidecars = s.buildDirectorySidecarFiles(filepath.Dir(media.FilePath))
 	}
 
-	media.ThumbnailStatus = ResolveThumbnailState(media, sidecars, s.thumbnailSettings())
+	if s.thumbnailService != nil {
+		media.ThumbnailStatus = s.thumbnailService.resolveThumbnailState(media, sidecars, s.thumbnailSettings())
+	} else {
+		media.ThumbnailStatus = ResolveThumbnailState(media, sidecars, s.thumbnailSettings())
+	}
 	media.ThumbnailFingerprint = CurrentThumbnailFingerprint(media)
 }
 
@@ -1535,6 +1630,16 @@ func (s *ScannerService) SyncActorsForMedia(media *model.Media) {
 		person, err := s.personRepo.FindOrCreate(name, 0)
 		if err != nil || person == nil {
 			continue
+		}
+		if s.shouldFetchGfriendsAvatars() && (strings.TrimSpace(person.ProfileURL) == "" || !fileExists(person.ProfileURL)) {
+			changed, avatarErr := s.gfriendsAvatarService.EnsureActorAvatar(person)
+			if avatarErr != nil {
+				s.logger.Debugf("ensure actor avatar failed: actor=%s err=%v", name, avatarErr)
+			} else if changed {
+				if updateErr := s.personRepo.Update(person); updateErr != nil {
+					s.logger.Warnf("persist actor avatar failed: actor=%s err=%v", name, updateErr)
+				}
+			}
 		}
 
 		sortOrder := actor.SortOrder
@@ -1681,6 +1786,13 @@ func (s *ScannerService) cleanDeletedFiles(library *model.Library) int {
 		if delErr != nil {
 			s.logger.Warnf("批量删除已删除文件记录失败: %v", delErr)
 			continue
+		}
+		if s.artworkCache != nil {
+			for _, mediaID := range batch {
+				if cacheErr := s.artworkCache.RemoveMedia(mediaID); cacheErr != nil {
+					s.logger.Debugf("remove deleted media artwork cache failed: media=%s err=%v", mediaID, cacheErr)
+				}
+			}
 		}
 		totalDeleted += int(deleted)
 
@@ -1948,6 +2060,7 @@ func (s *ScannerService) scanMovieLibrary(library *model.Library) (int, error) {
 			// local_only: 不自动在线刮削，标记为 manual
 			// local_preferred: 本地 NFO 有标题数据时视为已就绪，否则允许在线
 			// online_preferred: 保持默认 pending 状态（现有行为）
+			s.cacheMediaArtwork(pm.media, s.buildDirectorySidecarFiles(mediaDir))
 			switch library.MetadataMode {
 			case "local_only":
 				pm.media.ScrapeStatus = "manual"
@@ -2055,6 +2168,13 @@ func (s *ScannerService) syncDeletedMovieRecords(library *model.Library, existin
 		if err != nil {
 			s.logger.Warnf("delete stale media batch failed: root=%s err=%v", rootPath, err)
 			continue
+		}
+		if s.artworkCache != nil {
+			for _, mediaID := range deleteIDs[i:end] {
+				if cacheErr := s.artworkCache.RemoveMedia(mediaID); cacheErr != nil {
+					s.logger.Debugf("remove stale media artwork cache failed: media=%s err=%v", mediaID, cacheErr)
+				}
+			}
 		}
 		totalDeleted += int(deleted)
 

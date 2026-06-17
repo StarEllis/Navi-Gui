@@ -54,8 +54,9 @@ func normalizeThumbnailSettings(settings ThumbnailSettings) ThumbnailSettings {
 }
 
 type ThumbnailService struct {
-	cfg    *config.Config
-	logger *zap.SugaredLogger
+	cfg          *config.Config
+	logger       *zap.SugaredLogger
+	artworkCache *ArtworkCache
 }
 
 func NewThumbnailService(cfg *config.Config, logger *zap.SugaredLogger) *ThumbnailService {
@@ -63,6 +64,13 @@ func NewThumbnailService(cfg *config.Config, logger *zap.SugaredLogger) *Thumbna
 		cfg:    cfg,
 		logger: logger,
 	}
+}
+
+func (t *ThumbnailService) SetArtworkCache(cache *ArtworkCache) {
+	if t == nil {
+		return
+	}
+	t.artworkCache = cache
 }
 
 func (s *ScannerService) SetThumbnailSettingsProvider(provider ThumbnailSettingsProvider) {
@@ -109,7 +117,7 @@ func (t *ThumbnailService) EnsurePrimaryArtwork(media *model.Media, sidecars *di
 	}
 
 	var warnings []string
-	posterPath := generatedPosterPath(media.FilePath)
+	posterPath := t.generatedPosterPath(media)
 	if err := t.captureFrame(media.FilePath, mediaDurationSeconds(media)*0.25, posterPath, thumbnailPrimaryHeight); err != nil {
 		warnings = append(warnings, fmt.Sprintf("poster: %v", err))
 	} else if fileExists(posterPath) {
@@ -119,7 +127,7 @@ func (t *ThumbnailService) EnsurePrimaryArtwork(media *model.Media, sidecars *di
 		}
 	}
 
-	backdropPath := generatedBackdropPath(media.FilePath)
+	backdropPath := t.generatedBackdropPath(media)
 	if err := t.captureFrame(media.FilePath, mediaDurationSeconds(media)*0.58, backdropPath, thumbnailPrimaryHeight); err != nil {
 		warnings = append(warnings, fmt.Sprintf("fanart: %v", err))
 	} else if fileExists(backdropPath) {
@@ -144,22 +152,20 @@ func (t *ThumbnailService) GeneratePreviews(media *model.Media, sidecars *direct
 	if t.hasDedicatedPreviewImages(media.FilePath, sidecars) {
 		return 0, nil
 	}
+	if t.cachedPreviewCount(media) > 0 {
+		return 0, nil
+	}
 
 	duration := mediaDurationSeconds(media)
 	if duration <= 0 {
 		return 0, nil
 	}
 
-	previewDir := previewDirectory(media.FilePath)
-	if err := os.MkdirAll(previewDir, 0755); err != nil {
-		return 0, err
-	}
-
 	targets := previewTargetTimes(duration, settings.PreviewCount)
 	generated := 0
 	var warnings []string
 	for index, seekSeconds := range targets {
-		outputPath := filepath.Join(previewDir, generatedPreviewName(media.FilePath, index+1))
+		outputPath := t.generatedPreviewPath(media, index+1)
 		if fileExists(outputPath) {
 			continue
 		}
@@ -214,8 +220,8 @@ func (t *ThumbnailService) hasGeneratedPrimaryArtwork(media *model.Media, sideca
 		return false
 	}
 
-	posterPath := generatedPosterPath(media.FilePath)
-	backdropPath := generatedBackdropPath(media.FilePath)
+	posterPath := t.generatedPosterPath(media)
+	backdropPath := t.generatedBackdropPath(media)
 	if fileExists(posterPath) || fileExists(backdropPath) {
 		return true
 	}
@@ -231,6 +237,16 @@ func (t *ThumbnailService) syncPrimaryArtworkPaths(media *model.Media, sidecars 
 	}
 
 	changed := false
+	if t != nil && t.artworkCache != nil {
+		_, _, cacheChanged, err := t.artworkCache.CacheMediaArtwork(media, sidecars)
+		if err != nil {
+			if t.logger != nil {
+				t.logger.Debugf("cache media artwork failed: media=%s err=%v", media.ID, err)
+			}
+		} else if cacheChanged {
+			changed = true
+		}
+	}
 	if !hasUsablePrimaryArtworkPath(media.PosterPath, media, sidecars, true) && strings.TrimSpace(media.PosterPath) != "" {
 		media.PosterPath = ""
 		changed = true
@@ -339,6 +355,82 @@ func syncGeneratedArtworkPaths(media *model.Media) bool {
 		changed = true
 	}
 	return changed
+}
+
+func (t *ThumbnailService) syncGeneratedArtworkPaths(media *model.Media) bool {
+	if t == nil || t.artworkCache == nil || media == nil {
+		return syncGeneratedArtworkPaths(media)
+	}
+
+	changed := false
+	if posterPath := t.generatedPosterPath(media); fileExists(posterPath) && !samePath(media.PosterPath, posterPath) {
+		media.PosterPath = posterPath
+		changed = true
+	}
+	if backdropPath := t.generatedBackdropPath(media); fileExists(backdropPath) && !samePath(media.BackdropPath, backdropPath) {
+		media.BackdropPath = backdropPath
+		changed = true
+	}
+	return changed
+}
+
+func (t *ThumbnailService) generatedPosterPath(media *model.Media) string {
+	if t != nil && t.artworkCache != nil {
+		if path := t.artworkCache.GeneratedMediaArtworkPath(media, "poster"); path != "" {
+			return path
+		}
+	}
+	if media == nil {
+		return ""
+	}
+	return generatedPosterPath(media.FilePath)
+}
+
+func (t *ThumbnailService) generatedBackdropPath(media *model.Media) string {
+	if t != nil && t.artworkCache != nil {
+		if path := t.artworkCache.GeneratedMediaArtworkPath(media, "fanart"); path != "" {
+			return path
+		}
+	}
+	if media == nil {
+		return ""
+	}
+	return generatedBackdropPath(media.FilePath)
+}
+
+func (t *ThumbnailService) generatedPreviewPath(media *model.Media, index int) string {
+	if t != nil && t.artworkCache != nil {
+		if path := t.artworkCache.GeneratedMediaPreviewPath(media, index); path != "" {
+			return path
+		}
+	}
+	if media == nil {
+		return ""
+	}
+	return filepath.Join(previewDirectory(media.FilePath), generatedPreviewName(media.FilePath, index))
+}
+
+func (t *ThumbnailService) cachedPreviewCount(media *model.Media) int {
+	if t == nil || t.artworkCache == nil || media == nil {
+		return 0
+	}
+	return len(t.artworkCache.CachedMediaPreviews(media.ID))
+}
+
+func (t *ThumbnailService) countThumbnailPreviewImages(media *model.Media, sidecars *directorySidecarFiles) int {
+	if media == nil {
+		return 0
+	}
+	count := CountThumbnailPreviewImages(media.FilePath, sidecars)
+	count += t.cachedPreviewCount(media)
+	return count
+}
+
+func (t *ThumbnailService) resolveThumbnailState(media *model.Media, sidecars *directorySidecarFiles, settings ThumbnailSettings) string {
+	if media == nil {
+		return ThumbnailStatusNone
+	}
+	return resolveThumbnailStateWithPreviewCount(media, sidecars, settings, t.countThumbnailPreviewImages(media, sidecars))
 }
 
 func (t *ThumbnailService) captureFrame(mediaPath string, seekSeconds float64, outputPath string, outputHeight int) error {

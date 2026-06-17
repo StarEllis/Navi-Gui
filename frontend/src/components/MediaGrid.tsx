@@ -7,7 +7,15 @@ import {
     persistMediaListCache,
     removeMediaFromCachedMediaLists,
 } from '../utils/persistentCache';
-import { buildMediaSearchIndex, normalizeSearchField, normalizeSearchTerm } from '../utils/mediaSearch';
+import {
+    buildMediaPhoneticSearchIndex,
+    buildMediaSearchIndex,
+    hasCJKSearchCharacter,
+    type MediaPhoneticSearchIndex,
+    normalizeSearchField,
+    normalizeSearchTerm,
+    parseMediaSearchQuery,
+} from '../utils/mediaSearch';
 import { prefetchMediaDetailCacheEntry, seedMediaDetailCache } from '../utils/mediaDetailCache';
 
 interface MediaGridProps {
@@ -39,6 +47,12 @@ type SearchableMediaItem = {
     genreIndex: string;
     metadataIndex: string;
     pathIndex: string;
+    phoneticIndex?: MediaPhoneticSearchIndex;
+};
+
+type MediaSearchResult = {
+    items: any[];
+    isFallback: boolean;
 };
 
 const MEDIA_CARD_WIDTH = 178;
@@ -91,37 +105,115 @@ const createSearchableMediaItems = (items: any[]): SearchableMediaItem[] => {
         }));
 };
 
-const getSearchPriority = (item: SearchableMediaItem, normalizedKeyword: string) => {
-    if (!normalizedKeyword || !item.searchIndex.includes(normalizedKeyword)) {
+const getMediaItemPhoneticIndex = async (item: SearchableMediaItem) => {
+    if (!item.phoneticIndex) {
+        item.phoneticIndex = await buildMediaPhoneticSearchIndex(item.media);
+    }
+    return item.phoneticIndex;
+};
+
+const getTextTokenPriority = (item: SearchableMediaItem, token: string) => {
+    if (!token || !item.searchIndex.includes(token)) {
         return null;
     }
 
-    if (item.codeIndex === normalizedKeyword) {
+    if (item.codeIndex === token) {
         return 0;
     }
-    if (item.codeIndex.startsWith(normalizedKeyword)) {
+    if (item.codeIndex.startsWith(token)) {
         return 1;
     }
-    if (item.codeIndex.includes(normalizedKeyword)) {
+    if (item.codeIndex.includes(token)) {
         return 2;
     }
-    if (item.titleIndex.includes(normalizedKeyword)) {
+    if (item.titleIndex.includes(token)) {
         return 3;
     }
-    if (item.actorIndex.includes(normalizedKeyword)) {
+    if (item.actorIndex.includes(token)) {
         return 4;
     }
-    if (item.genreIndex.includes(normalizedKeyword)) {
+    if (item.genreIndex.includes(token)) {
         return 5;
     }
-    if (item.metadataIndex.includes(normalizedKeyword)) {
+    if (item.metadataIndex.includes(token)) {
         return 6;
     }
-    if (item.pathIndex.includes(normalizedKeyword)) {
+    if (item.pathIndex.includes(token)) {
         return 7;
     }
 
     return 8;
+};
+
+const getPhoneticTokenPriority = async (item: SearchableMediaItem, token: string) => {
+    if (!token || hasCJKSearchCharacter(token) || token.length < 2) {
+        return null;
+    }
+
+    const phoneticIndex = await getMediaItemPhoneticIndex(item);
+    const paddedPinyinIndex = ` ${phoneticIndex.pinyinIndex} `;
+    if (paddedPinyinIndex.includes(` ${token} `)) {
+        return 8;
+    }
+    if (phoneticIndex.pinyinIndex.includes(token)) {
+        return 9;
+    }
+    if (phoneticIndex.compactPinyinIndex.startsWith(token)) {
+        return 10;
+    }
+    if (phoneticIndex.compactPinyinIndex.includes(token)) {
+        return 11;
+    }
+    if (phoneticIndex.initialsIndex.startsWith(token)) {
+        return 12;
+    }
+    if (phoneticIndex.initialsIndex.includes(token)) {
+        return 13;
+    }
+
+    return null;
+};
+
+const getTokenPriority = async (item: SearchableMediaItem, token: string) => {
+    const textPriority = getTextTokenPriority(item, token);
+    if (textPriority !== null) {
+        return textPriority;
+    }
+    return getPhoneticTokenPriority(item, token);
+};
+
+const rankItemsByTokens = async (
+    items: SearchableMediaItem[],
+    tokens: string[],
+    priorityGetter: (item: SearchableMediaItem, token: string) => number | null | Promise<number | null>,
+) => {
+    const rankedItems: { media: any; index: number; priority: number }[] = [];
+
+    for (let index = 0; index < items.length; index += 1) {
+        const item = items[index];
+        let priority = 0;
+
+        for (const token of tokens) {
+            const tokenPriority = await priorityGetter(item, token);
+            if (tokenPriority === null) {
+                priority = -1;
+                break;
+            }
+            priority += tokenPriority;
+        }
+
+        if (priority >= 0) {
+            rankedItems.push({
+                media: item.media,
+                index,
+                priority,
+            });
+        }
+    }
+
+    return rankedItems
+        .sort((left, right) => left.priority - right.priority || left.index - right.index)
+        .map(({ media }) => media);
 };
 
 const FILTER_ONLY_SEARCH_TERMS = new Set([
@@ -143,27 +235,46 @@ const FILTER_ONLY_SEARCH_TERMS = new Set([
     '有码',
 ]);
 
-const filterSearchableMediaItems = (items: SearchableMediaItem[], keyword: string) => {
-    const normalizedKeyword = normalizeSearchTerm(keyword);
-    if (!normalizedKeyword) {
-        return items.map(({ media }) => media);
+const filterSearchableMediaItems = async (items: SearchableMediaItem[], keyword: string): Promise<MediaSearchResult> => {
+    const query = parseMediaSearchQuery(keyword);
+    if (query.tokens.length === 0) {
+        return {
+            items: items.map(({ media }) => media),
+            isFallback: false,
+        };
     }
 
-    if (FILTER_ONLY_SEARCH_TERMS.has(normalizedKeyword)) {
-        return items
-            .filter((item) => item.searchIndex.includes(normalizedKeyword))
-            .map(({ media }) => media);
+    if (FILTER_ONLY_SEARCH_TERMS.has(query.normalized)) {
+        return {
+            items: items
+                .filter((item) => item.searchIndex.includes(query.normalized))
+                .map(({ media }) => media),
+            isFallback: false,
+        };
     }
 
-    return items
-        .map((item, index) => ({
-            media: item.media,
-            index,
-            priority: getSearchPriority(item, normalizedKeyword),
-        }))
-        .filter((item): item is { media: any; index: number; priority: number } => item.priority !== null)
-        .sort((left, right) => left.priority - right.priority || left.index - right.index)
-        .map(({ media }) => media);
+    if (query.tokens.length === 1 && FILTER_ONLY_SEARCH_TERMS.has(query.tokens[0])) {
+        return {
+            items: items
+                .filter((item) => item.searchIndex.includes(query.tokens[0]))
+                .map(({ media }) => media),
+            isFallback: false,
+        };
+    }
+
+    const strictItems = await rankItemsByTokens(items, query.tokens, getTokenPriority);
+    if (strictItems.length > 0 || query.cjkTokens.length === 0) {
+        return {
+            items: strictItems,
+            isFallback: false,
+        };
+    }
+
+    const fallbackItems = await rankItemsByTokens(items, query.cjkTokens, getTextTokenPriority);
+    return {
+        items: fallbackItems,
+        isFallback: fallbackItems.length > 0,
+    };
 };
 
 const mergeSearchableMediaItem = (item: SearchableMediaItem, media: any): SearchableMediaItem => {
@@ -209,25 +320,22 @@ const MediaGrid: React.FC<MediaGridProps> = ({
     const filterValue = filter?.value || '';
     const deferredKeyword = useDeferredValue(keyword);
     const baseCacheKey = getMediaListBaseCacheKey(libraryId, sortField, sortOrder, filterType, filterValue);
-    const activeKeyword = deferredKeyword.trim();
-    const activeCacheKey = activeKeyword
-        ? getMediaListCacheKey(libraryId, activeKeyword, sortField, sortOrder, filterType, filterValue)
-        : baseCacheKey;
-    const initialCache = getCachedMediaListEntry(activeCacheKey);
-    const initialSearchableItems = createSearchableMediaItems(initialCache?.items || []);
     const containerRef = useRef<HTMLDivElement>(null);
     const latestScrollTopRef = useRef(0);
     const pendingRestoreRef = useRef<number | null>(initialScrollTop);
     const requestTokenRef = useRef(0);
     const scrollFrameRef = useRef<number | null>(null);
     const scrollNotifyTimerRef = useRef<number | null>(null);
+    const searchTimerRef = useRef<number | null>(null);
+    const searchRunRef = useRef(0);
     const onScrollPositionChangeRef = useRef(onScrollPositionChange);
     const [layout, setLayout] = useState({ columns: 4, gap: 20, justify: 'start' });
     const [viewportHeight, setViewportHeight] = useState(0);
     const [virtualScrollTop, setVirtualScrollTop] = useState(initialScrollTop);
-    const [baseItems, setBaseItems] = useState<SearchableMediaItem[]>(() => initialSearchableItems);
-    const [mediaItems, setMediaItems] = useState<any[]>(() => filterSearchableMediaItems(initialSearchableItems, keyword));
-    const [isLoading, setIsLoading] = useState(() => !initialCache);
+    const [baseItems, setBaseItems] = useState<SearchableMediaItem[]>([]);
+    const [mediaItems, setMediaItems] = useState<any[]>([]);
+    const [isFallbackSearch, setIsFallbackSearch] = useState(false);
+    const [isLoading, setIsLoading] = useState(true);
 
     useEffect(() => {
         onScrollPositionChangeRef.current = onScrollPositionChange;
@@ -240,6 +348,10 @@ const MediaGrid: React.FC<MediaGridProps> = ({
         if (scrollNotifyTimerRef.current !== null) {
             window.clearTimeout(scrollNotifyTimerRef.current);
         }
+        if (searchTimerRef.current !== null) {
+            window.clearTimeout(searchTimerRef.current);
+        }
+        searchRunRef.current += 1;
         onScrollPositionChangeRef.current?.(latestScrollTopRef.current);
     }, []);
 
@@ -356,19 +468,43 @@ const MediaGrid: React.FC<MediaGridProps> = ({
     ]);
 
     useEffect(() => {
-        const cachedEntry = getCachedMediaListEntry(activeCacheKey);
+        const cachedEntry = getCachedMediaListEntry(baseCacheKey);
         const requestToken = requestTokenRef.current + 1;
         requestTokenRef.current = requestToken;
 
+        const applySearchableItems = (searchableItems: SearchableMediaItem[]) => {
+            setBaseItems(searchableItems);
+
+            if (!deferredKeyword.trim()) {
+                const nextItems = searchableItems.map(({ media }) => media);
+                setMediaItems(nextItems);
+                setIsFallbackSearch(false);
+                onCountChange?.(nextItems.length);
+                return;
+            }
+
+            void filterSearchableMediaItems(searchableItems, deferredKeyword).then((searchResult) => {
+                if (requestTokenRef.current !== requestToken) {
+                    return;
+                }
+                setMediaItems(searchResult.items);
+                setIsFallbackSearch(searchResult.isFallback);
+                onCountChange?.(searchResult.items.length);
+            });
+        };
+
         if (cachedEntry) {
-            setBaseItems(createSearchableMediaItems(cachedEntry.items));
+            const cachedItems = createSearchableMediaItems(cachedEntry.items);
+            applySearchableItems(cachedItems);
             setIsLoading(false);
         } else {
             setBaseItems([]);
+            setMediaItems([]);
+            setIsFallbackSearch(false);
             setIsLoading(true);
         }
 
-        void GetMediaList(libraryId, 1, 0, sortField, sortOrder, activeKeyword, filterType, filterValue)
+        void GetMediaList(libraryId, 1, 0, sortField, sortOrder, '', filterType, filterValue)
             .then((res: any) => {
                 if (requestTokenRef.current !== requestToken) {
                     return;
@@ -376,11 +512,12 @@ const MediaGrid: React.FC<MediaGridProps> = ({
 
                 const nextItems = Array.isArray(res?.items) ? res.items : [];
                 const nextTotal = Number(res?.total || 0);
-                persistMediaListCache(activeCacheKey, {
+                persistMediaListCache(baseCacheKey, {
                     items: nextItems,
                     total: nextTotal,
                 });
-                setBaseItems(createSearchableMediaItems(nextItems));
+                const searchableItems = createSearchableMediaItems(nextItems);
+                applySearchableItems(searchableItems);
                 setIsLoading(false);
             })
             .catch((err) => {
@@ -393,14 +530,37 @@ const MediaGrid: React.FC<MediaGridProps> = ({
         return () => {
             requestTokenRef.current += 1;
         };
-    }, [activeCacheKey, activeKeyword, filterType, filterValue, libraryId, refreshVersion, sortField, sortOrder]);
+    }, [baseCacheKey, filterType, filterValue, libraryId, onCountChange, refreshVersion, sortField, sortOrder]);
 
     useEffect(() => {
-        const nextItems = filterSearchableMediaItems(baseItems, deferredKeyword);
-        startTransition(() => {
-            setMediaItems(nextItems);
-        });
-        onCountChange?.(nextItems.length);
+        if (searchTimerRef.current !== null) {
+            window.clearTimeout(searchTimerRef.current);
+        }
+
+        const searchRunToken = searchRunRef.current + 1;
+        searchRunRef.current = searchRunToken;
+
+        searchTimerRef.current = window.setTimeout(() => {
+            searchTimerRef.current = null;
+            void filterSearchableMediaItems(baseItems, deferredKeyword).then((searchResult) => {
+                if (searchRunRef.current !== searchRunToken) {
+                    return;
+                }
+                startTransition(() => {
+                    setMediaItems(searchResult.items);
+                    setIsFallbackSearch(searchResult.isFallback);
+                });
+                onCountChange?.(searchResult.items.length);
+            });
+        }, deferredKeyword.trim() ? 120 : 0);
+
+        return () => {
+            if (searchTimerRef.current !== null) {
+                window.clearTimeout(searchTimerRef.current);
+                searchTimerRef.current = null;
+            }
+            searchRunRef.current += 1;
+        };
     }, [baseItems, deferredKeyword, onCountChange]);
 
     useEffect(() => {
@@ -506,6 +666,12 @@ const MediaGrid: React.FC<MediaGridProps> = ({
             {isLoading && baseItems.length === 0 && (
                 <div className="grid-feedback loading">
                     {'\u6b63\u5728\u52a0\u8f7d\u5a92\u4f53\u5185\u5bb9...'}
+                </div>
+            )}
+
+            {!isLoading && mediaItems.length > 0 && isFallbackSearch && (
+                <div className="grid-search-fallback">
+                    没有精确结果，已显示可能匹配
                 </div>
             )}
 

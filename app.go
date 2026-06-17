@@ -34,6 +34,8 @@ type App struct {
 	repos           *repository.Repositories
 	scanner         *service.ScannerService
 	thumbnailWorker *service.ThumbnailWorker
+	artworkCache    *service.ArtworkCache
+	avatarService   *service.GfriendsAvatarService
 	logger          *zap.SugaredLogger
 	remote          *remoteAccessState
 	desktop         *desktopIntegration
@@ -75,6 +77,12 @@ func (a *App) startup(ctx context.Context) {
 	// 4. 注入之前写好的最小化 Shim 层
 	cfg := config.NewConfig()
 	wsHub := service.NewWSHub(ctx)
+	a.artworkCache = service.NewArtworkCache(cfg.Cache.CacheDir, a.logger)
+	a.avatarService = service.NewGfriendsAvatarService(service.GfriendsAvatarOptions{
+		CacheDir:     cfg.Cache.CacheDir,
+		ArtworkCache: a.artworkCache,
+		Logger:       a.logger,
+	})
 	thumbnailSettingsProvider := func() service.ThumbnailSettings {
 		settings, err := a.GetDesktopSettings()
 		if err != nil || settings == nil {
@@ -88,27 +96,55 @@ func (a *App) startup(ctx context.Context) {
 	}
 
 	// 5. 将桌面级组件全部注入核心 Scanner
+	gfriendsAvatarEnabled := func() bool {
+		settings, err := a.GetDesktopSettings()
+		if err != nil || settings == nil {
+			return true
+		}
+		return settings.EnableGfriendsAvatars
+	}
 	a.scanner = service.NewScannerService(a.repos.Media, a.repos.Series, a.repos.Person, a.repos.MediaPerson, cfg, a.logger)
 	a.scanner.SetWSHub(wsHub)
 	a.scanner.SetThumbnailSettingsProvider(thumbnailSettingsProvider)
+	a.scanner.SetArtworkCache(a.artworkCache)
+	a.scanner.SetGfriendsAvatarService(a.avatarService, gfriendsAvatarEnabled)
 	thumbSvc := service.NewThumbnailService(cfg, a.logger)
-	a.migrateThumbnailTasksV2(thumbSvc, thumbnailSettingsProvider())
+	thumbSvc.SetArtworkCache(a.artworkCache)
 	a.thumbnailWorker = service.NewThumbnailWorker(a.repos.Media, thumbSvc, thumbnailSettingsProvider, a.logger, wsHub)
-	a.thumbnailWorker.Start()
 	// a.scanner.SetMatchRuleRepo(a.repos.MatchRule)
 
-	if settings, err := a.GetDesktopSettings(); err == nil {
-		if err := a.syncDesktopIntegration(settings); err != nil {
-			a.logger.Warnf("sync desktop integration failed: %v", err)
-		}
-		if err := a.syncRemoteServices(settings); err != nil {
-			a.logger.Warnf("start remote services failed: %v", err)
-		}
-	} else {
-		a.logger.Warnf("load desktop settings for remote services failed: %v", err)
-	}
+	a.startPostStartupServices(thumbSvc, thumbnailSettingsProvider)
 
 	a.logger.Infof("Application backend started successfully! DB: %s", dbPath)
+}
+
+func (a *App) startPostStartupServices(thumbSvc *service.ThumbnailService, thumbnailSettingsProvider func() service.ThumbnailSettings) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil && a.logger != nil {
+				a.logger.Warnf("post-startup services failed: %v", r)
+			}
+		}()
+
+		// Let Wails finish creating and painting the WebView before maintenance work starts.
+		time.Sleep(500 * time.Millisecond)
+
+		a.migrateThumbnailTasksV2(thumbSvc, thumbnailSettingsProvider())
+		if a.thumbnailWorker != nil {
+			a.thumbnailWorker.Start()
+		}
+
+		if settings, err := a.GetDesktopSettings(); err == nil {
+			if err := a.syncDesktopIntegration(settings); err != nil {
+				a.logger.Warnf("sync desktop integration failed: %v", err)
+			}
+			if err := a.syncRemoteServices(settings); err != nil {
+				a.logger.Warnf("start remote services failed: %v", err)
+			}
+		} else {
+			a.logger.Warnf("load desktop settings for remote services failed: %v", err)
+		}
+	}()
 }
 
 func (a *App) migrateThumbnailTasksV2(thumbSvc *service.ThumbnailService, settings service.ThumbnailSettings) {
@@ -910,10 +946,11 @@ func (a *App) GetMediaDetail(mediaID string) (*model.Media, error) {
 		return nil, err
 	}
 
-	if service.NormalizeMetadataPhase(media.MetadataPhase) == service.MetadataPhaseQuick {
+	if shouldAutoCompleteDetailMetadata(&media) {
 		a.scanner.EnqueueMetadataCompletion(media.ID, true)
 	}
 
+	artworkChanged := false
 	if media.FilePath != "" {
 		nfoService := service.NewNFOService(a.logger)
 		if service.NeedsLocalMetadataRepair(&media) {
@@ -938,10 +975,21 @@ func (a *App) GetMediaDetail(mediaID string) (*model.Media, error) {
 			poster, backdrop = nfoService.FindLocalImages(filepath.Dir(media.FilePath))
 		}
 		if poster != "" && (media.PosterPath == "" || strings.Contains(strings.ToLower(filepath.Base(media.PosterPath)), "fanart")) {
-			media.PosterPath = poster
+			if !sameAppPath(media.PosterPath, poster) {
+				media.PosterPath = poster
+				artworkChanged = true
+			}
 		}
-		if backdrop != "" {
-			media.BackdropPath = backdrop
+		if backdrop != "" && (media.BackdropPath == "" || a.artworkCache == nil || !a.artworkCache.IsCachedPath(media.BackdropPath)) {
+			if !sameAppPath(media.BackdropPath, backdrop) {
+				media.BackdropPath = backdrop
+				artworkChanged = true
+			}
+		}
+	}
+	if artworkChanged {
+		if err := a.repos.Media.Update(&media); err != nil {
+			a.logger.Warnf("persist cached artwork paths failed: media=%s err=%v", media.ID, err)
 		}
 	}
 	actors, actorText := a.resolveMediaActors(&media)
@@ -950,8 +998,28 @@ func (a *App) GetMediaDetail(mediaID string) (*model.Media, error) {
 	a.hydrateMediaSearchText(&media)
 	service.ApplyDerivedMediaFields(&media)
 	a.hydrateMediaState(&media)
+	a.cacheMediaArtworkInBackground(media)
 
 	return &media, nil
+}
+
+func shouldAutoCompleteDetailMetadata(media *model.Media) bool {
+	if media == nil || service.NormalizeMetadataPhase(media.MetadataPhase) != service.MetadataPhaseQuick {
+		return false
+	}
+	if strings.TrimSpace(media.FilePath) == "" {
+		return false
+	}
+	return media.Duration <= 0 && media.Runtime <= 0
+}
+
+func sameAppPath(left string, right string) bool {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	if left == "" || right == "" {
+		return false
+	}
+	return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
 }
 
 type MediaDetailBundle struct {
@@ -1091,6 +1159,48 @@ func (a *App) getMediaPreviewsByPath(filePath string) []string {
 	return previews
 }
 
+func (a *App) getMediaPreviews(media *model.Media) []string {
+	if media == nil {
+		return nil
+	}
+	if a.scanner != nil {
+		if previews := a.scanner.CachedMediaPreviews(media.ID); len(previews) > 0 {
+			return previews
+		}
+	}
+
+	previews := a.getMediaPreviewsByPath(media.FilePath)
+	if len(previews) == 0 || a.scanner == nil {
+		return previews
+	}
+	a.cacheMediaPreviewsInBackground(*media, previews)
+	return previews
+}
+
+func (a *App) cacheMediaArtworkInBackground(media model.Media) {
+	if a == nil || a.scanner == nil || strings.TrimSpace(media.ID) == "" || strings.TrimSpace(media.FilePath) == "" {
+		return
+	}
+	go func() {
+		updated := media
+		if a.scanner.CacheMediaArtworkForMedia(&updated) {
+			if err := a.repos.Media.Update(&updated); err != nil {
+				a.logger.Warnf("persist background cached artwork paths failed: media=%s err=%v", updated.ID, err)
+			}
+		}
+	}()
+}
+
+func (a *App) cacheMediaPreviewsInBackground(media model.Media, previews []string) {
+	if a == nil || a.scanner == nil || strings.TrimSpace(media.ID) == "" || len(previews) == 0 {
+		return
+	}
+	sourcePaths := append([]string(nil), previews...)
+	go func() {
+		a.scanner.CacheMediaPreviews(&media, sourcePaths, len(sourcePaths))
+	}()
+}
+
 func (a *App) GetMediaDetailBundle(mediaID string) (*MediaDetailBundle, error) {
 	detail, err := a.GetMediaDetail(mediaID)
 	if err != nil {
@@ -1100,7 +1210,7 @@ func (a *App) GetMediaDetailBundle(mediaID string) (*MediaDetailBundle, error) {
 	return &MediaDetailBundle{
 		Detail:   detail,
 		Files:    a.getMediaFilesByPath(detail.FilePath),
-		Previews: a.getMediaPreviewsByPath(detail.FilePath),
+		Previews: a.getMediaPreviews(detail),
 	}, nil
 }
 
@@ -1137,6 +1247,7 @@ type DesktopSettings struct {
 	EverythingAddr              string `json:"everything_addr"`
 	ScanFromVideoDir            bool   `json:"scan_from_video_dir"`
 	EnableVideoThumbnail        bool   `json:"enable_video_thumbnail"`
+	EnableGfriendsAvatars       bool   `json:"enable_gfriends_avatars"`
 	ThumbnailPreviewCount       int    `json:"thumbnail_preview_count"`
 	ThumbnailMinDurationSeconds int    `json:"thumbnail_min_duration_seconds"`
 	RemoteBindHost              string `json:"remote_bind_host"`
@@ -1178,6 +1289,9 @@ func (a *App) GetDesktopSettings() (*DesktopSettings, error) {
 	thumbnailDefaults := service.DefaultThumbnailSettings()
 	if err != nil || !bytes.Contains(data, []byte(`"enable_video_thumbnail"`)) {
 		settings.EnableVideoThumbnail = thumbnailDefaults.Enabled
+	}
+	if err != nil || !bytes.Contains(data, []byte(`"enable_gfriends_avatars"`)) {
+		settings.EnableGfriendsAvatars = true
 	}
 	if settings.ThumbnailPreviewCount <= 0 {
 		settings.ThumbnailPreviewCount = thumbnailDefaults.PreviewCount
@@ -1408,6 +1522,11 @@ func (a *App) ToggleWatched(mediaID string) error {
 
 // DeleteMedia 只从数据库删除记录，不移动文件
 func (a *App) DeleteMedia(mediaID string) error {
+	if a.artworkCache != nil {
+		if err := a.artworkCache.RemoveMedia(mediaID); err != nil {
+			a.logger.Warnf("remove media artwork cache failed: media=%s err=%v", mediaID, err)
+		}
+	}
 	return a.repos.Media.DeleteByID(mediaID)
 }
 
@@ -1495,6 +1614,9 @@ func (a *App) syncMediaFromNFO(mediaID string, nfoPath string) {
 		if backdrop != "" {
 			updated.BackdropPath = backdrop
 		}
+	}
+	if a.scanner != nil {
+		a.scanner.CacheMediaArtworkForMedia(&updated)
 	}
 
 	service.ApplyDerivedMediaFields(&updated)
@@ -1884,7 +2006,7 @@ func (a *App) GetMediaPreviews(mediaID string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return a.getMediaPreviewsByPath(media.FilePath), nil
+	return a.getMediaPreviews(media), nil
 }
 
 // PlayFile 播放指定绝对路径的文件
@@ -1923,6 +2045,17 @@ func (a *App) PlayRandomLibraryMedia(libraryID string) (string, error) {
 
 // DeleteLibrary 删除一个媒体库及其关联的所有媒体记录
 func (a *App) DeleteLibrary(libraryID string) error {
+	if a.artworkCache != nil {
+		if mediaItems, err := a.repos.Media.ListByLibraryID(libraryID); err == nil {
+			for _, media := range mediaItems {
+				if err := a.artworkCache.RemoveMedia(media.ID); err != nil {
+					a.logger.Warnf("remove library media artwork cache failed: media=%s err=%v", media.ID, err)
+				}
+			}
+		} else {
+			a.logger.Warnf("list library media for artwork cleanup failed: library=%s err=%v", libraryID, err)
+		}
+	}
 	if err := a.repos.Media.DeleteByLibraryID(libraryID); err != nil {
 		a.logger.Errorf("删除媒体库关联媒体失败: %v", err)
 	}
@@ -1941,6 +2074,17 @@ func (a *App) ScanLibraryWithMode(libraryID string, mode string) error {
 	a.logger.Infof("ScanLibraryWithMode: id=%s mode=%s", libraryID, mode)
 
 	if mode == "overwrite" {
+		if a.artworkCache != nil {
+			if mediaItems, listErr := a.repos.Media.ListByLibraryID(libraryID); listErr == nil {
+				for _, media := range mediaItems {
+					if cacheErr := a.artworkCache.RemoveMedia(media.ID); cacheErr != nil {
+						a.logger.Warnf("remove overwritten media artwork cache failed: media=%s err=%v", media.ID, cacheErr)
+					}
+				}
+			} else {
+				a.logger.Warnf("list library media for overwrite artwork cleanup failed: library=%s err=%v", libraryID, listErr)
+			}
+		}
 		if err := a.repos.Media.DeleteByLibraryID(libraryID); err != nil {
 			return err
 		}

@@ -1,12 +1,108 @@
 const collapseWhitespace = (value: string) => value.replace(/\s+/g, ' ').trim();
+type PinyinFunction = (value: string, options: Record<string, unknown>) => string[];
+
+let pinyinLoader: Promise<PinyinFunction> | null = null;
+
+const loadPinyin = () => {
+    if (!pinyinLoader) {
+        pinyinLoader = import('pinyin-pro').then((module) => module.pinyin as unknown as PinyinFunction);
+    }
+    return pinyinLoader;
+};
+
+const cjkVariantMap: Record<string, string> = {
+    '沢': '泽',
+    '澤': '泽',
+};
+
+const cjkVariantPattern = new RegExp(`[${Object.keys(cjkVariantMap).join('')}]`, 'g');
+const cjkCharacterPattern = /[\u3005\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff]/;
+const asciiAlphaNumericPattern = /[a-z0-9]/i;
+
+export type ParsedMediaSearchQuery = {
+    normalized: string;
+    tokens: string[];
+    cjkTokens: string[];
+};
+
+export type MediaPhoneticSearchIndex = {
+    pinyinIndex: string;
+    compactPinyinIndex: string;
+    initialsIndex: string;
+};
+
+export const normalizeCJKVariants = (value: string) => value.replace(
+    cjkVariantPattern,
+    (char) => cjkVariantMap[char] || char,
+);
 
 export const normalizeSearchTerm = (value: string) => collapseWhitespace(
-    value
+    normalizeCJKVariants(value)
         .normalize('NFKC')
         .toLowerCase()
         .replace(/[\u0000-\u001f]+/g, ' ')
         .replace(/[_\-./\\[\](){}#+]+/g, ' '),
 );
+
+export const hasCJKSearchCharacter = (value: string) => cjkCharacterPattern.test(value);
+
+const uniqueInOrder = (values: string[]) => {
+    const seen = new Set<string>();
+    return values.filter((value) => {
+        if (!value || seen.has(value)) {
+            return false;
+        }
+        seen.add(value);
+        return true;
+    });
+};
+
+export const tokenizeSearchInput = (value: string) => {
+    const normalized = normalizeSearchTerm(value);
+    const tokens: string[] = [];
+    let current = '';
+    let currentKind: 'cjk' | 'latin' | '' = '';
+
+    const pushCurrent = () => {
+        if (current) {
+            tokens.push(current);
+            current = '';
+            currentKind = '';
+        }
+    };
+
+    Array.from(normalized).forEach((char) => {
+        const nextKind = cjkCharacterPattern.test(char)
+            ? 'cjk'
+            : asciiAlphaNumericPattern.test(char)
+                ? 'latin'
+                : '';
+
+        if (!nextKind) {
+            pushCurrent();
+            return;
+        }
+
+        if (current && currentKind !== nextKind) {
+            pushCurrent();
+        }
+
+        current += char;
+        currentKind = nextKind;
+    });
+
+    pushCurrent();
+    return uniqueInOrder(tokens);
+};
+
+export const parseMediaSearchQuery = (value: string): ParsedMediaSearchQuery => {
+    const tokens = tokenizeSearchInput(value);
+    return {
+        normalized: normalizeSearchTerm(value),
+        tokens,
+        cjkTokens: tokens.filter(hasCJKSearchCharacter),
+    };
+};
 
 export const normalizeSearchField = (value: unknown) => {
     if (typeof value === 'number') {
@@ -51,3 +147,23 @@ export const buildMediaSearchText = (media: any) => {
 };
 
 export const buildMediaSearchIndex = (media: any) => normalizeSearchTerm(buildMediaSearchText(media));
+
+const buildPinyinTokens = async (value: string) => {
+    const pinyin = await loadPinyin();
+    const tokens = pinyin(normalizeCJKVariants(value), {
+        toneType: 'none',
+        type: 'array',
+        nonZh: 'removed',
+    });
+
+    return uniqueInOrder(tokens.map(normalizeSearchField).filter(Boolean));
+};
+
+export const buildMediaPhoneticSearchIndex = async (media: any): Promise<MediaPhoneticSearchIndex> => {
+    const tokens = await buildPinyinTokens(buildMediaSearchText(media));
+    return {
+        pinyinIndex: tokens.join(' '),
+        compactPinyinIndex: tokens.join(''),
+        initialsIndex: tokens.map((token) => token[0] || '').join(''),
+    };
+};

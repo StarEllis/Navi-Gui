@@ -64,6 +64,7 @@ export namespace main {
 	    everything_addr: string;
 	    scan_from_video_dir: boolean;
 	    enable_video_thumbnail: boolean;
+	    enable_gfriends_avatars: boolean;
 	    thumbnail_preview_count: number;
 	    thumbnail_min_duration_seconds: number;
 	    remote_bind_host: string;
@@ -108,6 +109,7 @@ export namespace main {
 	        this.everything_addr = source["everything_addr"];
 	        this.scan_from_video_dir = source["scan_from_video_dir"];
 	        this.enable_video_thumbnail = source["enable_video_thumbnail"];
+	        this.enable_gfriends_avatars = source["enable_gfriends_avatars"];
 	        this.thumbnail_preview_count = source["thumbnail_preview_count"];
 	        this.thumbnail_min_duration_seconds = source["thumbnail_min_duration_seconds"];
 	        this.remote_bind_host = source["remote_bind_host"];

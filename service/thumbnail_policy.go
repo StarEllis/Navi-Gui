@@ -109,6 +109,13 @@ func CountThumbnailPreviewImages(mediaPath string, sidecars *directorySidecarFil
 }
 
 func ResolveThumbnailState(media *model.Media, sidecars *directorySidecarFiles, settings ThumbnailSettings) string {
+	if media == nil {
+		return ThumbnailStatusNone
+	}
+	return resolveThumbnailStateWithPreviewCount(media, sidecars, settings, CountThumbnailPreviewImages(media.FilePath, sidecars))
+}
+
+func resolveThumbnailStateWithPreviewCount(media *model.Media, sidecars *directorySidecarFiles, settings ThumbnailSettings, previewCount int) string {
 	settings = normalizeThumbnailSettings(settings)
 	if media == nil {
 		return ThumbnailStatusNone
@@ -117,7 +124,6 @@ func ResolveThumbnailState(media *model.Media, sidecars *directorySidecarFiles, 
 	status := normalizeThumbnailStatus(media.ThumbnailStatus)
 	currentFingerprint := CurrentThumbnailFingerprint(media)
 	previousFingerprint := strings.TrimSpace(media.ThumbnailFingerprint)
-	previewCount := CountThumbnailPreviewImages(media.FilePath, sidecars)
 	hasAssets := HasThumbnailArtwork(media, sidecars) || previewCount > 0
 	hasAllAssets := HasAllThumbnailAssets(media, sidecars, settings)
 	autoEligible := IsThumbnailAutoEligible(media, sidecars, settings)
@@ -177,9 +183,14 @@ func ResolveThumbnailStateFromDisk(media *model.Media, thumbSvc *ThumbnailServic
 	sidecars := collectDirectorySidecarFiles(filepath.Dir(media.FilePath))
 	if thumbSvc != nil {
 		thumbSvc.syncPrimaryArtworkPaths(media, sidecars)
+		thumbSvc.syncGeneratedArtworkPaths(media)
+	} else {
+		syncGeneratedArtworkPaths(media)
 	}
-	syncGeneratedArtworkPaths(media)
 
 	status := ResolveThumbnailState(media, sidecars, settings)
+	if thumbSvc != nil {
+		status = thumbSvc.resolveThumbnailState(media, sidecars, settings)
+	}
 	return status, CurrentThumbnailFingerprint(media), nil
 }

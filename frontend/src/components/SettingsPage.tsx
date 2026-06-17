@@ -63,6 +63,8 @@ const TEXT = {
     everythingTip: 'Everything 现在会参与扫描主流程；正式入库前仍会对命中文件做本地校验，避免索引延迟误判。',
     videoThumbnail: '自动截图补图',
     videoThumbnailDesc: '只对无 NFO 且时长足够的电影视频生成 poster、fanart 和预览图。',
+    gfriendsAvatars: 'gfriends 演员头像',
+    gfriendsAvatarsDesc: '按需联网匹配 gfriends Filetree，并把命中的演员头像缓存到本地。',
     thumbnailMinDuration: '最短时长（分钟）',
     thumbnailMinDurationDesc: '只有严格大于这个时长的视频才会触发自动截图。',
     thumbnailPreviewCount: '预览图数量',
@@ -486,6 +488,18 @@ const SettingsPage: React.FC = () => {
                         <SettingSwitch
                             checked={!!settings.enable_video_thumbnail}
                             onChange={(checked) => updateSettings({ enable_video_thumbnail: checked })}
+                        />
+                    }
+                />
+
+                <SettingRow
+                    icon={UserRound}
+                    title={TEXT.gfriendsAvatars}
+                    description={TEXT.gfriendsAvatarsDesc}
+                    control={
+                        <SettingSwitch
+                            checked={!!settings.enable_gfriends_avatars}
+                            onChange={(checked) => updateSettings({ enable_gfriends_avatars: checked })}
                         />
                     }
                 />
