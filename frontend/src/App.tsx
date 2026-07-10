@@ -373,12 +373,22 @@ function App() {
             clearScanProgress();
         });
 
+        const unsubIncomplete = EventsOn("scan:incomplete", (data: any) => {
+            showStatus(`扫描未完成：${data?.message || '目录无法完整访问'}`);
+            updateScanTitle(data, '未完成 ');
+            scanStartedAtRef.current = null;
+            scanModeRef.current = '';
+            scheduleTitleReset();
+            clearScanProgress();
+        });
+
         return () => {
             unsubStart();
             unsubProgress();
             unsubComplete();
             unsubMetadata();
             unsubFail();
+            unsubIncomplete();
             if (resetTitleTimerRef.current) {
                 window.clearTimeout(resetTitleTimerRef.current);
             }

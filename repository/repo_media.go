@@ -752,6 +752,102 @@ func (r *MediaRepo) DeleteByIDs(ids []string) (int64, error) {
 	return r.deleteMediaWhere("id IN ?", ids)
 }
 
+const mediaDeleteBatchSize = 100
+
+// DeleteByIDsAndRepairSeries atomically deletes media associations and media rows,
+// then repairs or removes every affected series in the same transaction.
+func (r *MediaRepo) DeleteByIDsAndRepairSeries(ids []string) (int64, error) {
+	ids = normalizeIDs(ids)
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	var totalDeleted int64
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		affectedSeries := make(map[string]bool)
+
+		for i := 0; i < len(ids); i += mediaDeleteBatchSize {
+			end := i + mediaDeleteBatchSize
+			if end > len(ids) {
+				end = len(ids)
+			}
+			batch := ids[i:end]
+
+			var seriesIDs []string
+			if err := tx.Model(&model.Media{}).
+				Where("id IN ? AND series_id IS NOT NULL AND series_id != ''", batch).
+				Distinct("series_id").
+				Pluck("series_id", &seriesIDs).Error; err != nil {
+				return fmt.Errorf("load affected series: %w", err)
+			}
+			for _, seriesID := range seriesIDs {
+				if seriesID = strings.TrimSpace(seriesID); seriesID != "" {
+					affectedSeries[seriesID] = true
+				}
+			}
+
+			if _, err := deleteMediaAssociationsByIDs(tx, batch); err != nil {
+				return fmt.Errorf("delete media associations: %w", err)
+			}
+			deleted := tx.Unscoped().Where("id IN ?", batch).Delete(&model.Media{})
+			if deleted.Error != nil {
+				return fmt.Errorf("delete media rows: %w", deleted.Error)
+			}
+			totalDeleted += deleted.RowsAffected
+		}
+
+		for seriesID := range affectedSeries {
+			var episodeCount int64
+			if err := tx.Model(&model.Media{}).Where("series_id = ?", seriesID).Count(&episodeCount).Error; err != nil {
+				return fmt.Errorf("count series episodes %s: %w", seriesID, err)
+			}
+
+			if episodeCount == 0 {
+				if err := deleteLibraryScrapeRows(tx, nil, []string{seriesID}); err != nil {
+					return fmt.Errorf("delete empty series scrape rows %s: %w", seriesID, err)
+				}
+				if err := deleteLibrarySeriesAssociations(tx, []string{seriesID}); err != nil {
+					return fmt.Errorf("delete empty series associations %s: %w", seriesID, err)
+				}
+				deleted := tx.Unscoped().Where("id = ?", seriesID).Delete(&model.Series{})
+				if deleted.Error != nil {
+					return fmt.Errorf("delete empty series %s: %w", seriesID, deleted.Error)
+				}
+				if deleted.RowsAffected == 0 {
+					return fmt.Errorf("delete empty series %s: %w", seriesID, gorm.ErrRecordNotFound)
+				}
+				continue
+			}
+
+			var seasonNumbers []int
+			if err := tx.Model(&model.Media{}).
+				Where("series_id = ?", seriesID).
+				Distinct("season_num").
+				Pluck("season_num", &seasonNumbers).Error; err != nil {
+				return fmt.Errorf("count series seasons %s: %w", seriesID, err)
+			}
+			updated := tx.Model(&model.Series{}).
+				Where("id = ?", seriesID).
+				Updates(map[string]interface{}{
+					"episode_count": int(episodeCount),
+					"season_count":  len(seasonNumbers),
+				})
+			if updated.Error != nil {
+				return fmt.Errorf("update series counters %s: %w", seriesID, updated.Error)
+			}
+			if updated.RowsAffected == 0 {
+				return fmt.Errorf("update series counters %s: %w", seriesID, gorm.ErrRecordNotFound)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return totalDeleted, nil
+}
+
 // MediaPathRecord 媒体文件路径记录（轻量结构，仅包含 ID、路径和关联的 SeriesID）
 type MediaPathRecord struct {
 	ID       string

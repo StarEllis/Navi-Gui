@@ -7,6 +7,7 @@ import {
     DEFAULT_LIBRARY_VIEW_MODE,
     getLibraryConfig,
 } from '../utils/library';
+import { applyLibraryDeleteOutcome } from '../utils/libraryDeleteOutcome';
 
 interface LibraryFormModalProps {
     mode: 'create' | 'edit';
@@ -117,8 +118,12 @@ const LibraryFormModal: React.FC<LibraryFormModalProps> = ({
         }
 
         try {
-            await DeleteLibrary(library.id);
-            onDeleted();
+            const result = await DeleteLibrary(library.id);
+            if (!applyLibraryDeleteOutcome(result, onDeleted, (warning) => {
+                window.alert(`媒体库已删除，但缓存清理失败：${warning}`);
+            })) {
+                setMsg('删除失败：后端未确认媒体库已删除');
+            }
         } catch (error: any) {
             setMsg(`删除失败：${error}`);
         }

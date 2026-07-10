@@ -37,7 +37,21 @@ export namespace gorm {
 }
 
 export namespace main {
+
+	export class DeleteLibraryResult {
+	    deleted: boolean;
+	    warning?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new DeleteLibraryResult(source);
+	    }
 	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.deleted = source["deleted"];
+	        this.warning = source["warning"];
+	    }
+	}
 	export class DesktopSettings {
 	    player_path: string;
 	    use_external_player: boolean;
@@ -659,6 +673,8 @@ export namespace service {
 	    resolution: string;
 	    video_codec: string;
 	    rating: string;
+	    source_fingerprint: string;
+	    updated_fields: Array<string>;
 	
 	    static createFrom(source: any = {}) {
 	        return new NFOEditorData(source);
@@ -682,8 +698,9 @@ export namespace service {
 	        this.resolution = source["resolution"];
 	        this.video_codec = source["video_codec"];
 	        this.rating = source["rating"];
+	        this.source_fingerprint = source["source_fingerprint"];
+	        this.updated_fields = source["updated_fields"];
 	    }
 	}
 
 }
-

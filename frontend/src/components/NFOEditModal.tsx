@@ -36,7 +36,24 @@ const emptyForm: NFOEditorDraft = {
     resolution: '',
     video_codec: '',
     rating: '',
+	source_fingerprint: '',
+	updated_fields: [],
 };
+
+const editableFields = [
+	'title',
+	'code',
+	'release_date',
+	'director',
+	'series',
+	'publisher',
+	'maker',
+	'genres',
+	'actors',
+	'plot',
+	'runtime',
+	'rating',
+] as const;
 
 const emptyTokenDrafts: TokenDrafts = {
     genres: '',
@@ -171,11 +188,17 @@ const NFOEditModal: React.FC<NFOEditModalProps> = ({
         }
     };
 
-    const buildSaveDraft = () => ({
-        ...form,
-        genres: mergeTokens(form.genres, tokenDrafts.genres),
-        actors: mergeTokens(form.actors, tokenDrafts.actors),
-    });
+	const buildSaveDraft = () => {
+		const draft = {
+			...form,
+			genres: mergeTokens(form.genres, tokenDrafts.genres),
+			actors: mergeTokens(form.actors, tokenDrafts.actors),
+		};
+		return {
+			...draft,
+			updated_fields: editableFields.filter((field) => draft[field] !== (data?.[field] ?? '')),
+		};
+	};
 
     const renderChips = (field: TokenField, rawValue: string) => {
         const tokens = splitTokens(rawValue);

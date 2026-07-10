@@ -10,6 +10,7 @@ const (
 	EventScanStarted          = "scan:started"
 	EventScanProgress         = "scan:progress"
 	EventScanCompleted        = "scan:completed"
+	EventScanIncomplete       = "scan:incomplete"
 	EventScanFailed           = "scan:failed"
 	EventMediaMetadataUpdated = "media:metadata-updated"
 )

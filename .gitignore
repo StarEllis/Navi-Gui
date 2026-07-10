@@ -1,3 +1,20 @@
 build/bin
 node_modules
 frontend/dist
+.gocache/
+
+# Local application databases and SQLite runtime sidecars
+/alex.db
+/navi.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite3-journal
+
+# Runtime logs
+*.log

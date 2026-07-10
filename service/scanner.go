@@ -3,7 +3,9 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"go.uber.org/zap"
+	"gorm.io/gorm"
 	"navi-desktop/config"
 	"navi-desktop/model"
 	"navi-desktop/repository"
@@ -186,6 +189,10 @@ func isBitmapSubtitle(codec string) bool {
 }
 
 // ScannerService 媒体文件扫描服务
+type eventBroadcaster interface {
+	BroadcastEvent(string, interface{})
+}
+
 type ScannerService struct {
 	mediaRepo                 *repository.MediaRepo
 	seriesRepo                *repository.SeriesRepo
@@ -194,8 +201,8 @@ type ScannerService struct {
 	matchRuleRepo             *repository.MatchRuleRepo // P2: 自定义匹配规则
 	cfg                       *config.Config
 	logger                    *zap.SugaredLogger
-	wsHub                     *WSHub      // WebSocket事件广播
-	nfoService                *NFOService // NFO 本地元数据解析服务
+	wsHub                     eventBroadcaster // WebSocket事件广播
+	nfoService                *NFOService      // NFO 本地元数据解析服务
 	metadataHighPri           chan metadataCompletionTask
 	metadataNormal            chan metadataCompletionTask
 	metadataMu                sync.Mutex
@@ -207,6 +214,19 @@ type ScannerService struct {
 	gfriendsAvatarsEnabled    func() bool
 	sidecarCacheMu            sync.RWMutex
 	sidecarCache              map[string]directorySidecarCacheEntry
+	walkFileTree              func(string, filepath.WalkFunc) error
+	statFile                  func(string) (os.FileInfo, error)
+	readDir                   func(string) ([]os.DirEntry, error)
+	readFile                  func(string) ([]byte, error)
+	probeMediaFile            func(string) ([]byte, error)
+	scanContext               context.Context
+	strictScan                bool
+	deferMetadata             bool
+	deferMediaEvents          bool
+	deferredMediaEvents       []MediaMetadataEventData
+	preparedPreviewCounts     map[string]int
+	preparedProbes            map[string]preparedMediaProbe
+	scanStartAlreadyBroadcast bool
 }
 
 func NewScannerService(mediaRepo *repository.MediaRepo, seriesRepo *repository.SeriesRepo, personRepo *repository.PersonRepo, mediaPersonRepo *repository.MediaPersonRepo, cfg *config.Config, logger *zap.SugaredLogger) *ScannerService {
@@ -223,6 +243,10 @@ func NewScannerService(mediaRepo *repository.MediaRepo, seriesRepo *repository.S
 		metadataState:    make(map[string]metadataTaskPriority),
 		thumbnailService: NewThumbnailService(cfg, logger),
 		sidecarCache:     make(map[string]directorySidecarCacheEntry),
+		walkFileTree:     filepath.Walk,
+		statFile:         os.Stat,
+		readDir:          os.ReadDir,
+		readFile:         os.ReadFile,
 	}
 	service.startMetadataWorkers()
 	return service
@@ -234,6 +258,512 @@ type ScanOptions struct {
 	CleanDeleted   bool
 	UseEverything  bool
 	EverythingAddr string
+	Context        context.Context
+}
+
+type OverwriteScanResult struct {
+	Scanned              int
+	DeletedMediaIDs      []string
+	CacheCleanupWarnings []error
+	LastScan             time.Time
+}
+
+type scanRunResult struct {
+	Count        int
+	TotalTargets int
+	Cleaned      int
+}
+
+type preparedScanPath struct {
+	path string
+	info os.FileInfo
+}
+
+type preparedOverwriteIO struct {
+	paths         []preparedScanPath
+	infos         map[string]os.FileInfo
+	dirs          map[string][]os.DirEntry
+	files         map[string][]byte
+	probes        map[string]preparedMediaProbe
+	preparedNFOs  map[string]*preparedNFOFile
+	previewCounts map[string]int
+}
+
+type preparedMediaProbe struct {
+	videoCodec string
+	resolution string
+	audioCodec string
+	duration   float64
+	streamURL  string
+}
+
+func newPreparedMediaProbe(media *model.Media) preparedMediaProbe {
+	return preparedMediaProbe{
+		videoCodec: media.VideoCodec,
+		resolution: media.Resolution,
+		audioCodec: media.AudioCodec,
+		duration:   media.Duration,
+		streamURL:  media.StreamURL,
+	}
+}
+
+func (p preparedMediaProbe) apply(media *model.Media) {
+	media.VideoCodec = p.videoCodec
+	media.Resolution = p.resolution
+	media.AudioCodec = p.audioCodec
+	media.Duration = p.duration
+	media.StreamURL = p.streamURL
+}
+
+func newPreparedOverwriteIO() *preparedOverwriteIO {
+	return &preparedOverwriteIO{
+		infos:         make(map[string]os.FileInfo),
+		dirs:          make(map[string][]os.DirEntry),
+		files:         make(map[string][]byte),
+		probes:        make(map[string]preparedMediaProbe),
+		preparedNFOs:  make(map[string]*preparedNFOFile),
+		previewCounts: make(map[string]int),
+	}
+}
+
+func (p *preparedOverwriteIO) stat(path string) (os.FileInfo, error) {
+	if info, ok := p.infos[nfoPathKey(path)]; ok {
+		return info, nil
+	}
+	return nil, &os.PathError{Op: "stat", Path: path, Err: fs.ErrNotExist}
+}
+
+func (p *preparedOverwriteIO) readDir(path string) ([]os.DirEntry, error) {
+	entries, ok := p.dirs[nfoPathKey(path)]
+	if !ok {
+		return nil, &os.PathError{Op: "readdir", Path: path, Err: fs.ErrNotExist}
+	}
+	return append([]os.DirEntry(nil), entries...), nil
+}
+
+func (p *preparedOverwriteIO) readFile(path string) ([]byte, error) {
+	data, ok := p.files[nfoPathKey(path)]
+	if !ok {
+		return nil, &os.PathError{Op: "read", Path: path, Err: fs.ErrNotExist}
+	}
+	return append([]byte(nil), data...), nil
+}
+
+func (p *preparedOverwriteIO) walk(root string, walkFn filepath.WalkFunc) error {
+	root = normalizeMediaPath(root)
+	var skippedDir string
+	for _, entry := range p.paths {
+		if entry.path != root && !isPathWithinRoot(entry.path, root) {
+			continue
+		}
+		if skippedDir != "" && isPathWithinRoot(entry.path, skippedDir) {
+			continue
+		}
+		skippedDir = ""
+		err := walkFn(entry.path, entry.info, nil)
+		if errors.Is(err, filepath.SkipDir) && entry.info.IsDir() {
+			skippedDir = entry.path
+			continue
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *ScannerService) prepareOverwriteIO(library *model.Library, options ScanOptions) (*preparedOverwriteIO, error) {
+	prepared := newPreparedOverwriteIO()
+	seen := make(map[string]bool)
+	roots := library.RootPaths()
+	if len(roots) == 0 {
+		roots = []string{strings.TrimSpace(library.Path)}
+	}
+
+	for _, root := range roots {
+		root = normalizeMediaPath(root)
+		if root == "" || root == "." {
+			return nil, &ScanIncompleteError{Err: fmt.Errorf("library has no scan roots")}
+		}
+		err := s.walk(root, func(path string, info os.FileInfo, walkErr error) error {
+			if options.Context != nil {
+				select {
+				case <-options.Context.Done():
+					return options.Context.Err()
+				default:
+				}
+			}
+			if walkErr != nil {
+				return walkErr
+			}
+			if info == nil {
+				return fmt.Errorf("filesystem returned no information for %s", path)
+			}
+			path = normalizeMediaPath(path)
+			key := nfoPathKey(path)
+			if seen[key] {
+				return nil
+			}
+			seen[key] = true
+			prepared.paths = append(prepared.paths, preparedScanPath{path: path, info: info})
+			prepared.infos[key] = info
+			if info.IsDir() {
+				if _, ok := prepared.dirs[key]; !ok {
+					prepared.dirs[key] = nil
+				}
+			}
+			if path != root {
+				parentKey := nfoPathKey(filepath.Dir(path))
+				prepared.dirs[parentKey] = append(prepared.dirs[parentKey], fs.FileInfoToDirEntry(info))
+			}
+			return nil
+		})
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil, err
+			}
+			return nil, &ScanIncompleteError{Root: root, Err: err}
+		}
+		if err := options.Context.Err(); err != nil {
+			return nil, err
+		}
+		rootInfo, ok := prepared.infos[nfoPathKey(root)]
+		if !ok || !rootInfo.IsDir() {
+			return nil, &ScanIncompleteError{Root: root, Err: fmt.Errorf("scan root is not a directory")}
+		}
+	}
+
+	for key := range prepared.dirs {
+		sort.Slice(prepared.dirs[key], func(i, j int) bool {
+			return prepared.dirs[key][i].Name() < prepared.dirs[key][j].Name()
+		})
+	}
+
+	existingPaths := make(map[string]bool)
+	if records, err := s.mediaRepo.ListIDAndPathByLibrary(library.ID); err == nil {
+		for _, record := range records {
+			existingPaths[nfoPathKey(record.FilePath)] = true
+			if s.artworkCache != nil {
+				prepared.previewCounts[record.ID] = len(s.artworkCache.CachedMediaPreviews(record.ID))
+			}
+		}
+	} else {
+		return nil, fmt.Errorf("load media before overwrite preparation: %w", err)
+	}
+	var matchRules []model.MatchRule
+	if library.Type == "movie" && s.matchRuleRepo != nil {
+		matchRules, _ = s.matchRuleRepo.ListEnabled(library.ID)
+	}
+
+	for _, entry := range prepared.paths {
+		if err := options.Context.Err(); err != nil {
+			return nil, err
+		}
+		if entry.info.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(entry.path))
+		if ext == ".nfo" || ext == ".strm" {
+			data, err := s.read(entry.path)
+			if err != nil {
+				return nil, fmt.Errorf("prepare metadata file %s: %w", entry.path, err)
+			}
+			prepared.files[nfoPathKey(entry.path)] = data
+			if ext == ".nfo" && s.nfoService != nil {
+				prepared.preparedNFOs[nfoPathKey(entry.path)] = s.nfoService.prepareNFO(entry.path, data, entry.info)
+			}
+		}
+		if !supportedExts[ext] {
+			continue
+		}
+		if library.Type == "movie" {
+			if isExtrasPath(entry.path) || isExtrasFile(filepath.Base(entry.path)) {
+				continue
+			}
+			if !existingPaths[nfoPathKey(entry.path)] {
+				if library.EnableFileFilter && library.MinFileSize > 0 && entry.info.Size() < int64(library.MinFileSize)*1024*1024 {
+					continue
+				}
+				if s.applyMatchRulesSkip(entry.path, matchRules) {
+					continue
+				}
+			}
+		}
+		if ext == ".strm" {
+			streamURL, err := parseSTRMData(prepared.files[nfoPathKey(entry.path)])
+			if err != nil {
+				return nil, fmt.Errorf("probe media %s at STRM parse stage: %w", entry.path, err)
+			}
+			media := &model.Media{FilePath: entry.path}
+			s.probeSTRMMedia(media, streamURL)
+			prepared.probes[nfoPathKey(entry.path)] = newPreparedMediaProbe(media)
+			continue
+		}
+		output, err := s.runMediaProbe(entry.path)
+		if err != nil {
+			return nil, fmt.Errorf("probe media %s at ffprobe execution stage: %w", entry.path, err)
+		}
+		media := &model.Media{FilePath: entry.path}
+		if err := s.applyFFprobeOutput(media, output); err != nil {
+			return nil, fmt.Errorf("probe media %s at ffprobe decode stage: %w", entry.path, err)
+		}
+		prepared.probes[nfoPathKey(entry.path)] = newPreparedMediaProbe(media)
+	}
+	if err := options.Context.Err(); err != nil {
+		return nil, err
+	}
+	return prepared, nil
+}
+
+// ScanLibraryOverwrite performs the complete overwrite scan against a single
+// database transaction. The live scanner and its cache remain untouched until
+// that transaction commits.
+func (s *ScannerService) ScanLibraryOverwrite(db *gorm.DB, library *model.Library, options ScanOptions) (OverwriteScanResult, error) {
+	var result OverwriteScanResult
+	var runResult scanRunResult
+	if db == nil {
+		return result, fmt.Errorf("database is nil")
+	}
+	if library == nil {
+		return result, fmt.Errorf("library is nil")
+	}
+	options.Mode = "overwrite"
+	options.Incremental = false
+	options.CleanDeleted = true
+	if options.Context == nil {
+		options.Context = context.Background()
+	}
+	s.broadcastScanEvent(EventScanStarted, &ScanProgressData{
+		LibraryID:   library.ID,
+		LibraryName: library.Name,
+		Mode:        options.Mode,
+		Phase:       "preparing",
+		Message:     fmt.Sprintf("preparing overwrite scan: %s", library.Name),
+	})
+	prepared, prepareErr := s.prepareOverwriteIO(library, options)
+	if prepareErr != nil {
+		s.broadcastScanTerminal(library, options, runResult, prepareErr)
+		return OverwriteScanResult{}, prepareErr
+	}
+	// The prepared snapshot is authoritative for this run. Reaching out to
+	// Everything again here would put network and filesystem I/O back in the tx.
+	options.UseEverything = false
+	var committedMediaEvents []MediaMetadataEventData
+
+	err := db.Transaction(func(tx *gorm.DB) error {
+		txRepos := repository.NewRepositories(tx)
+		before, err := txRepos.Media.ListIDAndPathByLibrary(library.ID)
+		if err != nil {
+			return fmt.Errorf("load media before overwrite: %w", err)
+		}
+
+		txScanner := s.cloneForAtomicScan(txRepos, options.Context, prepared)
+		runResult, err = txScanner.scanLibraryWithOptionsCore(library, options)
+		if err != nil {
+			return err
+		}
+		result.Scanned = runResult.Count
+
+		after, err := txRepos.Media.ListIDAndPathByLibrary(library.ID)
+		if err != nil {
+			return fmt.Errorf("load media after overwrite: %w", err)
+		}
+		remaining := make(map[string]bool, len(after))
+		for _, record := range after {
+			remaining[record.ID] = true
+		}
+		for _, record := range before {
+			if !remaining[record.ID] {
+				result.DeletedMediaIDs = append(result.DeletedMediaIDs, record.ID)
+			}
+		}
+		result.LastScan = time.Now().UTC().Truncate(time.Second)
+		updatedLibrary := *library
+		updatedLibrary.LastScan = &result.LastScan
+		if err := txRepos.Library.Update(&updatedLibrary); err != nil {
+			return fmt.Errorf("update library last scan: %w", err)
+		}
+		committedMediaEvents = append(committedMediaEvents, txScanner.deferredMediaEvents...)
+		return nil
+	})
+	if err != nil {
+		s.broadcastScanTerminal(library, options, runResult, err)
+		return OverwriteScanResult{}, err
+	}
+	for _, event := range committedMediaEvents {
+		s.broadcastMediaMetadataEvent(event.MediaID, event.LibraryID, event.MetadataPhase, event.Message)
+	}
+	s.broadcastScanTerminal(library, options, runResult, nil)
+
+	if s.artworkCache != nil {
+		for _, mediaID := range result.DeletedMediaIDs {
+			if cacheErr := s.artworkCache.RemoveMedia(mediaID); cacheErr != nil {
+				s.logger.Warnf("overwrite committed but artwork cache cleanup failed: media=%s err=%v", mediaID, cacheErr)
+				result.CacheCleanupWarnings = append(result.CacheCleanupWarnings, cacheErr)
+			}
+		}
+	}
+	return result, nil
+}
+
+func (s *ScannerService) cloneForAtomicScan(repos *repository.Repositories, ctx context.Context, prepared *preparedOverwriteIO) *ScannerService {
+	clone := &ScannerService{
+		mediaRepo:                 repos.Media,
+		seriesRepo:                repos.Series,
+		personRepo:                repos.Person,
+		mediaPersonRepo:           repos.MediaPerson,
+		cfg:                       s.cfg,
+		logger:                    s.logger,
+		wsHub:                     s.wsHub,
+		nfoService:                s.nfoService,
+		metadataHighPri:           s.metadataHighPri,
+		metadataNormal:            s.metadataNormal,
+		metadataState:             make(map[string]metadataTaskPriority),
+		thumbnailService:          s.thumbnailService,
+		thumbnailSettingsProvider: s.thumbnailSettingsProvider,
+		sidecarCache:              make(map[string]directorySidecarCacheEntry),
+		walkFileTree:              prepared.walk,
+		statFile:                  prepared.stat,
+		readDir:                   prepared.readDir,
+		readFile:                  prepared.readFile,
+		preparedProbes:            prepared.probes,
+		scanContext:               ctx,
+		strictScan:                true,
+		deferMetadata:             true,
+		deferMediaEvents:          true,
+		preparedPreviewCounts:     prepared.previewCounts,
+		scanStartAlreadyBroadcast: true,
+	}
+	if s.nfoService != nil {
+		clone.nfoService = s.nfoService.cloneWithPreparedIO(prepared.readFile, prepared.stat, prepared.readDir, prepared.preparedNFOs)
+	}
+	if s.matchRuleRepo != nil {
+		clone.matchRuleRepo = repos.MatchRule
+	}
+	return clone
+}
+
+func (s *ScannerService) checkScanCanceled() error {
+	if s == nil || s.scanContext == nil {
+		return nil
+	}
+	select {
+	case <-s.scanContext.Done():
+		return s.scanContext.Err()
+	default:
+		return nil
+	}
+}
+
+// ScanIncompleteError means the filesystem could not be enumerated reliably.
+// Callers must not treat it as a successful scan or use it to delete records.
+type ScanIncompleteError struct {
+	Root string
+	Err  error
+}
+
+func (e *ScanIncompleteError) Error() string {
+	if e == nil {
+		return "scan incomplete"
+	}
+	if strings.TrimSpace(e.Root) == "" {
+		return fmt.Sprintf("scan incomplete: %v", e.Err)
+	}
+	return fmt.Sprintf("scan incomplete for root %s: %v", e.Root, e.Err)
+}
+
+func (e *ScanIncompleteError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func IsScanIncomplete(err error) bool {
+	var incomplete *ScanIncompleteError
+	return errors.As(err, &incomplete)
+}
+
+type scanRootSnapshot struct {
+	roots     []string
+	filePaths map[string]bool
+	complete  bool
+	failure   error
+}
+
+type scanRootResult struct {
+	root      string
+	filePaths map[string]bool
+	complete  bool
+	failure   error
+}
+
+func newScanRootResult(root string) *scanRootResult {
+	return &scanRootResult{
+		root:      normalizeMediaPath(root),
+		filePaths: make(map[string]bool),
+	}
+}
+
+func (r *scanRootResult) addFile(path string) {
+	if r == nil {
+		return
+	}
+	path = normalizeMediaPath(path)
+	if path != "" && path != "." {
+		r.filePaths[path] = true
+	}
+}
+
+func newScanRootSnapshot() *scanRootSnapshot {
+	return &scanRootSnapshot{
+		filePaths: make(map[string]bool),
+		complete:  true,
+	}
+}
+
+func (s *scanRootSnapshot) add(result *scanRootResult) {
+	if s == nil || result == nil {
+		return
+	}
+	s.roots = append(s.roots, result.root)
+	for path := range result.filePaths {
+		s.filePaths[path] = true
+	}
+	if !result.complete {
+		s.complete = false
+		if s.failure == nil {
+			s.failure = result.failure
+		}
+	}
+}
+
+func (s *ScannerService) walk(root string, walkFn filepath.WalkFunc) error {
+	if s.walkFileTree != nil {
+		return s.walkFileTree(root, walkFn)
+	}
+	return filepath.Walk(root, walkFn)
+}
+
+func (s *ScannerService) stat(path string) (os.FileInfo, error) {
+	if s.statFile != nil {
+		return s.statFile(path)
+	}
+	return os.Stat(path)
+}
+
+func (s *ScannerService) listDir(path string) ([]os.DirEntry, error) {
+	if s.readDir != nil {
+		return s.readDir(path)
+	}
+	return os.ReadDir(path)
+}
+
+func (s *ScannerService) read(path string) ([]byte, error) {
+	if s.readFile != nil {
+		return s.readFile(path)
+	}
+	return os.ReadFile(path)
 }
 
 type scanProgressTracker struct {
@@ -456,7 +986,11 @@ func previewPriorityFromName(name string) (int, bool) {
 }
 
 func readDirectoryModTime(dir string) time.Time {
-	info, err := os.Stat(dir)
+	return readDirectoryModTimeWithStat(dir, os.Stat)
+}
+
+func readDirectoryModTimeWithStat(dir string, stat func(string) (os.FileInfo, error)) time.Time {
+	info, err := stat(dir)
 	if err != nil || !info.IsDir() {
 		return time.Time{}
 	}
@@ -464,10 +998,14 @@ func readDirectoryModTime(dir string) time.Time {
 }
 
 func readDirectorySidecarSignature(dir string) directorySidecarSignature {
+	return readDirectorySidecarSignatureWithStat(dir, os.Stat)
+}
+
+func readDirectorySidecarSignatureWithStat(dir string, stat func(string) (os.FileInfo, error)) directorySidecarSignature {
 	return directorySidecarSignature{
-		dirModTime:          readDirectoryModTime(dir),
-		extraFanartModTime:  readDirectoryModTime(filepath.Join(dir, "extrafanart")),
-		behindScenesModTime: readDirectoryModTime(filepath.Join(dir, "behind the scenes")),
+		dirModTime:          readDirectoryModTimeWithStat(dir, stat),
+		extraFanartModTime:  readDirectoryModTimeWithStat(filepath.Join(dir, "extrafanart"), stat),
+		behindScenesModTime: readDirectoryModTimeWithStat(filepath.Join(dir, "behind the scenes"), stat),
 	}
 }
 
@@ -483,7 +1021,7 @@ func (s *ScannerService) buildDirectorySidecarFiles(dir string) *directorySideca
 		return collectDirectorySidecarFiles(dir)
 	}
 
-	signature := readDirectorySidecarSignature(dir)
+	signature := readDirectorySidecarSignatureWithStat(dir, s.stat)
 
 	s.sidecarCacheMu.RLock()
 	if entry, ok := s.sidecarCache[dir]; ok && entry.signature.equals(signature) && entry.sidecars != nil {
@@ -492,7 +1030,7 @@ func (s *ScannerService) buildDirectorySidecarFiles(dir string) *directorySideca
 	}
 	s.sidecarCacheMu.RUnlock()
 
-	sidecars := collectDirectorySidecarFiles(dir)
+	sidecars := s.collectDirectorySidecarFiles(dir)
 
 	s.sidecarCacheMu.Lock()
 	s.sidecarCache[dir] = directorySidecarCacheEntry{
@@ -505,11 +1043,19 @@ func (s *ScannerService) buildDirectorySidecarFiles(dir string) *directorySideca
 }
 
 func collectDirectorySidecarFiles(dir string) *directorySidecarFiles {
+	return collectDirectorySidecarFilesWithReadDir(dir, os.ReadDir)
+}
+
+func (s *ScannerService) collectDirectorySidecarFiles(dir string) *directorySidecarFiles {
+	return collectDirectorySidecarFilesWithReadDir(dir, s.listDir)
+}
+
+func collectDirectorySidecarFilesWithReadDir(dir string, readDir func(string) ([]os.DirEntry, error)) *directorySidecarFiles {
 	result := &directorySidecarFiles{
 		nfoByStem: make(map[string]string),
 	}
 
-	entries, err := os.ReadDir(dir)
+	entries, err := readDir(dir)
 	if err != nil {
 		return result
 	}
@@ -585,7 +1131,7 @@ func collectDirectorySidecarFiles(dir string) *directorySidecarFiles {
 	}
 	for _, sub := range previewSubDirs {
 		subPath := filepath.Join(dir, sub.name)
-		entries, err := os.ReadDir(subPath)
+		entries, err := readDir(subPath)
 		if err != nil {
 			continue
 		}
@@ -900,20 +1446,20 @@ func repairMisencodedUTF8Text(raw string) string {
 	return repaired
 }
 
-func (entry scanMediaEntry) resolvePathAndInfo() (string, os.FileInfo, error) {
+func (entry scanMediaEntry) resolvePathAndInfo(stat func(string) (os.FileInfo, error)) (string, os.FileInfo, error) {
 	path := normalizeMediaPath(entry.path)
 	if entry.info != nil {
 		return path, entry.info, nil
 	}
 
-	info, err := os.Stat(path)
+	info, err := stat(path)
 	if err == nil {
 		return path, info, nil
 	}
 
 	repairedPath := normalizeMediaPath(repairMisencodedUTF8Text(path))
 	if repairedPath != "" && repairedPath != path {
-		repairedInfo, repairedErr := os.Stat(repairedPath)
+		repairedInfo, repairedErr := stat(repairedPath)
 		if repairedErr == nil {
 			return repairedPath, repairedInfo, nil
 		}
@@ -944,11 +1490,15 @@ func buildVideoFingerprintFromStored(signature repository.MediaFileSignature) st
 }
 
 func buildSidecarFileStamp(path string) string {
+	return buildSidecarFileStampWithStat(path, os.Stat)
+}
+
+func buildSidecarFileStampWithStat(path string, stat func(string) (os.FileInfo, error)) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return ""
 	}
-	info, err := os.Stat(path)
+	info, err := stat(path)
 	if err != nil || info.IsDir() {
 		return ""
 	}
@@ -956,6 +1506,10 @@ func buildSidecarFileStamp(path string) string {
 }
 
 func buildSidecarFingerprint(mediaPath string, sidecars *directorySidecarFiles) string {
+	return buildSidecarFingerprintWithStat(mediaPath, sidecars, os.Stat)
+}
+
+func buildSidecarFingerprintWithStat(mediaPath string, sidecars *directorySidecarFiles, stat func(string) (os.FileInfo, error)) string {
 	if sidecars == nil {
 		sidecars = collectDirectorySidecarFiles(filepath.Dir(mediaPath))
 	}
@@ -964,27 +1518,35 @@ func buildSidecarFingerprint(mediaPath string, sidecars *directorySidecarFiles) 
 	}
 
 	parts := []string{
-		buildSidecarFileStamp(sidecars.nfoPathForMedia(mediaPath)),
-		buildSidecarFileStamp(sidecars.posterPathForMedia(mediaPath)),
-		buildSidecarFileStamp(sidecars.backdropPathForMedia(mediaPath)),
+		buildSidecarFileStampWithStat(sidecars.nfoPathForMedia(mediaPath), stat),
+		buildSidecarFileStampWithStat(sidecars.posterPathForMedia(mediaPath), stat),
+		buildSidecarFileStampWithStat(sidecars.backdropPathForMedia(mediaPath), stat),
 	}
 	for _, subtitlePath := range sidecars.subtitlesForMedia(mediaPath) {
-		parts = append(parts, buildSidecarFileStamp(subtitlePath))
+		parts = append(parts, buildSidecarFileStampWithStat(subtitlePath, stat))
 	}
 	return strings.Join(parts, "||")
 }
 
 func updateMediaSyncFingerprints(media *model.Media, mediaPath string, info os.FileInfo, sidecars *directorySidecarFiles) {
+	updateMediaSyncFingerprintsWithStat(media, mediaPath, info, sidecars, os.Stat)
+}
+
+func updateMediaSyncFingerprintsWithStat(media *model.Media, mediaPath string, info os.FileInfo, sidecars *directorySidecarFiles, stat func(string) (os.FileInfo, error)) {
 	if media == nil {
 		return
 	}
 	media.VideoFingerprint = buildVideoFingerprintFromInfo(info)
-	media.SidecarFingerprint = buildSidecarFingerprint(mediaPath, sidecars)
+	media.SidecarFingerprint = buildSidecarFingerprintWithStat(mediaPath, sidecars, stat)
 }
 
 func shouldRefreshExistingMovieMedia(options ScanOptions, signature repository.MediaFileSignature, mediaPath string, info os.FileInfo, sidecars *directorySidecarFiles) (bool, bool) {
+	return shouldRefreshExistingMovieMediaWithStat(options, signature, mediaPath, info, sidecars, os.Stat)
+}
+
+func shouldRefreshExistingMovieMediaWithStat(options ScanOptions, signature repository.MediaFileSignature, mediaPath string, info os.FileInfo, sidecars *directorySidecarFiles, stat func(string) (os.FileInfo, error)) (bool, bool) {
 	currentVideoFingerprint := buildVideoFingerprintFromInfo(info)
-	currentSidecarFingerprint := buildSidecarFingerprint(mediaPath, sidecars)
+	currentSidecarFingerprint := buildSidecarFingerprintWithStat(mediaPath, sidecars, stat)
 	storedVideoFingerprint := buildVideoFingerprintFromStored(signature)
 	storedSidecarFingerprint := strings.TrimSpace(signature.SidecarFingerprint)
 
@@ -999,175 +1561,165 @@ func shouldRefreshExistingMovieMedia(options ScanOptions, signature repository.M
 	return true, videoChanged
 }
 
-/*
 func (s *ScannerService) ScanLibraryWithOptions(library *model.Library, options ScanOptions) (int, error) {
-	s.logger.Infof("寮€濮嬫壂鎻忓獟浣撳簱: %s (%s), mode=%s", library.Name, library.Path, options.Mode)
-
-	s.broadcastScanEvent(EventScanStarted, &ScanProgressData{
-		LibraryID:   library.ID,
-		LibraryName: library.Name,
-		Phase:       "scanning",
-		Message:     fmt.Sprintf("寮€濮嬫壂鎻忓獟浣撳簱: %s", library.Name),
-	})
-
-	rootPaths := library.RootPaths()
-	if len(rootPaths) == 0 {
-		rootPaths = []string{strings.TrimSpace(library.Path)}
+	result, err := s.scanLibraryWithOptionsCore(library, options)
+	if library != nil {
+		s.broadcastScanTerminal(library, options, result, err)
 	}
-
-	var count int
-	var err error
-
-	for _, rootPath := range rootPaths {
-		if strings.TrimSpace(rootPath) == "" {
-			continue
-		}
-		rootLibrary := *library
-		rootLibrary.Path = rootPath
-
-		var scanned int
-		switch library.Type {
-		case "tvshow":
-			scanned, err = s.scanTVShowLibrary(&rootLibrary)
-		case "mixed":
-			scanned, err = s.scanMixedLibrary(&rootLibrary)
-		default:
-			scanned, err = s.scanMovieLibraryWithOptions(&rootLibrary, options)
-		}
-		count += scanned
-		if err != nil {
-			break
-		}
-	}
-
-	if err != nil {
-		s.broadcastScanEvent(EventScanFailed, &ScanProgressData{
-			LibraryID:   library.ID,
-			LibraryName: library.Name,
-			Phase:       "scanning",
-			NewFound:    count,
-			Message:     fmt.Sprintf("鎵弿鍑洪敊: %v", err),
-		})
-	} else {
-		s.broadcastScanEvent(EventScanCompleted, &ScanProgressData{
-			LibraryID:   library.ID,
-			LibraryName: library.Name,
-			Phase:       "scanning",
-			NewFound:    count,
-			Message:     fmt.Sprintf("scan completed: %s, new media: %d", library.Name, count),
-			/*
-			* /
-			/*
-			Message:     fmt.Sprintf("鎵弿瀹屾垚: %s, 鏂板 %d 涓獟浣?, library.Name, count),
-		})
-	}
-
-			* /
-		})
-	}
-
-	cleaned := 0
-	if options.CleanDeleted {
-		cleaned = s.cleanDeletedFiles(library)
-		if cleaned > 0 {
-			s.logger.Infof("cleaned deleted media records: %s, cleaned=%d", library.Name, cleaned)
-			/*
-			s.logger.Infof("娓呯悊宸插垹闄ゆ枃浠? %s, 鍏辨竻鐞?%d 鏉¤褰?, library.Name, cleaned)
-		}
-	}
-
-	s.logger.Infof("鎵弿瀹屾垚: %s, 鏂板 %d 涓獟浣? 娓呯悊 %d 鏉″凡鍒犻櫎璁板綍", library.Name, count, cleaned)
-			* /
-		}
-	}
-
-	s.logger.Infof("scan finished: %s, new=%d, cleaned=%d", library.Name, count, cleaned)
-	return count, err
+	return result.Count, err
 }
 
-// SetMatchRuleRepo 设置匹配规则仓储（延迟注入）
-*/
+func (s *ScannerService) scanLibraryWithOptionsCore(library *model.Library, options ScanOptions) (scanRunResult, error) {
+	if library == nil {
+		return scanRunResult{}, fmt.Errorf("library is nil")
+	}
+	if options.Mode == "overwrite" && !s.strictScan {
+		return scanRunResult{}, fmt.Errorf("overwrite scans must use ScanLibraryOverwrite")
+	}
+	if options.Context != nil {
+		select {
+		case <-options.Context.Done():
+			return scanRunResult{}, options.Context.Err()
+		default:
+		}
+	}
 
-func (s *ScannerService) ScanLibraryWithOptions(library *model.Library, options ScanOptions) (int, error) {
 	s.logger.Infof("start scanning library: %s (%s), mode=%s", library.Name, library.Path, options.Mode)
-	totalTargets := s.countScanTargets(library, options)
+	totalTargets := 0
 	s.beginScanProgress(library, options.Mode, totalTargets)
 	defer s.endScanProgress(library.ID)
 
-	s.broadcastScanEvent(EventScanStarted, &ScanProgressData{
-		LibraryID:   library.ID,
-		LibraryName: library.Name,
-		Mode:        options.Mode,
-		Phase:       "scanning",
-		Total:       totalTargets,
-		Message:     fmt.Sprintf("start scanning: %s", library.Name),
-	})
+	if !s.scanStartAlreadyBroadcast {
+		s.broadcastScanEvent(EventScanStarted, &ScanProgressData{
+			LibraryID:   library.ID,
+			LibraryName: library.Name,
+			Mode:        options.Mode,
+			Phase:       "scanning",
+			Total:       totalTargets,
+			Message:     fmt.Sprintf("start scanning: %s", library.Name),
+		})
+	}
 
 	rootPaths := library.RootPaths()
 	if len(rootPaths) == 0 {
 		rootPaths = []string{strings.TrimSpace(library.Path)}
 	}
+	normalizedRoots := make([]string, 0, len(rootPaths))
+	for _, rootPath := range rootPaths {
+		rootPath = normalizeMediaPath(rootPath)
+		if rootPath != "" && rootPath != "." {
+			normalizedRoots = append(normalizedRoots, rootPath)
+		}
+	}
 
 	var count int
-	var err error
+	var scanErr error
+	cleanDeleted := options.CleanDeleted || options.Mode == "delete_update" || options.Mode == "overwrite"
+	snapshot := newScanRootSnapshot()
+	if len(normalizedRoots) == 0 {
+		scanErr = &ScanIncompleteError{Err: fmt.Errorf("library has no scan roots")}
+		snapshot.complete = false
+		snapshot.failure = scanErr
+	}
 
-	for _, rootPath := range rootPaths {
-		if strings.TrimSpace(rootPath) == "" {
-			continue
+	for _, rootPath := range normalizedRoots {
+		if scanErr != nil {
+			break
+		}
+		if err := s.checkScanCanceled(); err != nil {
+			scanErr = err
+			break
 		}
 
 		rootLibrary := *library
 		rootLibrary.Path = rootPath
 
 		var scanned int
+		var result *scanRootResult
+		var err error
 		switch library.Type {
 		case "tvshow":
-			scanned, err = s.scanTVShowLibrary(&rootLibrary)
+			scanned, result, err = s.scanTVShowLibrary(&rootLibrary)
 		case "mixed":
-			scanned, err = s.scanMixedLibrary(&rootLibrary)
+			scanned, result, err = s.scanMixedLibrary(&rootLibrary)
 		default:
-			scanned, err = s.scanMovieLibraryWithOptions(&rootLibrary, options)
+			scanned, result, err = s.scanMovieLibraryWithOptions(&rootLibrary, options)
 		}
+		if result == nil {
+			result = newScanRootResult(rootPath)
+		}
+		result.complete = err == nil
+		result.failure = err
+		snapshot.add(result)
 		count += scanned
 		if err != nil {
+			scanErr = err
 			break
 		}
 	}
-
-	if err != nil {
-		s.broadcastScanEvent(EventScanFailed, &ScanProgressData{
-			LibraryID:   library.ID,
-			LibraryName: library.Name,
-			Mode:        options.Mode,
-			Phase:       "scanning",
-			NewFound:    count,
-			Current:     totalTargets,
-			Total:       totalTargets,
-			Message:     fmt.Sprintf("scan failed: %v", err),
-		})
-	} else {
-		s.broadcastScanEvent(EventScanCompleted, &ScanProgressData{
-			LibraryID:   library.ID,
-			LibraryName: library.Name,
-			Mode:        options.Mode,
-			Phase:       "scanning",
-			NewFound:    count,
-			Current:     totalTargets,
-			Total:       totalTargets,
-			Message:     fmt.Sprintf("scan completed: %s, new media: %d", library.Name, count),
-		})
+	totalTargets = len(snapshot.filePaths)
+	if scanErr == nil && options.Mode == "overwrite" {
+		scanErr = s.forceRefreshSnapshotMetadata(library, snapshot)
 	}
 
 	cleaned := 0
-	if options.CleanDeleted {
-		cleaned = s.cleanDeletedFiles(library)
-		if cleaned > 0 {
-			s.logger.Infof("cleaned deleted media records: %s, cleaned=%d", library.Name, cleaned)
+	if scanErr == nil && cleanDeleted {
+		if !snapshot.complete || len(snapshot.roots) != len(normalizedRoots) {
+			scanErr = &ScanIncompleteError{Err: snapshot.failure}
+		} else {
+			cleaned, scanErr = s.syncDeletedRecords(library, snapshot)
 		}
 	}
 
-	s.logger.Infof("scan finished: %s, new=%d, cleaned=%d", library.Name, count, cleaned)
-	return count, err
+	result := scanRunResult{
+		Count:        count,
+		TotalTargets: totalTargets,
+		Cleaned:      cleaned,
+	}
+
+	s.logger.Infof("scan database phase finished: %s, new=%d, cleaned=%d", library.Name, count, cleaned)
+	return result, scanErr
+}
+
+func (s *ScannerService) broadcastScanTerminal(library *model.Library, options ScanOptions, result scanRunResult, scanErr error) {
+	if library == nil {
+		return
+	}
+	eventType := scanTerminalEvent(scanErr)
+	phase := "completed"
+	message := fmt.Sprintf("scan completed: %s, new media: %d", library.Name, result.Count)
+	if scanErr != nil {
+		phase = "failed"
+		message = scanErr.Error()
+		if errors.Is(scanErr, context.Canceled) {
+			phase = "canceled"
+		} else if IsScanIncomplete(scanErr) {
+			phase = "incomplete"
+		}
+	}
+
+	s.broadcastScanEvent(eventType, &ScanProgressData{
+		LibraryID:   library.ID,
+		LibraryName: library.Name,
+		Mode:        options.Mode,
+		Phase:       phase,
+		NewFound:    result.Count,
+		Current:     result.TotalTargets,
+		Total:       result.TotalTargets,
+		Cleaned:     result.Cleaned,
+		Message:     message,
+	})
+	s.logger.Infof("scan finished: %s, new=%d, cleaned=%d, err=%v", library.Name, result.Count, result.Cleaned, scanErr)
+}
+
+func scanTerminalEvent(err error) string {
+	if err == nil {
+		return EventScanCompleted
+	}
+	if IsScanIncomplete(err) {
+		return EventScanIncomplete
+	}
+	return EventScanFailed
 }
 
 func (s *ScannerService) SetMatchRuleRepo(repo *repository.MatchRuleRepo) {
@@ -1293,6 +1845,9 @@ func (s *ScannerService) enqueueMetadataCompletion(mediaID string, libraryID str
 	if mediaID == "" {
 		return false
 	}
+	if s.deferMetadata {
+		return true
+	}
 
 	s.metadataMu.Lock()
 	current, exists := s.metadataState[mediaID]
@@ -1357,15 +1912,19 @@ func (s *ScannerService) runMetadataCompletionTask(task metadataCompletionTask) 
 }
 
 func (s *ScannerService) completeMediaMetadataByID(mediaID string) error {
+	return s.completeMediaMetadataByIDWithMode(mediaID, false)
+}
+
+func (s *ScannerService) completeMediaMetadataByIDWithMode(mediaID string, force bool) error {
 	media, err := s.mediaRepo.FindByID(mediaID)
 	if err != nil || media == nil {
 		return err
 	}
-	if !NeedsMetadataCompletion(media) {
+	if !force && !NeedsMetadataCompletion(media) {
 		return nil
 	}
 
-	info, statErr := os.Stat(media.FilePath)
+	info, statErr := s.stat(media.FilePath)
 	if statErr != nil || info.IsDir() {
 		s.markMediaMetadataPhase(media.ID, media.LibraryID, MetadataPhaseFailed, "metadata completion failed")
 		if statErr != nil {
@@ -1379,15 +1938,22 @@ func (s *ScannerService) completeMediaMetadataByID(mediaID string) error {
 	if media.MediaType == "movie" {
 		sidecars = s.buildDirectorySidecarFiles(filepath.Dir(media.FilePath))
 		s.scanExternalSubtitlesWithSidecars(media, sidecars)
-		s.applyLocalSidecarsWithMode(media, media.FilePath, sidecars, true)
+		if err := s.applyLocalSidecarsWithMode(media, media.FilePath, sidecars, true); err != nil {
+			return fmt.Errorf("parse local metadata for %s: %w", media.FilePath, err)
+		}
 	} else {
 		s.scanExternalSubtitles(media)
 	}
-	s.probeMediaInfo(media)
+	if probeErr := s.probeMediaInfo(media); probeErr != nil {
+		s.logger.Warnf("media probe failed: path=%s stage=%v", media.FilePath, probeErr)
+		if force {
+			return fmt.Errorf("probe media %s: %w", media.FilePath, probeErr)
+		}
+	}
 	if media.MediaType == "movie" {
 		s.resolveThumbnailState(media, sidecars)
 	}
-	updateMediaSyncFingerprints(media, media.FilePath, info, sidecars)
+	updateMediaSyncFingerprintsWithStat(media, media.FilePath, info, sidecars, s.stat)
 	media.MetadataPhase = MetadataPhaseFull
 
 	if err := s.mediaRepo.Update(media); err != nil {
@@ -1396,7 +1962,9 @@ func (s *ScannerService) completeMediaMetadataByID(mediaID string) error {
 	}
 
 	if media.MediaType == "movie" {
-		s.SyncActorsForMedia(media)
+		if err := s.syncActorsForMedia(media, force); err != nil {
+			return err
+		}
 	}
 	s.broadcastMediaMetadataEvent(media.ID, media.LibraryID, media.MetadataPhase, "metadata completed")
 	return nil
@@ -1415,6 +1983,15 @@ func (s *ScannerService) markMediaMetadataPhase(mediaID string, libraryID string
 }
 
 func (s *ScannerService) broadcastMediaMetadataEvent(mediaID string, libraryID string, phase string, message string) {
+	if s.deferMediaEvents {
+		s.deferredMediaEvents = append(s.deferredMediaEvents, MediaMetadataEventData{
+			MediaID:       mediaID,
+			LibraryID:     libraryID,
+			MetadataPhase: NormalizeMetadataPhase(phase),
+			Message:       message,
+		})
+		return
+	}
 	if s.wsHub == nil {
 		return
 	}
@@ -1428,20 +2005,21 @@ func (s *ScannerService) broadcastMediaMetadataEvent(mediaID string, libraryID s
 }
 
 func (s *ScannerService) applyLocalSidecars(media *model.Media, mediaPath string, sidecars *directorySidecarFiles) {
-	s.applyLocalSidecarsWithMode(media, mediaPath, sidecars, false)
+	_ = s.applyLocalSidecarsWithMode(media, mediaPath, sidecars, false)
 }
 
-func (s *ScannerService) applyLocalSidecarsWithMode(media *model.Media, mediaPath string, sidecars *directorySidecarFiles, overwrite bool) {
+func (s *ScannerService) applyLocalSidecarsWithMode(media *model.Media, mediaPath string, sidecars *directorySidecarFiles, overwrite bool) error {
 	if media == nil {
-		return
+		return nil
 	}
 	if sidecars == nil {
-		return
+		return nil
 	}
 
 	if nfoPath := sidecars.nfoPathForMedia(mediaPath); nfoPath != "" {
 		if parseErr := s.nfoService.ParseMovieNFO(nfoPath, media); parseErr != nil {
 			s.logger.Debugf("parse NFO failed: %s, err=%v", nfoPath, parseErr)
+			return parseErr
 		}
 	}
 
@@ -1463,12 +2041,12 @@ func (s *ScannerService) applyLocalSidecarsWithMode(media *model.Media, mediaPat
 		if backdropPath != "" && media.BackdropPath == "" {
 			media.BackdropPath = backdropPath
 		}
-		return
+		return nil
 	}
 	if overwrite {
 		media.PosterPath = posterPath
 		media.BackdropPath = backdropPath
-		return
+		return nil
 	}
 	if posterPath != "" && media.PosterPath == "" {
 		media.PosterPath = posterPath
@@ -1476,6 +2054,7 @@ func (s *ScannerService) applyLocalSidecarsWithMode(media *model.Media, mediaPat
 	if backdropPath != "" && media.BackdropPath == "" {
 		media.BackdropPath = backdropPath
 	}
+	return nil
 }
 
 func (s *ScannerService) resolveThumbnailState(media *model.Media, sidecars *directorySidecarFiles) {
@@ -1486,12 +2065,29 @@ func (s *ScannerService) resolveThumbnailState(media *model.Media, sidecars *dir
 		sidecars = s.buildDirectorySidecarFiles(filepath.Dir(media.FilePath))
 	}
 
-	if s.thumbnailService != nil {
+	if s.strictScan && s.preparedPreviewCounts != nil {
+		previewCount := s.preparedPreviewCounts[media.ID] + countPreparedSidecarPreviews(media.FilePath, sidecars)
+		media.ThumbnailStatus = resolveThumbnailStateWithPreviewCount(media, sidecars, s.thumbnailSettings(), previewCount)
+	} else if s.thumbnailService != nil {
 		media.ThumbnailStatus = s.thumbnailService.resolveThumbnailState(media, sidecars, s.thumbnailSettings())
 	} else {
 		media.ThumbnailStatus = ResolveThumbnailState(media, sidecars, s.thumbnailSettings())
 	}
 	media.ThumbnailFingerprint = CurrentThumbnailFingerprint(media)
+}
+
+func countPreparedSidecarPreviews(mediaPath string, sidecars *directorySidecarFiles) int {
+	if sidecars == nil {
+		return 0
+	}
+	requirePrefix := sidecars.hasMultipleVideos()
+	seen := make(map[string]bool)
+	for _, candidate := range sidecars.previewFiles {
+		if !seen[candidate.path] && previewBelongsToMediaFile(candidate.name, mediaPath, requirePrefix) {
+			seen[candidate.path] = true
+		}
+	}
+	return len(seen)
 }
 
 func (s *ScannerService) applyLibraryMetadataMode(library *model.Library, media *model.Media) {
@@ -1551,9 +2147,9 @@ func (s *ScannerService) requestMetadataCompletionIfNeeded(media *model.Media) b
 	return s.enqueueMetadataCompletion(media.ID, media.LibraryID, metadataTaskPriorityNormal)
 }
 
-func (s *ScannerService) updateExistingEpisodeRecord(existing *model.Media, seriesID string, title string, ep EpisodeInfo) bool {
+func (s *ScannerService) updateExistingEpisodeRecord(existing *model.Media, seriesID string, title string, ep EpisodeInfo) (bool, error) {
 	if existing == nil {
-		return false
+		return false, nil
 	}
 
 	needUpdate := false
@@ -1595,40 +2191,84 @@ func (s *ScannerService) updateExistingEpisodeRecord(existing *model.Media, seri
 	if needUpdate {
 		if err := s.mediaRepo.Update(existing); err != nil {
 			s.logger.Warnf("update existing episode failed: %s, err=%v", existing.FilePath, err)
+			return false, err
 		}
 	}
 
 	s.requestMetadataCompletionIfNeeded(existing)
-	return needUpdate
+	return needUpdate, nil
 }
 
 // SyncActorsForMedia replaces a movie's actor relations with the actors from its local NFO.
 func (s *ScannerService) SyncActorsForMedia(media *model.Media) {
-	if media == nil || media.ID == "" || media.FilePath == "" || s.personRepo == nil || s.mediaPersonRepo == nil {
-		return
+	if err := s.syncActorsForMedia(media, false); err != nil && s.logger != nil {
+		s.logger.Warnf("sync media actors failed: media=%s err=%v", media.ID, err)
+	}
+}
+
+// SyncActorsForMediaStrict is used after an explicit NFO edit. Unlike ordinary
+// scanning, relation failures are returned so callers cannot report success.
+func (s *ScannerService) SyncActorsForMediaStrict(media *model.Media) error {
+	return s.syncActorsForMedia(media, true)
+}
+
+// SyncActorsForMediaStrictWithDB binds the relation work to the caller's
+// transaction. NFO file replacement is completed before callers open that tx.
+func (s *ScannerService) SyncActorsForMediaStrictWithDB(media *model.Media, db *gorm.DB) error {
+	if db == nil {
+		return fmt.Errorf("database is nil")
+	}
+	repos := repository.NewRepositories(db)
+	return s.syncActorsForMediaWithRepos(media, true, repos.Person, repos.MediaPerson)
+}
+
+func (s *ScannerService) syncActorsForMedia(media *model.Media, strict bool) error {
+	return s.syncActorsForMediaWithRepos(media, strict, s.personRepo, s.mediaPersonRepo)
+}
+
+func (s *ScannerService) syncActorsForMediaWithRepos(media *model.Media, strict bool, personRepo *repository.PersonRepo, mediaPersonRepo *repository.MediaPersonRepo) error {
+	if media == nil || media.ID == "" || media.FilePath == "" || personRepo == nil || mediaPersonRepo == nil {
+		return nil
 	}
 
 	nfoPath := s.nfoService.FindNFOForMedia(media.FilePath)
 	if nfoPath == "" {
-		return
+		return nil
 	}
 
-	actors, _, err := s.nfoService.GetActorsFromNFO(nfoPath)
-	if err != nil || len(actors) == 0 {
-		return
+	actorMetadata, err := s.nfoService.GetActorMetadataFromNFO(nfoPath)
+	if err != nil {
+		if strict {
+			return fmt.Errorf("parse actors from %s: %w", nfoPath, err)
+		}
+		return nil
+	}
+	if !actorMetadata.ActorsPresent {
+		return nil
+	}
+	if !strict && len(actorMetadata.Actors) == 0 {
+		return nil
 	}
 
-	_ = s.mediaPersonRepo.DeleteByMediaID(media.ID)
+	if err := mediaPersonRepo.DeleteByMediaID(media.ID); err != nil {
+		if strict {
+			return fmt.Errorf("delete old actor relations for %s: %w", media.ID, err)
+		}
+		return nil
+	}
 	seen := make(map[string]bool)
-	for index, actor := range actors {
+	for index, actor := range actorMetadata.Actors {
 		name := strings.TrimSpace(actor.Name)
 		if name == "" || seen[name] {
 			continue
 		}
 		seen[name] = true
 
-		person, err := s.personRepo.FindOrCreate(name, 0)
+		person, err := personRepo.FindOrCreate(name, 0)
 		if err != nil || person == nil {
+			if strict && err != nil {
+				return fmt.Errorf("find or create actor %s: %w", name, err)
+			}
 			continue
 		}
 		if s.shouldFetchGfriendsAvatars() && (strings.TrimSpace(person.ProfileURL) == "" || !fileExists(person.ProfileURL)) {
@@ -1636,7 +2276,7 @@ func (s *ScannerService) SyncActorsForMedia(media *model.Media) {
 			if avatarErr != nil {
 				s.logger.Debugf("ensure actor avatar failed: actor=%s err=%v", name, avatarErr)
 			} else if changed {
-				if updateErr := s.personRepo.Update(person); updateErr != nil {
+				if updateErr := personRepo.Update(person); updateErr != nil {
 					s.logger.Warnf("persist actor avatar failed: actor=%s err=%v", name, updateErr)
 				}
 			}
@@ -1647,591 +2287,201 @@ func (s *ScannerService) SyncActorsForMedia(media *model.Media) {
 			sortOrder = index
 		}
 
-		if err := s.mediaPersonRepo.Create(&model.MediaPerson{
+		if err := mediaPersonRepo.Create(&model.MediaPerson{
 			MediaID:   media.ID,
 			PersonID:  person.ID,
 			Role:      "actor",
 			SortOrder: sortOrder,
 		}); err != nil {
+			if strict {
+				return fmt.Errorf("persist actor relation for %s: %w", media.ID, err)
+			}
 			s.logger.Warnf("persist actor relation failed: media=%s actor=%s err=%v", media.ID, name, err)
 		}
 	}
+	return nil
 }
 
 // ScanLibrary 扫描媒体库目录
 func (s *ScannerService) ScanLibrary(library *model.Library) (int, error) {
-	s.logger.Infof("开始扫描媒体库: %s (%s)", library.Name, library.Path)
-
-	// 发送扫描开始事件
-	s.broadcastScanEvent(EventScanStarted, &ScanProgressData{
-		LibraryID:   library.ID,
-		LibraryName: library.Name,
-		Phase:       "scanning",
-		Message:     fmt.Sprintf("开始扫描媒体库: %s", library.Name),
+	return s.ScanLibraryWithOptions(library, ScanOptions{
+		Mode:         "incremental",
+		Incremental:  true,
+		CleanDeleted: true,
 	})
-
-	// 根据媒体库类型采用不同的扫描策略
-	rootPaths := library.RootPaths()
-	if len(rootPaths) == 0 {
-		rootPaths = []string{strings.TrimSpace(library.Path)}
-	}
-
-	var count int
-	var err error
-
-	for _, rootPath := range rootPaths {
-		if strings.TrimSpace(rootPath) == "" {
-			continue
-		}
-		rootLibrary := *library
-		rootLibrary.Path = rootPath
-
-		var scanned int
-		switch library.Type {
-		case "tvshow":
-			scanned, err = s.scanTVShowLibrary(&rootLibrary)
-		case "mixed":
-			scanned, err = s.scanMixedLibrary(&rootLibrary)
-		default:
-			scanned, err = s.scanMovieLibrary(&rootLibrary)
-		}
-		count += scanned
-		if err != nil {
-			break
-		}
-	}
-
-	if err != nil {
-		s.broadcastScanEvent(EventScanFailed, &ScanProgressData{
-			LibraryID:   library.ID,
-			LibraryName: library.Name,
-			Phase:       "scanning",
-			NewFound:    count,
-			Message:     fmt.Sprintf("扫描出错: %v", err),
-		})
-	} else {
-		s.broadcastScanEvent(EventScanCompleted, &ScanProgressData{
-			LibraryID:   library.ID,
-			LibraryName: library.Name,
-			Phase:       "scanning",
-			NewFound:    count,
-			Message:     fmt.Sprintf("扫描完成: %s, 新增 %d 个媒体", library.Name, count),
-		})
-	}
-
-	// ==================== 增量扫描自动清理已删除文件 ====================
-	cleaned := s.cleanDeletedFiles(library)
-	if cleaned > 0 {
-		s.logger.Infof("清理已删除文件: %s, 共清理 %d 条记录", library.Name, cleaned)
-	}
-
-	s.logger.Infof("扫描完成: %s, 新增 %d 个媒体, 清理 %d 条已删除记录", library.Name, count, cleaned)
-	return count, err
 }
 
-// cleanDeletedFiles 清理数据库中记录了但磁盘上已不存在的文件
-// 遍历该媒体库所有数据库记录，检查文件是否仍存在于磁盘，不存在则删除记录
-// 同时更新受影响的 Series 合集统计信息，清理变为空的合集
-func (s *ScannerService) cleanDeletedFiles(library *model.Library) int {
-	// 获取该媒体库所有媒体的 ID、路径和关联 SeriesID
-	records, err := s.mediaRepo.ListIDAndPathByLibrary(library.ID)
-	if err != nil {
-		s.logger.Warnf("清理已删除文件失败（获取记录出错）: %v", err)
-		return 0
-	}
-
-	if len(records) == 0 {
-		return 0
-	}
-
-	s.broadcastScanEvent(EventScanProgress, &ScanProgressData{
-		LibraryID:   library.ID,
-		LibraryName: library.Name,
-		Phase:       "cleaning",
-		Total:       len(records),
-		Message:     fmt.Sprintf("正在检查 %d 个文件是否仍存在...", len(records)),
-	})
-
-	// 收集需要删除的媒体 ID 和受影响的 SeriesID
-	var deleteIDs []string
-	affectedSeries := make(map[string]bool) // 受影响的 SeriesID 集合
-
-	for _, rec := range records {
-		// 检查文件是否仍存在于磁盘
-		if _, statErr := os.Stat(rec.FilePath); os.IsNotExist(statErr) {
-			deleteIDs = append(deleteIDs, rec.ID)
-			if rec.SeriesID != "" {
-				affectedSeries[rec.SeriesID] = true
-			}
-			s.logger.Debugf("文件已不存在，标记清理: %s", rec.FilePath)
+func isPathWithinAnyRoot(path string, roots []string) bool {
+	for _, root := range roots {
+		if isPathWithinRoot(path, root) {
+			return true
 		}
 	}
-
-	if len(deleteIDs) == 0 {
-		return 0
-	}
-
-	s.logger.Infof("发现 %d 个已删除文件需要清理（共检查 %d 条记录）", len(deleteIDs), len(records))
-
-	// 批量删除已不存在的媒体记录（每批 100 条，避免 SQL 过长）
-	totalDeleted := 0
-	batchSize := 100
-	for i := 0; i < len(deleteIDs); i += batchSize {
-		end := i + batchSize
-		if end > len(deleteIDs) {
-			end = len(deleteIDs)
-		}
-		batch := deleteIDs[i:end]
-		deleted, delErr := s.mediaRepo.DeleteByIDs(batch)
-		if delErr != nil {
-			s.logger.Warnf("批量删除已删除文件记录失败: %v", delErr)
-			continue
-		}
-		if s.artworkCache != nil {
-			for _, mediaID := range batch {
-				if cacheErr := s.artworkCache.RemoveMedia(mediaID); cacheErr != nil {
-					s.logger.Debugf("remove deleted media artwork cache failed: media=%s err=%v", mediaID, cacheErr)
-				}
-			}
-		}
-		totalDeleted += int(deleted)
-
-		// 广播清理进度
-		s.broadcastScanEvent(EventScanProgress, &ScanProgressData{
-			LibraryID:   library.ID,
-			LibraryName: library.Name,
-			Phase:       "cleaning",
-			Current:     totalDeleted,
-			Total:       len(deleteIDs),
-			Cleaned:     totalDeleted,
-			Message:     fmt.Sprintf("已清理 %d/%d 条已删除文件记录", totalDeleted, len(deleteIDs)),
-		})
-	}
-
-	// 更新受影响的 Series 合集统计信息
-	for seriesID := range affectedSeries {
-		episodes, listErr := s.mediaRepo.ListBySeriesID(seriesID)
-		if listErr != nil {
-			s.logger.Warnf("更新合集统计失败（获取剧集列表出错）: seriesID=%s, %v", seriesID, listErr)
-			continue
-		}
-
-		if len(episodes) == 0 {
-			// 合集下已无剧集，删除空合集
-			if delErr := s.seriesRepo.Delete(seriesID); delErr != nil {
-				s.logger.Warnf("删除空合集失败: seriesID=%s, %v", seriesID, delErr)
-			} else {
-				s.logger.Infof("清理空合集: seriesID=%s", seriesID)
-			}
-			continue
-		}
-
-		// 重新统计季数和集数
-		series, findErr := s.seriesRepo.FindByIDOnly(seriesID)
-		if findErr != nil {
-			continue
-		}
-		seasonSet := make(map[int]bool)
-		for _, ep := range episodes {
-			seasonSet[ep.SeasonNum] = true
-		}
-		series.EpisodeCount = len(episodes)
-		series.SeasonCount = len(seasonSet)
-		s.seriesRepo.Update(series)
-		s.logger.Debugf("更新合集统计: %s, %d 季 %d 集", series.Title, series.SeasonCount, series.EpisodeCount)
-	}
-
-	// 广播清理完成事件
-	s.broadcastScanEvent(EventScanCompleted, &ScanProgressData{
-		LibraryID:   library.ID,
-		LibraryName: library.Name,
-		Phase:       "cleaning",
-		Cleaned:     totalDeleted,
-		Message:     fmt.Sprintf("清理完成: 移除 %d 条已删除文件记录", totalDeleted),
-	})
-
-	return totalDeleted
+	return false
 }
 
-// scanMovieLibrary 扫描电影库（支持增量扫描 + P2 性能优化）
-func (s *ScannerService) scanMovieLibrary(library *model.Library) (int, error) {
-	var count int
-	var totalFiles int     // 遍历到的总文件数
-	var videoFiles int     // 识别到的视频文件数
-	var skippedExist int   // 已存在且未变更跳过的文件数
-	var skippedUpdated int // 已存在但已更新的文件数
-	var skippedRule int    // 被匹配规则跳过的文件数
-
-	// 增量扫描：获取上次扫描时间，仅处理新增/变更的文件
-	lastScanTime := time.Time{}
-	if library.LastScan != nil {
-		lastScanTime = *library.LastScan
+func (s *ScannerService) ensureSnapshotRootsAvailable(snapshot *scanRootSnapshot) error {
+	if snapshot == nil || len(snapshot.roots) == 0 {
+		return &ScanIncompleteError{Err: fmt.Errorf("scan root snapshot is empty")}
 	}
-
-	s.logger.Infof("电影库扫描开始: %s, 路径: %s, 上次扫描: %v", library.Name, library.Path, lastScanTime)
-
-	// P2: 文件路径预加载到内存 Set（避免 N+1 查询）
-	existingPaths, err := s.mediaRepo.GetAllFilePathsByLibrary(library.ID)
-	if err != nil {
-		s.logger.Warnf("预加载文件路径失败，回退到逐个查询: %v", err)
-		existingPaths = nil
-	} else {
-		s.logger.Infof("预加载 %d 个已有文件路径到内存", len(existingPaths))
-	}
-
-	// P2: 预加载自定义匹配规则
-	var matchRules []model.MatchRule
-	if s.matchRuleRepo != nil {
-		matchRules, _ = s.matchRuleRepo.ListEnabled(library.ID)
-		if len(matchRules) > 0 {
-			s.logger.Infof("加载 %d 条匹配规则", len(matchRules))
-		}
-	}
-
-	// P2: 收集新发现的媒体文件，用于后续批量处理 FFprobe 和堆叠检测
-	var pendingList []pendingMedia
-
-	err = filepath.Walk(library.Path, func(path string, info os.FileInfo, err error) error {
+	for _, root := range snapshot.roots {
+		info, err := s.stat(root)
 		if err != nil {
-			s.logger.Warnf("访问文件失败: %s, 错误: %v", path, err)
-			return nil
+			return &ScanIncompleteError{Root: root, Err: err}
 		}
-		if info.IsDir() {
-			// 跳过 extras/trailers 等非正片目录（P0: 兼容 Emby 标准）
-			if extrasExcludeDirs[strings.ToLower(filepath.Base(path))] {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		totalFiles++
-		ext := strings.ToLower(filepath.Ext(path))
-		if !supportedExts[ext] {
-			return nil
-		}
-		videoFiles++
-
-		// P0: 文件大小过滤（启用 MinFileSize 配置）
-		if library.EnableFileFilter && library.MinFileSize > 0 {
-			minBytes := int64(library.MinFileSize) * 1024 * 1024
-			if info.Size() < minBytes {
-				s.logger.Debugf("跳过过小文件(%dMB < %dMB): %s",
-					info.Size()/(1024*1024), library.MinFileSize, path)
-				return nil
-			}
-		}
-
-		// P0: 排除 extras 路径和 Emby 特典后缀文件
-		if isExtrasPath(path) || isExtrasFile(filepath.Base(path)) {
-			s.logger.Debugf("跳过非正片内容: %s", path)
-			return nil
-		}
-
-		// P2: 应用自定义匹配规则
-		if s.applyMatchRulesSkip(path, matchRules) {
-			skippedRule++
-			s.logger.Debugf("匹配规则跳过: %s", path)
-			return nil
-		}
-
-		// P2: 内存查重（替代逐个 DB 查询）
-		if existingPaths != nil {
-			if existingPaths[path] {
-				// 文件已存在：增量扫描模式下，如果文件未修改则跳过
-				if !lastScanTime.IsZero() && info.ModTime().Before(lastScanTime) {
-					skippedExist++
-					return nil
-				}
-				// 文件已变更，更新文件大小和媒体信息
-				skippedUpdated++
-				existing, findErr := s.mediaRepo.FindByFilePath(path)
-				if findErr == nil {
-					applyFileTimes(existing, info)
-					s.probeMediaInfo(existing)
-					s.scanExternalSubtitles(existing)
-					s.mediaRepo.Update(existing)
-					s.logger.Debugf("更新已有媒体: %s", path)
-				}
-				return nil
-			}
-		} else {
-			// 回退：逐个查询
-			existing, findErr := s.mediaRepo.FindByFilePath(path)
-			if findErr == nil {
-				if !lastScanTime.IsZero() && info.ModTime().Before(lastScanTime) {
-					skippedExist++
-					return nil
-				}
-				skippedUpdated++
-				applyFileTimes(existing, info)
-				s.probeMediaInfo(existing)
-				s.scanExternalSubtitles(existing)
-				s.mediaRepo.Update(existing)
-				s.logger.Debugf("更新已有媒体: %s", path)
-				return nil
-			}
-		}
-
-		// P0: 增强的标题提取（含年份 + ID 标签解析）
-		filename := filepath.Base(path)
-		title, year, tmdbID := s.extractTitleEnhanced(filename)
-		media := &model.Media{
-			LibraryID:    library.ID,
-			Title:        title,
-			FilePath:     path,
-			FileSize:     info.Size(),
-			MediaType:    "movie",
-			Year:         year,
-			TMDbID:       tmdbID,
-			ScrapeStatus: "pending",
-		}
-		applyFileTimes(media, info)
-
-		// P2: 应用匹配规则的非跳过动作（set_type, set_genre 等）
-		s.applyMatchRulesAction(media, path, matchRules)
-
-		// P2: 检测多 CD 堆叠
-		stackBase, stackOrder := detectStacking(filename)
-		if stackOrder > 0 {
-			media.StackGroup = stackBase
-			media.StackOrder = stackOrder
-			s.logger.Debugf("检测到堆叠文件: %s (组=%s, 序号=%d)", filename, stackBase, stackOrder)
-		}
-
-		// P2: 检测多版本标识
-		if versionTag := detectVersionTag(filename); versionTag != "" {
-			media.VersionTag = versionTag
-			s.logger.Debugf("检测到版本标识: %s -> %s", filename, versionTag)
-		}
-
-		// 收集到待处理列表（FFprobe 后续并行处理）
-		pendingList = append(pendingList, pendingMedia{media: media, path: path, info: info})
-		return nil
-	})
-
-	// P2: 并行 FFprobe 探测 + 批量入库
-	if len(pendingList) > 0 {
-		s.logger.Infof("开始并行 FFprobe 探测 %d 个新文件", len(pendingList))
-		s.parallelProbe(pendingList)
-
-		// P2: 堆叠分组 — 为同一 StackGroup 的文件分配相同的 VersionGroup
-		stackGroups := make(map[string][]*pendingMedia)
-		for i := range pendingList {
-			if pendingList[i].media.StackGroup != "" {
-				stackGroups[pendingList[i].media.StackGroup] = append(stackGroups[pendingList[i].media.StackGroup], &pendingList[i])
-			}
-		}
-		for _, group := range stackGroups {
-			if len(group) > 1 {
-				// 使用第一个文件的标题作为组标识
-				groupID := group[0].media.Title
-				for _, pm := range group {
-					pm.media.VersionGroup = groupID
-				}
-			}
-		}
-
-		// 逐个入库（保留 NFO/图片扫描逻辑 + 事件广播）
-		for _, pm := range pendingList {
-			s.scanExternalSubtitles(pm.media)
-
-			// 识别本地 NFO 信息文件并解析元数据
-			if nfoPath := s.nfoService.FindNFOForMedia(pm.path); nfoPath != "" {
-				if err := s.nfoService.ParseMovieNFO(nfoPath, pm.media); err != nil {
-					s.logger.Debugf("解析NFO失败: %s, 错误: %v", nfoPath, err)
-				} else {
-					s.logger.Debugf("从NFO读取元数据: %s -> %s", nfoPath, pm.media.Title)
-				}
-			}
-
-			// 识别本地海报封面图片
-			mediaDir := filepath.Dir(pm.path)
-			if poster, backdrop := s.nfoService.FindLocalImages(mediaDir); poster != "" || backdrop != "" {
-				if poster != "" && pm.media.PosterPath == "" {
-					pm.media.PosterPath = poster
-					s.logger.Debugf("发现本地海报: %s", poster)
-				}
-				if backdrop != "" && pm.media.BackdropPath == "" {
-					pm.media.BackdropPath = backdrop
-					s.logger.Debugf("发现本地背景图: %s", backdrop)
-				}
-			}
-
-			// V7: 根据媒体库元数据策略设置刮削状态
-			// local_only: 不自动在线刮削，标记为 manual
-			// local_preferred: 本地 NFO 有标题数据时视为已就绪，否则允许在线
-			// online_preferred: 保持默认 pending 状态（现有行为）
-			s.cacheMediaArtwork(pm.media, s.buildDirectorySidecarFiles(mediaDir))
-			switch library.MetadataMode {
-			case "local_only":
-				pm.media.ScrapeStatus = "manual"
-			case "local_preferred":
-				// 如果本地 NFO 已提供足够信息（至少 title 非空且非文件名推断），标记为 manual
-				hasNfoData := pm.media.NfoRawXml != ""
-				if hasNfoData {
-					pm.media.ScrapeStatus = "manual"
-				}
-				// 否则保持 pending，允许在线刮削
-			}
-			// online_preferred 或空值：保持默认 "pending"
-
-			if err := s.mediaRepo.Create(pm.media); err != nil {
-				s.logger.Warnf("保存媒体失败: %s, 错误: %v", pm.path, err)
-				continue
-			}
-			s.SyncActorsForMedia(pm.media)
-			count++
-			s.logger.Infof("发现电影: %s", pm.media.Title)
-			s.broadcastScanEvent(EventScanProgress, &ScanProgressData{
-				LibraryID:   library.ID,
-				LibraryName: library.Name,
-				Phase:       "scanning",
-				NewFound:    count,
-				Message:     fmt.Sprintf("发现: %s", pm.media.Title),
-			})
+		if !info.IsDir() {
+			return &ScanIncompleteError{Root: root, Err: fmt.Errorf("scan root is not a directory")}
 		}
 	}
-
-	s.logger.Infof("电影库扫描统计: %s — 遍历文件: %d, 视频文件: %d, 新增: %d, 已存在跳过: %d, 已更新: %d, 规则跳过: %d",
-		library.Name, totalFiles, videoFiles, count, skippedExist, skippedUpdated, skippedRule)
-
-	return count, err
+	return nil
 }
 
 // ==================== P2: 并行 FFprobe 探测 ====================
 
 // pendingMedia 待处理的媒体文件信息（P2: 用于并行 FFprobe 和批量入库）
-func (s *ScannerService) refreshExistingMovieMedia(library *model.Library, existing *model.Media, mediaPath string, info os.FileInfo, sidecars *directorySidecarFiles, refreshVideo bool) bool {
+func (s *ScannerService) refreshExistingMovieMedia(library *model.Library, existing *model.Media, mediaPath string, info os.FileInfo, sidecars *directorySidecarFiles, refreshVideo bool) (bool, error) {
 	if existing == nil || info == nil {
-		return false
+		return false, nil
 	}
 
 	applyFileTimes(existing, info)
 	s.scanExternalSubtitlesWithSidecars(existing, sidecars)
-	s.applyLocalSidecarsWithMode(existing, mediaPath, sidecars, true)
+	if err := s.applyLocalSidecarsWithMode(existing, mediaPath, sidecars, true); err != nil {
+		return false, err
+	}
 	if refreshVideo {
-		s.probeMediaInfo(existing)
+		if probeErr := s.probeMediaInfo(existing); probeErr != nil {
+			s.logger.Warnf("media probe failed: path=%s stage=%v", mediaPath, probeErr)
+			if s.strictScan {
+				return false, fmt.Errorf("probe media %s: %w", mediaPath, probeErr)
+			}
+		}
 	}
 	existing.MetadataPhase = MetadataPhaseFull
 	s.resolveThumbnailState(existing, sidecars)
 	s.applyLibraryMetadataMode(library, existing)
-	updateMediaSyncFingerprints(existing, mediaPath, info, sidecars)
+	updateMediaSyncFingerprintsWithStat(existing, mediaPath, info, sidecars, s.stat)
 
 	if err := s.mediaRepo.Update(existing); err != nil {
 		s.logger.Warnf("update existing movie failed: %s, err=%v", mediaPath, err)
-		return false
+		return false, err
 	}
 
-	s.SyncActorsForMedia(existing)
+	if err := s.syncActorsForMedia(existing, s.strictScan); err != nil {
+		return false, err
+	}
 	s.broadcastMediaMetadataEvent(existing.ID, existing.LibraryID, existing.MetadataPhase, "metadata updated")
-	return true
+	return true, nil
 }
 
-func (s *ScannerService) syncDeletedMovieRecords(library *model.Library, existingSignatures map[string]repository.MediaFileSignature, seenPaths map[string]bool) int {
-	if library == nil || len(existingSignatures) == 0 {
-		return 0
+func (s *ScannerService) forceRefreshSnapshotMetadata(library *model.Library, snapshot *scanRootSnapshot) error {
+	if library == nil || snapshot == nil || !snapshot.complete {
+		return &ScanIncompleteError{Err: fmt.Errorf("cannot refresh metadata from incomplete scan")}
+	}
+	mediaItems, err := s.mediaRepo.ListByLibraryID(library.ID)
+	if err != nil {
+		return fmt.Errorf("load media for overwrite metadata refresh: %w", err)
+	}
+	for i := range mediaItems {
+		if err := s.checkScanCanceled(); err != nil {
+			return err
+		}
+		mediaPath := normalizeMediaPath(mediaItems[i].FilePath)
+		if !snapshot.filePaths[mediaPath] {
+			continue
+		}
+		if err := s.completeMediaMetadataByIDWithMode(mediaItems[i].ID, true); err != nil {
+			return fmt.Errorf("force refresh metadata %s: %w", mediaPath, err)
+		}
+	}
+	return nil
+}
+
+func (s *ScannerService) syncDeletedRecords(library *model.Library, snapshot *scanRootSnapshot) (int, error) {
+	if library == nil {
+		return 0, fmt.Errorf("library is nil")
+	}
+	if snapshot == nil || len(snapshot.roots) == 0 || !snapshot.complete {
+		return 0, &ScanIncompleteError{Err: fmt.Errorf("scan root snapshot is empty")}
 	}
 
-	rootPath := normalizeMediaPath(library.Path)
+	records, err := s.mediaRepo.ListIDAndPathByLibrary(library.ID)
+	if err != nil {
+		return 0, fmt.Errorf("load media paths before cleanup: %w", err)
+	}
+	if len(records) == 0 {
+		return 0, nil
+	}
+
 	var deleteIDs []string
-	affectedSeries := make(map[string]bool)
 
-	for path, signature := range existingSignatures {
-		normalizedPath := normalizeMediaPath(path)
-		if normalizedPath == "" || !isPathWithinRoot(normalizedPath, rootPath) {
+	for _, record := range records {
+		normalizedPath := normalizeMediaPath(record.FilePath)
+		if normalizedPath == "" || !isPathWithinAnyRoot(normalizedPath, snapshot.roots) {
 			continue
 		}
-		if seenPaths[normalizedPath] {
-			continue
-		}
-		if info, err := os.Stat(normalizedPath); err == nil && !info.IsDir() {
+		if snapshot.filePaths[normalizedPath] {
 			continue
 		}
 
-		deleteIDs = append(deleteIDs, signature.ID)
-		if strings.TrimSpace(signature.SeriesID) != "" {
-			affectedSeries[signature.SeriesID] = true
+		_, statErr := s.stat(normalizedPath)
+		if statErr == nil {
+			continue
 		}
+		if !os.IsNotExist(statErr) {
+			return 0, &ScanIncompleteError{Root: normalizedPath, Err: statErr}
+		}
+
+		deleteIDs = append(deleteIDs, record.ID)
 	}
 
 	if len(deleteIDs) == 0 {
-		return 0
+		return 0, nil
+	}
+	if err := s.ensureSnapshotRootsAvailable(snapshot); err != nil {
+		return 0, err
 	}
 
-	totalDeleted := 0
-	for i := 0; i < len(deleteIDs); i += scanCreateBatchSize {
-		end := i + scanCreateBatchSize
-		if end > len(deleteIDs) {
-			end = len(deleteIDs)
-		}
+	deleted, err := s.mediaRepo.DeleteByIDsAndRepairSeries(deleteIDs)
+	if err != nil {
+		return 0, fmt.Errorf("delete stale media transaction: %w", err)
+	}
+	totalDeleted := int(deleted)
 
-		deleted, err := s.mediaRepo.DeleteByIDs(deleteIDs[i:end])
-		if err != nil {
-			s.logger.Warnf("delete stale media batch failed: root=%s err=%v", rootPath, err)
-			continue
-		}
-		if s.artworkCache != nil {
-			for _, mediaID := range deleteIDs[i:end] {
-				if cacheErr := s.artworkCache.RemoveMedia(mediaID); cacheErr != nil {
-					s.logger.Debugf("remove stale media artwork cache failed: media=%s err=%v", mediaID, cacheErr)
-				}
+	if s.artworkCache != nil {
+		for _, mediaID := range deleteIDs {
+			if cacheErr := s.artworkCache.RemoveMedia(mediaID); cacheErr != nil {
+				s.logger.Debugf("remove stale media artwork cache failed: media=%s err=%v", mediaID, cacheErr)
 			}
 		}
-		totalDeleted += int(deleted)
-
-		s.broadcastScanEvent(EventScanProgress, &ScanProgressData{
-			LibraryID:   library.ID,
-			LibraryName: library.Name,
-			Phase:       "cleaning",
-			Current:     totalDeleted,
-			Total:       len(deleteIDs),
-			Cleaned:     totalDeleted,
-			Message:     fmt.Sprintf("已清理 %d/%d 个已删除文件", totalDeleted, len(deleteIDs)),
-		})
 	}
+	s.broadcastScanEvent(EventScanProgress, &ScanProgressData{
+		LibraryID:   library.ID,
+		LibraryName: library.Name,
+		Phase:       "cleaning",
+		Current:     totalDeleted,
+		Total:       len(deleteIDs),
+		Cleaned:     totalDeleted,
+		Message:     fmt.Sprintf("已清理 %d/%d 个已删除文件", totalDeleted, len(deleteIDs)),
+	})
 
-	for seriesID := range affectedSeries {
-		episodes, err := s.mediaRepo.ListBySeriesID(seriesID)
-		if err != nil {
-			s.logger.Warnf("reload series episodes failed: series=%s err=%v", seriesID, err)
-			continue
-		}
-		if len(episodes) == 0 {
-			if err := s.seriesRepo.Delete(seriesID); err != nil {
-				s.logger.Warnf("delete empty series failed: series=%s err=%v", seriesID, err)
-			}
-			continue
-		}
-
-		series, err := s.seriesRepo.FindByIDOnly(seriesID)
-		if err != nil || series == nil {
-			continue
-		}
-
-		seasonSet := make(map[int]bool)
-		for _, episode := range episodes {
-			seasonSet[episode.SeasonNum] = true
-		}
-		series.EpisodeCount = len(episodes)
-		series.SeasonCount = len(seasonSet)
-		if err := s.seriesRepo.Update(series); err != nil {
-			s.logger.Warnf("update series counters failed: series=%s err=%v", seriesID, err)
-		}
-	}
-
-	return totalDeleted
+	return totalDeleted, nil
 }
 
-func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, options ScanOptions) (int, error) {
+func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, options ScanOptions) (int, *scanRootResult, error) {
 	var count int
 	var skippedExist int
 	var skippedUpdated int
 	var skippedRule int
-	var deletedCount int
+	result := newScanRootResult(library.Path)
 
 	s.logger.Infof("movie scan start: %s, path=%s, mode=%s", library.Name, library.Path, options.Mode)
 
 	existingSignatures, err := s.mediaRepo.GetAllFileSignaturesByLibrary(library.ID)
 	if err != nil {
+		if s.strictScan {
+			return 0, result, fmt.Errorf("preload media signatures: %w", err)
+		}
 		s.logger.Warnf("preload media signatures failed, fallback to path records: %v", err)
 		pathRecords, listErr := s.mediaRepo.ListIDAndPathByLibrary(library.ID)
 		if listErr != nil {
@@ -2267,13 +2517,13 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 		}
 	}
 
-	entries, err := s.listMovieEntries(library, options)
+	entries, err := s.listMovieEntries(library, options, result)
 	if err != nil {
-		return 0, err
+		return 0, result, err
 	}
+	s.setScanProgressTotal(library, len(entries))
 
 	var pendingList []pendingMedia
-	seenPaths := make(map[string]bool, len(entries))
 	sidecarCache := make(map[string]*directorySidecarFiles)
 
 	getSidecars := func(mediaPath string) *directorySidecarFiles {
@@ -2287,10 +2537,12 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 	}
 
 	for _, entry := range entries {
-		mediaPath, info, infoErr := entry.resolvePathAndInfo()
+		if err := s.checkScanCanceled(); err != nil {
+			return count, result, err
+		}
+		mediaPath, info, infoErr := entry.resolvePathAndInfo(s.stat)
 		if infoErr != nil {
-			s.logger.Warnf("stat movie file failed: %s, err=%v", entry.path, infoErr)
-			continue
+			return count, result, &ScanIncompleteError{Root: entry.path, Err: infoErr}
 		}
 		if info == nil || info.IsDir() {
 			continue
@@ -2302,8 +2554,6 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 				continue
 			}
 		}
-		seenPaths[mediaPath] = true
-
 		if s.applyMatchRulesSkip(mediaPath, matchRules) {
 			skippedRule++
 			s.advanceScanProgress(library, fmt.Sprintf("跳过规则: %s", filepath.Base(mediaPath)))
@@ -2315,7 +2565,7 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 		if existingSignatures != nil {
 			if signature, ok := existingSignatures[mediaPath]; ok {
 				sidecars := getSidecars(mediaPath)
-				shouldRefresh, refreshVideo := shouldRefreshExistingMovieMedia(options, signature, mediaPath, info, sidecars)
+				shouldRefresh, refreshVideo := shouldRefreshExistingMovieMediaWithStat(options, signature, mediaPath, info, sidecars, s.stat)
 				if !shouldRefresh {
 					skippedExist++
 					s.advanceScanProgress(library, progressMessage)
@@ -2324,12 +2574,22 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 
 				existing, findErr := s.mediaRepo.FindByFilePath(mediaPath)
 				if findErr != nil || existing == nil {
+					if s.strictScan && findErr != nil {
+						return count, result, fmt.Errorf("load existing movie %s: %w", mediaPath, findErr)
+					}
 					s.logger.Warnf("load existing movie failed: %s, err=%v", mediaPath, findErr)
 					s.advanceScanProgress(library, progressMessage)
 					continue
 				}
 
-				if s.refreshExistingMovieMedia(library, existing, mediaPath, info, sidecars, refreshVideo) {
+				updated, refreshErr := s.refreshExistingMovieMedia(library, existing, mediaPath, info, sidecars, refreshVideo)
+				if refreshErr != nil {
+					if s.strictScan {
+						return count, result, fmt.Errorf("refresh existing movie %s: %w", mediaPath, refreshErr)
+					}
+					s.logger.Warnf("refresh existing movie failed: %s, err=%v", mediaPath, refreshErr)
+				}
+				if updated {
 					skippedUpdated++
 				}
 				s.advanceScanProgress(library, progressMessage)
@@ -2341,7 +2601,14 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 			existing, findErr := s.mediaRepo.FindByFilePath(mediaPath)
 			if findErr == nil && existing != nil {
 				sidecars := getSidecars(mediaPath)
-				if s.refreshExistingMovieMedia(library, existing, mediaPath, info, sidecars, true) {
+				updated, refreshErr := s.refreshExistingMovieMedia(library, existing, mediaPath, info, sidecars, true)
+				if refreshErr != nil {
+					if s.strictScan {
+						return count, result, fmt.Errorf("refresh existing movie %s: %w", mediaPath, refreshErr)
+					}
+					s.logger.Warnf("refresh existing movie failed: %s, err=%v", mediaPath, refreshErr)
+				}
+				if updated {
 					skippedUpdated++
 				}
 				s.advanceScanProgress(library, progressMessage)
@@ -2401,9 +2668,9 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 			}
 		}
 
-		flushCreateBatch := func(batch []pendingMedia) {
+		flushCreateBatch := func(batch []pendingMedia) error {
 			if len(batch) == 0 {
-				return
+				return nil
 			}
 
 			mediaBatch := make([]*model.Media, 0, len(batch))
@@ -2412,6 +2679,9 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 			}
 
 			if err := s.mediaRepo.BatchCreate(mediaBatch); err != nil {
+				if s.strictScan {
+					return fmt.Errorf("batch save media: %w", err)
+				}
 				s.logger.Warnf("batch save media failed, fallback to single insert: batch=%d err=%v", len(batch), err)
 				for _, item := range batch {
 					if singleErr := s.mediaRepo.Create(item.media); singleErr != nil {
@@ -2423,7 +2693,7 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 					count++
 					s.advanceScanProgress(library, item.message)
 				}
-				return
+				return nil
 			}
 
 			for _, item := range batch {
@@ -2431,31 +2701,32 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 				count++
 				s.advanceScanProgress(library, item.message)
 			}
+			return nil
 		}
 
 		createBatch := make([]pendingMedia, 0, scanCreateBatchSize)
 		for _, item := range pendingList {
 			sidecars := getSidecars(item.path)
 			s.prepareQuickMovieMedia(library, item.media, sidecars)
-			updateMediaSyncFingerprints(item.media, item.path, item.info, sidecars)
+			updateMediaSyncFingerprintsWithStat(item.media, item.path, item.info, sidecars, s.stat)
 
 			createBatch = append(createBatch, item)
 			if len(createBatch) >= scanCreateBatchSize {
-				flushCreateBatch(createBatch)
+				if err := flushCreateBatch(createBatch); err != nil {
+					return count, result, err
+				}
 				createBatch = createBatch[:0]
 			}
 		}
-		flushCreateBatch(createBatch)
+		if err := flushCreateBatch(createBatch); err != nil {
+			return count, result, err
+		}
 	}
 
-	if options.Mode == "delete_update" {
-		deletedCount = s.syncDeletedMovieRecords(library, existingSignatures, seenPaths)
-	}
+	s.logger.Infof("movie scan stats: %s total=%d new=%d unchanged=%d updated=%d ruleSkipped=%d",
+		library.Name, len(entries), count, skippedExist, skippedUpdated, skippedRule)
 
-	s.logger.Infof("movie scan stats: %s total=%d new=%d unchanged=%d updated=%d deleted=%d ruleSkipped=%d",
-		library.Name, len(entries), count, skippedExist, skippedUpdated, deletedCount, skippedRule)
-
-	return count, nil
+	return count, result, nil
 }
 
 type pendingMedia struct {
@@ -2504,7 +2775,10 @@ func (s *ScannerService) parallelProbe(items []pendingMedia) {
 		go func() {
 			defer wg.Done()
 			for job := range jobs {
-				s.probeMediaInfo(items[job.index].media)
+				media := items[job.index].media
+				if err := s.probeMediaInfo(media); err != nil {
+					s.logger.Warnf("media probe failed: path=%s stage=%v", media.FilePath, err)
+				}
 			}
 		}()
 	}
@@ -2629,12 +2903,13 @@ func (s *ScannerService) matchRule(filePath string, rule *model.MatchRule) bool 
 // - 如果子目录内包含多个视频文件，或文件名匹配剧集命名模式，则视为电视剧
 // - 如果子目录内只有单个视频文件且不匹配剧集模式，则视为电影
 // - 根目录下的散落视频文件按电影处理
-func (s *ScannerService) scanMixedLibrary(library *model.Library) (int, error) {
+func (s *ScannerService) scanMixedLibrary(library *model.Library) (int, *scanRootResult, error) {
 	s.logger.Infof("混合媒体库扫描: %s (%s)", library.Name, library.Path)
+	result := newScanRootResult(library.Path)
 
-	entries, err := os.ReadDir(library.Path)
+	entries, err := s.listDir(library.Path)
 	if err != nil {
-		return 0, fmt.Errorf("读取媒体库目录失败: %w", err)
+		return 0, result, &ScanIncompleteError{Root: library.Path, Err: err}
 	}
 
 	s.logger.Infof("混合库根目录包含 %d 个条目", len(entries))
@@ -2656,6 +2931,9 @@ func (s *ScannerService) scanMixedLibrary(library *model.Library) (int, error) {
 	var looseVideoFiles []os.DirEntry                  // 根目录散落的视频文件
 
 	for _, entry := range entries {
+		if err := s.checkScanCanceled(); err != nil {
+			return totalCount, result, err
+		}
 		if !entry.IsDir() {
 			// 根目录下的散落视频文件
 			ext := strings.ToLower(filepath.Ext(entry.Name()))
@@ -2669,7 +2947,11 @@ func (s *ScannerService) scanMixedLibrary(library *model.Library) (int, error) {
 		folderPath := filepath.Join(library.Path, dirName)
 
 		// 智能判断：该目录是电视剧还是电影
-		if s.isTVShowFolder(folderPath) {
+		isTV, classifyErr := s.isTVShowFolder(folderPath)
+		if classifyErr != nil {
+			return totalCount, result, &ScanIncompleteError{Root: folderPath, Err: classifyErr}
+		}
+		if isTV {
 			// 电视剧目录：按标准化系列名分组（支持多季合并）
 			normalizedName := s.normalizeSeriesName(dirName)
 			seasonNum := s.extractSeasonFromDirName(dirName)
@@ -2686,22 +2968,23 @@ func (s *ScannerService) scanMixedLibrary(library *model.Library) (int, error) {
 
 	// === 阶段二：处理电视剧目录（复用 scanTVShowLibrary 的分组逻辑） ===
 	for normalizedName, folders := range seriesDirGroups {
+		if err := s.checkScanCanceled(); err != nil {
+			return totalCount, result, err
+		}
 		if len(folders) == 1 && folders[0].seasonNum == 0 {
 			// 单个目录且未识别到季号 → 独立处理
 			f := folders[0]
 			seriesTitle := s.extractSeriesTitle(f.dirName)
-			newCount, err := s.scanSeriesFolder(library, f.path, seriesTitle)
+			newCount, err := s.scanSeriesFolder(library, f.path, seriesTitle, result)
 			if err != nil {
-				s.logger.Warnf("混合库-扫描剧集文件夹失败: %s, 错误: %v", f.path, err)
-				continue
+				return totalCount, result, err
 			}
 			totalCount += newCount
 		} else {
 			// 多季合并
-			newCount, err := s.scanMultiSeasonSeries(library, normalizedName, folders)
+			newCount, err := s.scanMultiSeasonSeries(library, normalizedName, folders, result)
 			if err != nil {
-				s.logger.Warnf("混合库-扫描多季合集失败: %s, 错误: %v", normalizedName, err)
-				continue
+				return totalCount, result, err
 			}
 			totalCount += newCount
 		}
@@ -2709,18 +2992,30 @@ func (s *ScannerService) scanMixedLibrary(library *model.Library) (int, error) {
 
 	// === 阶段三：处理电影目录（扫描目录内的视频文件作为电影） ===
 	for _, entry := range movieDirs {
+		if err := s.checkScanCanceled(); err != nil {
+			return totalCount, result, err
+		}
 		folderPath := filepath.Join(library.Path, entry.Name())
-		err := filepath.Walk(folderPath, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info.IsDir() {
+		err := s.walk(folderPath, func(path string, info os.FileInfo, walkErr error) error {
+			if err := s.checkScanCanceled(); err != nil {
+				return err
+			}
+			if walkErr != nil {
+				return walkErr
+			}
+			if info.IsDir() {
 				return nil
 			}
 			ext := strings.ToLower(filepath.Ext(path))
 			if !supportedExts[ext] {
 				return nil
 			}
+			result.addFile(path)
 			if existing, err := s.mediaRepo.FindByFilePath(path); err == nil {
 				s.requestMetadataCompletionIfNeeded(existing)
 				return nil // 已存在
+			} else if s.strictScan && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("find existing media %s: %w", path, err)
 			}
 			title := s.extractTitle(filepath.Base(path))
 			media := &model.Media{
@@ -2734,6 +3029,9 @@ func (s *ScannerService) scanMixedLibrary(library *model.Library) (int, error) {
 			s.prepareQuickMovieMedia(library, media, getMovieSidecars(path))
 			if err := s.persistQuickMedia(media); err != nil {
 				s.logger.Warnf("保存媒体失败: %s, 错误: %v", path, err)
+				if s.strictScan {
+					return fmt.Errorf("save mixed movie %s: %w", path, err)
+				}
 				return nil
 			}
 			totalCount++
@@ -2748,20 +3046,26 @@ func (s *ScannerService) scanMixedLibrary(library *model.Library) (int, error) {
 			return nil
 		})
 		if err != nil {
-			s.logger.Warnf("混合库-扫描电影目录失败: %s, 错误: %v", folderPath, err)
+			return totalCount, result, &ScanIncompleteError{Root: folderPath, Err: err}
 		}
 	}
 
 	// === 阶段四：处理根目录散落的视频文件（作为电影） ===
 	for _, entry := range looseVideoFiles {
+		if err := s.checkScanCanceled(); err != nil {
+			return totalCount, result, err
+		}
 		filePath := filepath.Join(library.Path, entry.Name())
+		result.addFile(filePath)
 		if existing, err := s.mediaRepo.FindByFilePath(filePath); err == nil {
 			s.requestMetadataCompletionIfNeeded(existing)
 			continue // 已存在
+		} else if s.strictScan && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return totalCount, result, fmt.Errorf("find existing media %s: %w", filePath, err)
 		}
 		info, err := entry.Info()
 		if err != nil {
-			continue
+			return totalCount, result, &ScanIncompleteError{Root: filePath, Err: err}
 		}
 		title := s.extractTitle(entry.Name())
 		media := &model.Media{
@@ -2775,6 +3079,9 @@ func (s *ScannerService) scanMixedLibrary(library *model.Library) (int, error) {
 		s.prepareQuickMovieMedia(library, media, getMovieSidecars(filePath))
 		if err := s.persistQuickMedia(media); err != nil {
 			s.logger.Warnf("保存媒体失败: %s, 错误: %v", filePath, err)
+			if s.strictScan {
+				return totalCount, result, fmt.Errorf("save loose mixed movie %s: %w", filePath, err)
+			}
 			continue
 		}
 		totalCount++
@@ -2789,7 +3096,7 @@ func (s *ScannerService) scanMixedLibrary(library *model.Library) (int, error) {
 	}
 
 	s.logger.Infof("混合媒体库扫描完成: %s, 新增 %d 个媒体", library.Name, totalCount)
-	return totalCount, nil
+	return totalCount, result, nil
 }
 
 // isTVShowFolder 智能判断一个目录是否为电视剧文件夹
@@ -2798,18 +3105,18 @@ func (s *ScannerService) scanMixedLibrary(library *model.Library) (int, error) {
 // 2. 目录内包含 Season 子目录
 // 3. 目录内有多个视频文件且文件名匹配剧集命名模式（S01E01、EP01、第N集等）
 // 4. 目录内有多个视频文件且文件名包含连续编号
-func (s *ScannerService) isTVShowFolder(folderPath string) bool {
+func (s *ScannerService) isTVShowFolder(folderPath string) (bool, error) {
 	dirName := filepath.Base(folderPath)
 
 	// 规则1: 目录名包含季号标识
 	if s.extractSeasonFromDirName(dirName) > 0 {
-		return true
+		return true, nil
 	}
 
 	// 读取目录内容
-	entries, err := os.ReadDir(folderPath)
+	entries, err := s.listDir(folderPath)
 	if err != nil {
-		return false
+		return false, err
 	}
 
 	// 规则2: 包含 Season 子目录
@@ -2818,11 +3125,14 @@ func (s *ScannerService) isTVShowFolder(folderPath string) bool {
 		if entry.IsDir() {
 			for _, pattern := range seasonDirPatterns {
 				if pattern.MatchString(entry.Name()) {
-					return true
+					return true, nil
 				}
 			}
 			// 递归检查子目录中的视频文件（只深入一层）
-			subEntries, err := os.ReadDir(filepath.Join(folderPath, entry.Name()))
+			subEntries, err := s.listDir(filepath.Join(folderPath, entry.Name()))
+			if err != nil && s.strictScan {
+				return false, err
+			}
 			if err == nil {
 				for _, subEntry := range subEntries {
 					if !subEntry.IsDir() {
@@ -2843,7 +3153,7 @@ func (s *ScannerService) isTVShowFolder(folderPath string) bool {
 
 	// 只有0或1个视频文件 → 大概率是电影
 	if len(videoFiles) <= 1 {
-		return false
+		return false, nil
 	}
 
 	// 规则3: 多个视频文件中有匹配剧集命名模式的
@@ -2857,15 +3167,15 @@ func (s *ScannerService) isTVShowFolder(folderPath string) bool {
 
 	// 如果超过一半的视频文件匹配剧集模式，认定为电视剧
 	if episodeMatchCount > 0 && episodeMatchCount >= len(videoFiles)/2 {
-		return true
+		return true, nil
 	}
 
 	// 规则4: 有3个及以上视频文件（即使无法解析集号，多文件目录更可能是剧集）
 	if len(videoFiles) >= 3 {
-		return true
+		return true, nil
 	}
 
-	return false
+	return false, nil
 }
 
 // ==================== 剧集扫描逻辑 ====================
@@ -2956,15 +3266,16 @@ type EpisodeInfo struct {
 }
 
 // scanTVShowLibrary 扫描剧集库（基于文件夹的合集识别 + 根目录散落文件智能归类）
-func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, error) {
+func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, *scanRootResult, error) {
 	var totalNewEpisodes int
+	result := newScanRootResult(library.Path)
 
 	s.logger.Infof("剧集库扫描开始: %s, 路径: %s", library.Name, library.Path)
 
 	// 遍历媒体库根目录的第一层子目录，每个子目录视为一个剧集
-	entries, err := os.ReadDir(library.Path)
+	entries, err := s.listDir(library.Path)
 	if err != nil {
-		return 0, fmt.Errorf("读取媒体库目录失败: %w", err)
+		return 0, result, &ScanIncompleteError{Root: library.Path, Err: err}
 	}
 
 	s.logger.Infof("剧集库根目录包含 %d 个条目", len(entries))
@@ -2981,18 +3292,24 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, error) 
 	seriesDirGroups := make(map[string][]seriesFolder)
 
 	for _, entry := range entries {
+		if err := s.checkScanCanceled(); err != nil {
+			return totalNewEpisodes, result, err
+		}
 		if !entry.IsDir() {
 			// 根目录下的视频文件
 			ext := strings.ToLower(filepath.Ext(entry.Name()))
 			if supportedExts[ext] {
 				filePath := filepath.Join(library.Path, entry.Name())
+				result.addFile(filePath)
 				if existing, err := s.mediaRepo.FindByFilePath(filePath); err == nil {
 					s.requestMetadataCompletionIfNeeded(existing)
 					continue // 已存在
+				} else if s.strictScan && !errors.Is(err, gorm.ErrRecordNotFound) {
+					return totalNewEpisodes, result, fmt.Errorf("find existing episode %s: %w", filePath, err)
 				}
-				info, _ := entry.Info()
-				if info == nil {
-					continue
+				info, infoErr := entry.Info()
+				if infoErr != nil {
+					return totalNewEpisodes, result, &ScanIncompleteError{Root: filePath, Err: infoErr}
 				}
 				// 从文件名提取系列名称用于智能归类
 				seriesName := s.extractSeriesNameFromFile(entry.Name())
@@ -3020,23 +3337,24 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, error) 
 
 	// === 阶段二：处理分组后的目录 ===
 	for normalizedName, folders := range seriesDirGroups {
+		if err := s.checkScanCanceled(); err != nil {
+			return totalNewEpisodes, result, err
+		}
 		if len(folders) == 1 && folders[0].seasonNum == 0 {
 			// 单个目录且未识别到季号 → 按原有逻辑独立处理
 			f := folders[0]
 			seriesTitle := s.extractSeriesTitle(f.dirName)
-			newCount, err := s.scanSeriesFolder(library, f.path, seriesTitle)
+			newCount, err := s.scanSeriesFolder(library, f.path, seriesTitle, result)
 			if err != nil {
-				s.logger.Warnf("扫描剧集文件夹失败: %s, 错误: %v", f.path, err)
-				continue
+				return totalNewEpisodes, result, err
 			}
 			totalNewEpisodes += newCount
 		} else {
 			// 多个目录属于同一系列（如"一拳超人 S1"和"一拳超人 S2"）
 			// 或单个目录但明确包含季号标识 → 合并到同一个 Series
-			newCount, err := s.scanMultiSeasonSeries(library, normalizedName, folders)
+			newCount, err := s.scanMultiSeasonSeries(library, normalizedName, folders, result)
 			if err != nil {
-				s.logger.Warnf("扫描多季合集失败: %s, 错误: %v", normalizedName, err)
-				continue
+				return totalNewEpisodes, result, err
 			}
 			totalNewEpisodes += newCount
 		}
@@ -3044,6 +3362,9 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, error) 
 
 	// 处理根目录散落文件的智能归类
 	for seriesName, files := range seriesGroups {
+		if err := s.checkScanCanceled(); err != nil {
+			return totalNewEpisodes, result, err
+		}
 		if len(files) <= 1 && seriesName == "__ungrouped__" {
 			// 单个无法识别系列名的文件，作为独立媒体处理
 			for _, f := range files {
@@ -3064,6 +3385,9 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, error) 
 				media.EpisodeTitle = ep.EpisodeTitle
 				if err := s.persistQuickMedia(media); err != nil {
 					s.logger.Warnf("保存媒体失败: %s, 错误: %v", filePath, err)
+					if s.strictScan {
+						return totalNewEpisodes, result, fmt.Errorf("save loose episode %s: %w", filePath, err)
+					}
 				}
 				totalNewEpisodes++
 			}
@@ -3092,6 +3416,9 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, error) 
 				media.EpisodeTitle = ep.EpisodeTitle
 				if err := s.persistQuickMedia(media); err != nil {
 					s.logger.Warnf("保存媒体失败: %s, 错误: %v", filePath, err)
+					if s.strictScan {
+						return totalNewEpisodes, result, fmt.Errorf("save ungrouped episode %s: %w", filePath, err)
+					}
 				}
 				totalNewEpisodes++
 			}
@@ -3111,6 +3438,9 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, error) 
 			}
 			if err := s.seriesRepo.Create(series); err != nil {
 				s.logger.Warnf("创建散落剧集合集失败: %s, 错误: %v", actualSeriesName, err)
+				if s.strictScan {
+					return totalNewEpisodes, result, fmt.Errorf("create loose series %s: %w", actualSeriesName, err)
+				}
 				continue
 			}
 			s.logger.Infof("创建散落剧集合集: %s (ID=%s)", actualSeriesName, series.ID)
@@ -3120,6 +3450,9 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, error) 
 		var newCount int
 
 		for _, f := range files {
+			if err := s.checkScanCanceled(); err != nil {
+				return totalNewEpisodes, result, err
+			}
 			filePath := filepath.Join(library.Path, f.entry.Name())
 			ep := s.parseEpisodeInfo(f.entry.Name())
 			if ep.SeasonNum == 0 {
@@ -3142,6 +3475,9 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, error) 
 
 			if err := s.persistQuickMedia(media); err != nil {
 				s.logger.Warnf("保存剧集失败: %s, 错误: %v", filePath, err)
+				if s.strictScan {
+					return totalNewEpisodes, result, fmt.Errorf("save grouped episode %s: %w", filePath, err)
+				}
 				continue
 			}
 
@@ -3159,10 +3495,15 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, error) 
 		}
 
 		// 更新合集统计
-		allEpisodes, _ := s.mediaRepo.ListBySeriesID(series.ID)
+		allEpisodes, listErr := s.mediaRepo.ListBySeriesID(series.ID)
+		if listErr != nil && s.strictScan {
+			return totalNewEpisodes, result, fmt.Errorf("list loose series episodes: %w", listErr)
+		}
 		series.EpisodeCount = len(allEpisodes)
 		series.SeasonCount = len(seasonSet)
-		s.seriesRepo.Update(series)
+		if updateErr := s.seriesRepo.Update(series); updateErr != nil && s.strictScan {
+			return totalNewEpisodes, result, fmt.Errorf("update loose series: %w", updateErr)
+		}
 
 		s.logger.Infof("散落剧集归类完成: %s, 新增 %d 集, 共 %d 季 %d 集",
 			actualSeriesName, newCount, series.SeasonCount, series.EpisodeCount)
@@ -3170,7 +3511,7 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, error) 
 		totalNewEpisodes += newCount
 	}
 
-	return totalNewEpisodes, nil
+	return totalNewEpisodes, result, nil
 }
 
 // normalizeSeriesName 标准化系列名：从目录名中去掉季号标识，返回纯系列名
@@ -3236,7 +3577,7 @@ func (s *ScannerService) extractSeasonFromDirName(dirName string) int {
 
 // scanMultiSeasonSeries 扫描属于同一系列的多季目录，将其合并到一个 Series 中
 // folders 中的 seriesFolder 包含各个季目录的路径、目录名和从目录名提取的季号
-func (s *ScannerService) scanMultiSeasonSeries(library *model.Library, seriesTitle string, folders []seriesFolder) (int, error) {
+func (s *ScannerService) scanMultiSeasonSeries(library *model.Library, seriesTitle string, folders []seriesFolder, result *scanRootResult) (int, error) {
 	s.logger.Infof("扫描多季合集: %s (%d 个目录)", seriesTitle, len(folders))
 
 	// 查找或创建统一的 Series 合集
@@ -3246,6 +3587,9 @@ func (s *ScannerService) scanMultiSeasonSeries(library *model.Library, seriesTit
 
 	// 1. 尝试按任意一个目录的 FolderPath 查找已有 Series
 	for _, f := range folders {
+		if err := s.checkScanCanceled(); err != nil {
+			return 0, err
+		}
 		if existing, err := s.seriesRepo.FindByFolderPath(f.path); err == nil {
 			series = existing
 			break
@@ -3279,6 +3623,9 @@ func (s *ScannerService) scanMultiSeasonSeries(library *model.Library, seriesTit
 		if nfoPath := s.nfoService.FindNFOFile(f.path); nfoPath != "" {
 			if err := s.nfoService.ParseTVShowNFO(nfoPath, series); err != nil {
 				s.logger.Debugf("解析多季合集NFO失败: %s, 错误: %v", nfoPath, err)
+				if s.strictScan {
+					return 0, fmt.Errorf("parse multi-season NFO %s: %w", nfoPath, err)
+				}
 			} else {
 				s.logger.Debugf("从NFO读取多季合集元数据: %s -> %s", nfoPath, series.Title)
 			}
@@ -3304,14 +3651,22 @@ func (s *ScannerService) scanMultiSeasonSeries(library *model.Library, seriesTit
 	}
 
 	// 保存NFO和图片更新
-	s.seriesRepo.Update(series)
+	if err := s.seriesRepo.Update(series); err != nil && s.strictScan {
+		return 0, fmt.Errorf("update multi-season series metadata: %w", err)
+	}
 
 	var totalNewCount int
 	seasonSet := make(map[int]bool)
 
 	// 扫描每个季目录
 	for _, f := range folders {
-		episodes := s.collectEpisodes(f.path)
+		if err := s.checkScanCanceled(); err != nil {
+			return totalNewCount, err
+		}
+		episodes, collectErr := s.collectEpisodes(f.path, result)
+		if collectErr != nil {
+			return totalNewCount, collectErr
+		}
 		if len(episodes) == 0 {
 			s.logger.Debugf("多季合集目录无视频文件: %s", f.path)
 			continue
@@ -3380,6 +3735,9 @@ func (s *ScannerService) scanMultiSeasonSeries(library *model.Library, seriesTit
 		}
 
 		for _, ep := range episodes {
+			if err := s.checkScanCanceled(); err != nil {
+				return totalNewCount, err
+			}
 			// 季号分配：
 			// 当目录名有明确季号时，优先使用目录季号（除非文件名中有不同的、合理的季号如S2标识的OVA）
 			seasonNum := ep.SeasonNum
@@ -3399,8 +3757,12 @@ func (s *ScannerService) scanMultiSeasonSeries(library *model.Library, seriesTit
 			epAdjusted.SeasonNum = seasonNum
 			if existing, err := s.mediaRepo.FindByFilePath(ep.FilePath); err == nil {
 				seasonSet[seasonNum] = true
-				s.updateExistingEpisodeRecord(existing, series.ID, seriesTitle, epAdjusted)
+				if _, updateErr := s.updateExistingEpisodeRecord(existing, series.ID, seriesTitle, epAdjusted); updateErr != nil && s.strictScan {
+					return totalNewCount, fmt.Errorf("update existing episode %s: %w", ep.FilePath, updateErr)
+				}
 				continue
+			} else if s.strictScan && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return totalNewCount, fmt.Errorf("find existing episode %s: %w", ep.FilePath, err)
 			}
 
 			media := &model.Media{
@@ -3420,6 +3782,9 @@ func (s *ScannerService) scanMultiSeasonSeries(library *model.Library, seriesTit
 
 			if err := s.persistQuickMedia(media); err != nil {
 				s.logger.Warnf("保存剧集失败: %s, 错误: %v", ep.FilePath, err)
+				if s.strictScan {
+					return totalNewCount, fmt.Errorf("save multi-season episode %s: %w", ep.FilePath, err)
+				}
 				continue
 			}
 
@@ -3439,10 +3804,15 @@ func (s *ScannerService) scanMultiSeasonSeries(library *model.Library, seriesTit
 	}
 
 	// 更新合集统计信息
-	allEpisodes, _ := s.mediaRepo.ListBySeriesID(series.ID)
+	allEpisodes, listErr := s.mediaRepo.ListBySeriesID(series.ID)
+	if listErr != nil && s.strictScan {
+		return totalNewCount, fmt.Errorf("list multi-season episodes: %w", listErr)
+	}
 	series.EpisodeCount = len(allEpisodes)
 	series.SeasonCount = len(seasonSet)
-	s.seriesRepo.Update(series)
+	if updateErr := s.seriesRepo.Update(series); updateErr != nil && s.strictScan {
+		return totalNewCount, fmt.Errorf("update multi-season statistics: %w", updateErr)
+	}
 
 	if totalNewCount > 0 {
 		s.logger.Infof("多季合集扫描完成: %s, 新增 %d 集, 共 %d 季 %d 集",
@@ -3453,7 +3823,7 @@ func (s *ScannerService) scanMultiSeasonSeries(library *model.Library, seriesTit
 }
 
 // scanSeriesFolder 扫描单个剧集文件夹
-func (s *ScannerService) scanSeriesFolder(library *model.Library, folderPath, seriesTitle string) (int, error) {
+func (s *ScannerService) scanSeriesFolder(library *model.Library, folderPath, seriesTitle string, result *scanRootResult) (int, error) {
 	s.logger.Infof("扫描剧集: %s (%s)", seriesTitle, folderPath)
 
 	// 查找或创建剧集合集条目
@@ -3475,6 +3845,9 @@ func (s *ScannerService) scanSeriesFolder(library *model.Library, folderPath, se
 	if nfoPath := s.nfoService.FindNFOFile(folderPath); nfoPath != "" {
 		if err := s.nfoService.ParseTVShowNFO(nfoPath, series); err != nil {
 			s.logger.Debugf("解析剧集NFO失败: %s, 错误: %v", nfoPath, err)
+			if s.strictScan {
+				return 0, fmt.Errorf("parse series NFO %s: %w", nfoPath, err)
+			}
 		} else {
 			s.logger.Debugf("从NFO读取剧集元数据: %s -> %s", nfoPath, series.Title)
 			// 如果NFO中有标题，更新seriesTitle用于后续剧集
@@ -3497,17 +3870,27 @@ func (s *ScannerService) scanSeriesFolder(library *model.Library, folderPath, se
 	}
 
 	// 保存NFO和图片更新
-	s.seriesRepo.Update(series)
+	if err := s.seriesRepo.Update(series); err != nil && s.strictScan {
+		return 0, fmt.Errorf("update series metadata: %w", err)
+	}
 
 	// 收集所有剧集文件
-	episodes := s.collectEpisodes(folderPath)
+	episodes, collectErr := s.collectEpisodes(folderPath, result)
+	if collectErr != nil {
+		return 0, collectErr
+	}
 
 	if len(episodes) == 0 {
 		s.logger.Debugf("剧集文件夹无视频文件: %s", folderPath)
 		// 如果该合集下已经没有任何剧集，清理这个空合集
-		existingEpisodes, _ := s.mediaRepo.ListBySeriesID(series.ID)
+		existingEpisodes, listErr := s.mediaRepo.ListBySeriesID(series.ID)
+		if listErr != nil && s.strictScan {
+			return 0, fmt.Errorf("list empty series episodes: %w", listErr)
+		}
 		if len(existingEpisodes) == 0 {
-			s.seriesRepo.Delete(series.ID)
+			if deleteErr := s.seriesRepo.Delete(series.ID); deleteErr != nil && s.strictScan {
+				return 0, fmt.Errorf("delete empty series: %w", deleteErr)
+			}
 			s.logger.Infof("清理空合集: %s (ID=%s)", seriesTitle, series.ID)
 		}
 		return 0, nil
@@ -3518,11 +3901,18 @@ func (s *ScannerService) scanSeriesFolder(library *model.Library, folderPath, se
 	seasonSet := make(map[int]bool)
 
 	for _, ep := range episodes {
+		if err := s.checkScanCanceled(); err != nil {
+			return newCount, err
+		}
 		// 检查是否已存在，如果存在则修正可能的脏数据
 		if existing, err := s.mediaRepo.FindByFilePath(ep.FilePath); err == nil {
 			seasonSet[ep.SeasonNum] = true
-			s.updateExistingEpisodeRecord(existing, series.ID, seriesTitle, ep)
+			if _, updateErr := s.updateExistingEpisodeRecord(existing, series.ID, seriesTitle, ep); updateErr != nil && s.strictScan {
+				return newCount, fmt.Errorf("update existing episode %s: %w", ep.FilePath, updateErr)
+			}
 			continue
+		} else if s.strictScan && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return newCount, fmt.Errorf("find existing episode %s: %w", ep.FilePath, err)
 		}
 
 		media := &model.Media{
@@ -3542,6 +3932,9 @@ func (s *ScannerService) scanSeriesFolder(library *model.Library, folderPath, se
 
 		if err := s.persistQuickMedia(media); err != nil {
 			s.logger.Warnf("保存剧集失败: %s, 错误: %v", ep.FilePath, err)
+			if s.strictScan {
+				return newCount, fmt.Errorf("save series episode %s: %w", ep.FilePath, err)
+			}
 			continue
 		}
 
@@ -3559,10 +3952,15 @@ func (s *ScannerService) scanSeriesFolder(library *model.Library, folderPath, se
 	}
 
 	// 更新合集统计信息
-	allEpisodes, _ := s.mediaRepo.ListBySeriesID(series.ID)
+	allEpisodes, listErr := s.mediaRepo.ListBySeriesID(series.ID)
+	if listErr != nil && s.strictScan {
+		return newCount, fmt.Errorf("list series episodes: %w", listErr)
+	}
 	series.EpisodeCount = len(allEpisodes)
 	series.SeasonCount = len(seasonSet)
-	s.seriesRepo.Update(series)
+	if updateErr := s.seriesRepo.Update(series); updateErr != nil && s.strictScan {
+		return newCount, fmt.Errorf("update series statistics: %w", updateErr)
+	}
 
 	s.logger.Infof("剧集扫描完成: %s, 新增 %d 集, 共 %d 季 %d 集",
 		seriesTitle, newCount, series.SeasonCount, series.EpisodeCount)
@@ -3571,17 +3969,24 @@ func (s *ScannerService) scanSeriesFolder(library *model.Library, folderPath, se
 }
 
 // collectEpisodes 递归收集剧集文件夹下的所有视频文件
-func (s *ScannerService) collectEpisodes(folderPath string) []EpisodeInfo {
+func (s *ScannerService) collectEpisodes(folderPath string, result *scanRootResult) ([]EpisodeInfo, error) {
 	var episodes []EpisodeInfo
 
-	filepath.Walk(folderPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+	err := s.walk(folderPath, func(path string, info os.FileInfo, walkErr error) error {
+		if err := s.checkScanCanceled(); err != nil {
+			return err
+		}
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.IsDir() {
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(path))
 		if !supportedExts[ext] {
 			return nil
 		}
+		result.addFile(path)
 
 		fileName := filepath.Base(path)
 		ep := s.parseEpisodeInfo(fileName)
@@ -3605,6 +4010,9 @@ func (s *ScannerService) collectEpisodes(folderPath string) []EpisodeInfo {
 		episodes = append(episodes, ep)
 		return nil
 	})
+	if err != nil {
+		return nil, &ScanIncompleteError{Root: folderPath, Err: err}
+	}
 
 	// 按季号+集号排序
 	sort.Slice(episodes, func(i, j int) bool {
@@ -3631,7 +4039,7 @@ func (s *ScannerService) collectEpisodes(folderPath string) []EpisodeInfo {
 		}
 	}
 
-	return episodes
+	return episodes, nil
 }
 
 // parseEpisodeInfo 从文件名解析剧集信息
@@ -4006,7 +4414,7 @@ func (s *ScannerService) broadcastScanEvent(eventType string, data *ScanProgress
 			if !shouldBroadcastScanProgress(data) {
 				return
 			}
-		case EventScanCompleted, EventScanFailed:
+		case EventScanCompleted, EventScanIncomplete, EventScanFailed:
 			defer resetScanProgressThrottle(data.LibraryID)
 		}
 	}
@@ -4202,86 +4610,7 @@ func isPathWithinRoot(path string, root string) bool {
 	return os.IsPathSeparator(path[len(root)])
 }
 
-func (s *ScannerService) countScanTargetsWithEverything(library *model.Library, addr string) (int, error) {
-	addr = normalizeEverythingAddr(addr)
-	if library == nil || addr == "" {
-		return 0, fmt.Errorf("everything address is empty")
-	}
-
-	rootPaths := library.RootPaths()
-	if len(rootPaths) == 0 {
-		rootPaths = []string{strings.TrimSpace(library.Path)}
-	}
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	pageSize := 2000
-
-	total := 0
-	for _, rootPath := range rootPaths {
-		rootPath = filepath.Clean(strings.TrimSpace(rootPath))
-		if rootPath == "" {
-			continue
-		}
-
-		query := everythingSearchForRoot(rootPath)
-		for offset := 0; ; offset += pageSize {
-			params := url.Values{}
-			params.Set("json", "1")
-			params.Set("path_column", "1")
-			params.Set("size_column", "1")
-			params.Set("count", strconv.Itoa(pageSize))
-			params.Set("offset", strconv.Itoa(offset))
-			params.Set("search", query)
-
-			resp, err := client.Get(addr + "/?" + params.Encode())
-			if err != nil {
-				return 0, err
-			}
-
-			var payload everythingHTTPResponse
-			decodeErr := json.NewDecoder(resp.Body).Decode(&payload)
-			_ = resp.Body.Close()
-			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				return 0, fmt.Errorf("everything http status %d", resp.StatusCode)
-			}
-			if decodeErr != nil {
-				return 0, decodeErr
-			}
-
-			if len(payload.Results) == 0 {
-				break
-			}
-
-			for _, item := range payload.Results {
-				if !strings.EqualFold(strings.TrimSpace(item.Type), "file") {
-					continue
-				}
-
-				fullPath := filepath.Join(item.Path, item.Name)
-				if !isPathWithinRoot(fullPath, rootPath) {
-					continue
-				}
-
-				ext := strings.ToLower(filepath.Ext(item.Name))
-				if !supportedExts[ext] {
-					continue
-				}
-				if isExtrasPath(fullPath) || isExtrasFile(filepath.Base(fullPath)) {
-					continue
-				}
-				total++
-			}
-
-			if len(payload.Results) < pageSize {
-				break
-			}
-		}
-	}
-
-	return total, nil
-}
-
-func (s *ScannerService) listMovieEntriesWithEverything(library *model.Library, addr string) ([]scanMediaEntry, error) {
+func (s *ScannerService) listMovieEntriesWithEverything(library *model.Library, addr string, result *scanRootResult) ([]scanMediaEntry, error) {
 	addr = normalizeEverythingAddr(addr)
 	if library == nil || addr == "" {
 		return nil, fmt.Errorf("everything address is empty")
@@ -4302,8 +4631,17 @@ func (s *ScannerService) listMovieEntriesWithEverything(library *model.Library, 
 		if rootPath == "" {
 			continue
 		}
+		rootInfo, statErr := s.stat(rootPath)
+		if statErr != nil {
+			return nil, &ScanIncompleteError{Root: rootPath, Err: statErr}
+		}
+		if !rootInfo.IsDir() {
+			return nil, &ScanIncompleteError{Root: rootPath, Err: fmt.Errorf("scan root is not a directory")}
+		}
 
 		query := everythingSearchForRoot(rootPath)
+		receivedResults := 0
+		expectedResults := 0
 		for offset := 0; ; offset += pageSize {
 			params := url.Values{}
 			params.Set("json", "1")
@@ -4327,9 +4665,17 @@ func (s *ScannerService) listMovieEntriesWithEverything(library *model.Library, 
 			if decodeErr != nil {
 				return nil, decodeErr
 			}
+			if payload.TotalResults > expectedResults {
+				expectedResults = payload.TotalResults
+			}
 			if len(payload.Results) == 0 {
+				if expectedResults > receivedResults {
+					return nil, &ScanIncompleteError{Root: rootPath, Err: fmt.Errorf(
+						"Everything enumeration returned %d of %d results", receivedResults, expectedResults)}
+				}
 				break
 			}
+			receivedResults += len(payload.Results)
 
 			for _, item := range payload.Results {
 				if !strings.EqualFold(strings.TrimSpace(item.Type), "file") {
@@ -4351,10 +4697,18 @@ func (s *ScannerService) listMovieEntriesWithEverything(library *model.Library, 
 					continue
 				}
 				seen[fullPath] = true
+				result.addFile(fullPath)
 				entries = append(entries, scanMediaEntry{path: fullPath})
 			}
 
+			if expectedResults > 0 && receivedResults >= expectedResults {
+				break
+			}
 			if len(payload.Results) < pageSize {
+				if expectedResults > receivedResults {
+					return nil, &ScanIncompleteError{Root: rootPath, Err: fmt.Errorf(
+						"Everything enumeration returned %d of %d results", receivedResults, expectedResults)}
+				}
 				break
 			}
 		}
@@ -4366,7 +4720,7 @@ func (s *ScannerService) listMovieEntriesWithEverything(library *model.Library, 
 	return entries, nil
 }
 
-func (s *ScannerService) listMovieEntriesWithWalk(library *model.Library) ([]scanMediaEntry, error) {
+func (s *ScannerService) listMovieEntriesWithWalk(library *model.Library, result *scanRootResult) ([]scanMediaEntry, error) {
 	if library == nil {
 		return nil, fmt.Errorf("library is nil")
 	}
@@ -4384,10 +4738,10 @@ func (s *ScannerService) listMovieEntriesWithWalk(library *model.Library) ([]sca
 			continue
 		}
 
-		err := filepath.Walk(rootPath, func(path string, info os.FileInfo, walkErr error) error {
+		err := s.walk(rootPath, func(path string, info os.FileInfo, walkErr error) error {
 			if walkErr != nil {
 				s.logger.Warnf("visit file failed: %s, err=%v", path, walkErr)
-				return nil
+				return walkErr
 			}
 			if info.IsDir() {
 				if extrasExcludeDirs[strings.ToLower(filepath.Base(path))] {
@@ -4415,6 +4769,7 @@ func (s *ScannerService) listMovieEntriesWithWalk(library *model.Library) ([]sca
 				return nil
 			}
 			seen[normalizedPath] = true
+			result.addFile(normalizedPath)
 			entries = append(entries, scanMediaEntry{
 				path: normalizedPath,
 				info: info,
@@ -4422,7 +4777,7 @@ func (s *ScannerService) listMovieEntriesWithWalk(library *model.Library) ([]sca
 			return nil
 		})
 		if err != nil {
-			return nil, err
+			return nil, &ScanIncompleteError{Root: rootPath, Err: err}
 		}
 	}
 
@@ -4432,42 +4787,42 @@ func (s *ScannerService) listMovieEntriesWithWalk(library *model.Library) ([]sca
 	return entries, nil
 }
 
-func (s *ScannerService) listMovieEntries(library *model.Library, options ScanOptions) ([]scanMediaEntry, error) {
+func (s *ScannerService) listMovieEntries(library *model.Library, options ScanOptions, result *scanRootResult) ([]scanMediaEntry, error) {
 	if options.UseEverything {
-		entries, err := s.listMovieEntriesWithEverything(library, options.EverythingAddr)
+		entries, err := s.listMovieEntriesWithEverything(library, options.EverythingAddr, result)
 		if err == nil {
 			return entries, nil
 		}
 		s.logger.Warnf("list movie entries via Everything HTTP failed, fallback to walk: library=%s err=%v", library.Name, err)
 	}
-	return s.listMovieEntriesWithWalk(library)
-}
-
-func (s *ScannerService) countScanTargets(library *model.Library, options ScanOptions) int {
-	if library == nil || !options.UseEverything {
-		return 0
-	}
-
-	if total, err := s.countScanTargetsWithEverything(library, options.EverythingAddr); err == nil {
-		s.logger.Infof("counted scan targets via Everything HTTP: library=%s total=%d", library.Name, total)
-		return total
-	}
-	return 0
+	return s.listMovieEntriesWithWalk(library, result)
 }
 
 // ProbeMediaInfo 公开的 FFprobe 媒体信息探测方法（供外部服务调用）
 func (s *ScannerService) ProbeMediaInfo(media *model.Media) {
-	s.probeMediaInfo(media)
+	if media == nil {
+		return
+	}
+	if err := s.probeMediaInfo(media); err != nil && s.logger != nil {
+		s.logger.Warnf("media probe failed: path=%s stage=%v", media.FilePath, err)
+	}
 }
 
 // parseSTRMFile 解析 .strm 文件，提取远程流 URL
 // .strm 文件格式：纯文本文件，第一行为可播放的远程 URL
 func (s *ScannerService) parseSTRMFile(filePath string) (string, error) {
-	data, err := os.ReadFile(filePath)
+	data, err := s.read(filePath)
 	if err != nil {
 		return "", fmt.Errorf("读取 .strm 文件失败: %w", err)
 	}
+	streamURL, err := parseSTRMData(data)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, filePath)
+	}
+	return streamURL, nil
+}
 
+func parseSTRMData(data []byte) (string, error) {
 	// 逐行读取，取第一个非空、非注释行作为 URL
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
@@ -4477,11 +4832,15 @@ func (s *ScannerService) parseSTRMFile(filePath string) (string, error) {
 		}
 		// 验证是否为有效的 URL
 		if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
+			parsed, parseErr := url.Parse(line)
+			if parseErr != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+				return "", fmt.Errorf(".strm target URL is invalid")
+			}
 			return line, nil
 		}
 	}
 
-	return "", fmt.Errorf(".strm 文件中未找到有效的 URL: %s", filePath)
+	return "", fmt.Errorf(".strm file does not contain a valid URL")
 }
 
 // isSTRMFile 判断是否为 .strm 文件
@@ -4508,38 +4867,61 @@ func (s *ScannerService) probeSTRMMedia(media *model.Media, streamURL string) {
 	s.logger.Debugf("STRM 文件: %s -> %s", media.FilePath, streamURL)
 }
 
-// probeMediaInfo 使用FFprobe提取视频元数据（.strm 文件走特殊逻辑）
-func (s *ScannerService) probeMediaInfo(media *model.Media) {
-	// .strm 文件：解析远程 URL，不使用 FFprobe
-	if isSTRMFile(media.FilePath) {
-		streamURL, err := s.parseSTRMFile(media.FilePath)
-		if err != nil {
-			s.logger.Warnf("解析 STRM 文件失败: %s, 错误: %v", media.FilePath, err)
-			return
-		}
-		s.probeSTRMMedia(media, streamURL)
-		return
+func (s *ScannerService) runMediaProbe(mediaPath string) ([]byte, error) {
+	if s.probeMediaFile != nil {
+		return s.probeMediaFile(mediaPath)
 	}
-
+	if s.cfg == nil || strings.TrimSpace(s.cfg.App.FFprobePath) == "" {
+		return nil, fmt.Errorf("ffprobe configuration is unavailable")
+	}
 	cmd, cancel := newBackgroundCommand(mediaProbeTimeout, s.cfg.App.FFprobePath,
 		"-v", "quiet",
 		"-print_format", "json",
 		"-show_format",
 		"-show_streams",
-		media.FilePath,
+		mediaPath,
 	)
 	defer cancel()
+	return cmd.Output()
+}
 
-	output, err := cmd.Output()
+// probeMediaInfo 使用FFprobe提取视频元数据（.strm 文件走特殊逻辑）
+func (s *ScannerService) probeMediaInfo(media *model.Media) error {
+	if media == nil || strings.TrimSpace(media.FilePath) == "" {
+		return fmt.Errorf("probe input is missing media path")
+	}
+	if s.preparedProbes != nil {
+		probe, ok := s.preparedProbes[nfoPathKey(media.FilePath)]
+		if !ok {
+			return fmt.Errorf("prepared probe result is missing")
+		}
+		probe.apply(media)
+		return nil
+	}
+	// .strm 文件：解析远程 URL，不使用 FFprobe
+	if isSTRMFile(media.FilePath) {
+		streamURL, err := s.parseSTRMFile(media.FilePath)
+		if err != nil {
+			return fmt.Errorf("strm parse: %w", err)
+		}
+		s.probeSTRMMedia(media, streamURL)
+		return nil
+	}
+	output, err := s.runMediaProbe(media.FilePath)
 	if err != nil {
-		s.logger.Warnf("FFprobe分析失败: %s, 错误: %v", media.FilePath, err)
-		return
+		return fmt.Errorf("ffprobe execution: %w", err)
 	}
 
+	return s.applyFFprobeOutput(media, output)
+}
+
+func (s *ScannerService) applyFFprobeOutput(media *model.Media, output []byte) error {
 	var result FFprobeResult
 	if err := json.Unmarshal(output, &result); err != nil {
-		s.logger.Warnf("解析FFprobe输出失败: %s, 错误: %v", media.FilePath, err)
-		return
+		return fmt.Errorf("ffprobe JSON decode: %w", err)
+	}
+	if len(result.Streams) == 0 {
+		return fmt.Errorf("ffprobe output contains no media streams")
 	}
 
 	// 提取视频流信息
@@ -4559,10 +4941,13 @@ func (s *ScannerService) probeMediaInfo(media *model.Media) {
 
 	// 提取时长
 	if result.Format.Duration != "" {
-		if dur, err := strconv.ParseFloat(result.Format.Duration, 64); err == nil {
-			media.Duration = dur
+		dur, err := strconv.ParseFloat(result.Format.Duration, 64)
+		if err != nil {
+			return fmt.Errorf("ffprobe duration parse: %w", err)
 		}
+		media.Duration = dur
 	}
+	return nil
 }
 
 // GetSubtitleTracks 获取媒体文件的内嵌字幕轨道列表
@@ -4646,7 +5031,7 @@ func (s *ScannerService) scanExternalSubtitles(media *model.Media) {
 	subtitleExts := []string{".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx"}
 
 	var found []string
-	entries, err := os.ReadDir(dir)
+	entries, err := s.listDir(dir)
 	if err != nil {
 		return
 	}

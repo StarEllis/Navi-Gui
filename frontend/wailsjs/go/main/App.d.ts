@@ -9,7 +9,7 @@ export function CleanOrphanedMediaAssociations():Promise<repository.OrphanedMedi
 
 export function CreateLibrary(arg1:model.Library):Promise<model.Library>;
 
-export function DeleteLibrary(arg1:string):Promise<void>;
+export function DeleteLibrary(arg1:string):Promise<main.DeleteLibraryResult>;
 
 export function DeleteMedia(arg1:string):Promise<void>;
 

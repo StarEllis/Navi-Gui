@@ -1,12 +1,14 @@
 package service
 
 import (
+	"bytes"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -19,11 +21,93 @@ import (
 // 支持 Kodi / Emby / Jellyfin 风格的 NFO XML 文件
 // 增强：宽松兼容非标准字段、日期归一化、原始 XML 保留
 type NFOService struct {
-	logger *zap.SugaredLogger
+	logger        *zap.SugaredLogger
+	readFile      func(string) ([]byte, error)
+	statFile      func(string) (os.FileInfo, error)
+	readDir       func(string) ([]os.DirEntry, error)
+	preparedNFOs  map[string]*preparedNFOFile
+	createNFOtemp func(string, string) (*os.File, error)
+	writeNFOtemp  func(*os.File, []byte) (int, error)
+	validateNFO   func([]byte) error
+	replaceNFO    func(string, string) error
 }
 
 func NewNFOService(logger *zap.SugaredLogger) *NFOService {
 	return &NFOService{logger: logger}
+}
+
+type preparedNFOFile struct {
+	data          []byte
+	info          os.FileInfo
+	movie         *NFOMovie
+	movieErr      error
+	tvShow        *NFOTVShow
+	tvShowErr     error
+	fieldPresence map[string]bool
+	fieldErr      error
+	actorMetadata *NFOActorMetadata
+	actorsErr     error
+}
+
+func nfoPathKey(path string) string {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return path
+}
+
+func (s *NFOService) read(path string) ([]byte, error) {
+	if s != nil && s.readFile != nil {
+		return s.readFile(path)
+	}
+	return os.ReadFile(path)
+}
+
+func (s *NFOService) stat(path string) (os.FileInfo, error) {
+	if s != nil && s.statFile != nil {
+		return s.statFile(path)
+	}
+	return os.Stat(path)
+}
+
+func (s *NFOService) listDir(path string) ([]os.DirEntry, error) {
+	if s != nil && s.readDir != nil {
+		return s.readDir(path)
+	}
+	return os.ReadDir(path)
+}
+
+func (s *NFOService) prepareNFO(path string, data []byte, info os.FileInfo) *preparedNFOFile {
+	prepared := &preparedNFOFile{data: append([]byte(nil), data...), info: info}
+	var movie NFOMovie
+	prepared.movieErr = s.unmarshalNFOXML(data, &movie, path)
+	if prepared.movieErr == nil {
+		prepared.movie = &movie
+	}
+	var tvShow NFOTVShow
+	prepared.tvShowErr = s.unmarshalNFOXML(data, &tvShow, path)
+	if prepared.tvShowErr == nil {
+		prepared.tvShow = &tvShow
+	}
+	prepared.fieldPresence, prepared.fieldErr = nfoXMLFieldPresence(data)
+	prepared.actorMetadata, prepared.actorsErr = parseNFOActorMetadata(data)
+	return prepared
+}
+
+func (s *NFOService) cloneWithPreparedIO(
+	readFile func(string) ([]byte, error),
+	statFile func(string) (os.FileInfo, error),
+	readDir func(string) ([]os.DirEntry, error),
+	prepared map[string]*preparedNFOFile,
+) *NFOService {
+	return &NFOService{
+		logger:       s.logger,
+		readFile:     readFile,
+		statFile:     statFile,
+		readDir:      readDir,
+		preparedNFOs: prepared,
+	}
 }
 
 type NFOSet struct {
@@ -39,14 +123,6 @@ func (s *NFOSet) Value() string {
 		return value
 	}
 	return strings.TrimSpace(s.Text)
-}
-
-func newNFOSet(value string) *NFOSet {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return nil
-	}
-	return &NFOSet{Name: value}
 }
 
 // ==================== NFO XML 结构体（增强版） ====================
@@ -135,6 +211,12 @@ type NFOActor struct {
 	SortOrder int    `xml:"sortorder"`
 }
 
+type NFOActorMetadata struct {
+	Actors        []NFOActor
+	Directors     []string
+	ActorsPresent bool
+}
+
 // NFOExtraFields 存储到 Media.NfoExtraFields 的 JSON 结构
 // NOTE: 后续可根据需要扩展字段
 type NFOExtraFields struct {
@@ -161,22 +243,29 @@ type NFORawSection struct {
 }
 
 type NFOEditorData struct {
-	NFOPath     string `json:"nfo_path"`
-	Title       string `json:"title"`
-	Code        string `json:"code"`
-	ReleaseDate string `json:"release_date"`
-	Director    string `json:"director"`
-	Series      string `json:"series"`
-	Publisher   string `json:"publisher"`
-	Maker       string `json:"maker"`
-	Genres      string `json:"genres"`
-	Actors      string `json:"actors"`
-	Plot        string `json:"plot"`
-	Runtime     string `json:"runtime"`
-	FileSize    string `json:"file_size"`
-	Resolution  string `json:"resolution"`
-	VideoCodec  string `json:"video_codec"`
-	Rating      string `json:"rating"`
+	NFOPath           string   `json:"nfo_path"`
+	Title             string   `json:"title"`
+	Code              string   `json:"code"`
+	ReleaseDate       string   `json:"release_date"`
+	Director          string   `json:"director"`
+	Series            string   `json:"series"`
+	Publisher         string   `json:"publisher"`
+	Maker             string   `json:"maker"`
+	Genres            string   `json:"genres"`
+	Actors            string   `json:"actors"`
+	Plot              string   `json:"plot"`
+	Runtime           string   `json:"runtime"`
+	FileSize          string   `json:"file_size"`
+	Resolution        string   `json:"resolution"`
+	VideoCodec        string   `json:"video_codec"`
+	Rating            string   `json:"rating"`
+	SourceFingerprint string   `json:"source_fingerprint"`
+	UpdatedFields     []string `json:"updated_fields"`
+}
+
+var nfoEditorWritableFields = []string{
+	"title", "code", "release_date", "director", "series", "publisher",
+	"maker", "genres", "actors", "plot", "runtime", "rating",
 }
 
 func joinEditorList(values []string) string {
@@ -258,18 +347,6 @@ func splitEditorValues(raw string) []string {
 	return items
 }
 
-func buildEditorActors(raw string) []NFOActor {
-	names := splitEditorValues(raw)
-	actors := make([]NFOActor, 0, len(names))
-	for index, name := range names {
-		actors = append(actors, NFOActor{
-			Name:      name,
-			SortOrder: index,
-		})
-	}
-	return actors
-}
-
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		value = strings.TrimSpace(value)
@@ -331,16 +408,6 @@ func deriveEditorCode(media *model.Media) string {
 	filename := filepath.Base(media.FilePath)
 	stem := strings.TrimSuffix(filename, filepath.Ext(filename))
 	return strings.TrimSpace(stem)
-}
-
-func releaseYear(value string, fallback int) int {
-	value = strings.TrimSpace(value)
-	if len(value) >= 4 {
-		if year, err := strconv.Atoi(value[:4]); err == nil && year > 0 {
-			return year
-		}
-	}
-	return fallback
 }
 
 func sanitizeMalformedNFOXML(data []byte) ([]byte, bool) {
@@ -440,7 +507,14 @@ func isXMLNameChar(value byte) bool {
 }
 
 func (s *NFOService) unmarshalNFOXML(data []byte, target interface{}, nfoPath string) error {
-	if err := xml.Unmarshal(data, target); err == nil {
+	decode := func(input []byte) error {
+		filtered, err := filterNFOXMLNamespaces(input, false)
+		if err != nil {
+			return err
+		}
+		return xml.Unmarshal(filtered, target)
+	}
+	if err := decode(data); err == nil {
 		return nil
 	} else {
 		sanitized, changed := sanitizeMalformedNFOXML(data)
@@ -451,7 +525,7 @@ func (s *NFOService) unmarshalNFOXML(data []byte, target interface{}, nfoPath st
 		if targetValue.Kind() == reflect.Ptr && !targetValue.IsNil() {
 			targetValue.Elem().Set(reflect.Zero(targetValue.Elem().Type()))
 		}
-		if retryErr := xml.Unmarshal(sanitized, target); retryErr == nil {
+		if retryErr := decode(sanitized); retryErr == nil {
 			if s.logger != nil {
 				s.logger.Debugf("parsed malformed NFO after XML sanitization: %s", nfoPath)
 			}
@@ -465,20 +539,21 @@ func (s *NFOService) LoadEditorData(nfoPath string, media *model.Media) (*NFOEdi
 	ApplyDerivedMediaFields(media)
 
 	data := &NFOEditorData{
-		NFOPath:     strings.TrimSpace(nfoPath),
-		Title:       strings.TrimSpace(media.Title),
-		Code:        deriveEditorCode(media),
-		ReleaseDate: strings.TrimSpace(media.ReleaseDateNormalized),
-		Publisher:   firstNonEmptyTrimmed(media.Label, media.Studio),
-		Maker:       firstNonEmptyTrimmed(media.Maker, media.Studio),
-		Genres:      joinEditorList(strings.Split(strings.TrimSpace(media.Genres), ",")),
-		Actors:      joinEditorList(strings.Split(strings.TrimSpace(media.Actor), ",")),
-		Plot:        strings.TrimSpace(media.Overview),
-		Runtime:     formatEditorInt(media.Runtime),
-		FileSize:    formatEditorFileSize(media.FileSize),
-		Resolution:  strings.TrimSpace(media.Resolution),
-		VideoCodec:  strings.TrimSpace(media.VideoCodec),
-		Rating:      formatEditorFloat(media.Rating),
+		NFOPath:           strings.TrimSpace(nfoPath),
+		Title:             strings.TrimSpace(media.Title),
+		Code:              deriveEditorCode(media),
+		ReleaseDate:       strings.TrimSpace(media.ReleaseDateNormalized),
+		Publisher:         firstNonEmptyTrimmed(media.Label, media.Studio),
+		Maker:             firstNonEmptyTrimmed(media.Maker, media.Studio),
+		Genres:            joinEditorList(strings.Split(strings.TrimSpace(media.Genres), ",")),
+		Actors:            joinEditorList(strings.Split(strings.TrimSpace(media.Actor), ",")),
+		Plot:              strings.TrimSpace(media.Overview),
+		Runtime:           formatEditorInt(media.Runtime),
+		FileSize:          formatEditorFileSize(media.FileSize),
+		Resolution:        strings.TrimSpace(media.Resolution),
+		VideoCodec:        strings.TrimSpace(media.VideoCodec),
+		Rating:            formatEditorFloat(media.Rating),
+		SourceFingerprint: missingNFOFingerprint,
 	}
 	if media.Series != nil {
 		data.Series = strings.TrimSpace(media.Series.Title)
@@ -488,31 +563,75 @@ func (s *NFOService) LoadEditorData(nfoPath string, media *model.Media) (*NFOEdi
 		return data, nil
 	}
 
-	content, err := os.ReadFile(nfoPath)
+	content, _, exists, err := readNFOState(nfoPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return data, nil
-		}
 		return nil, fmt.Errorf("读取 NFO 文件失败: %w", err)
 	}
+	if !exists {
+		return data, nil
+	}
+	data.SourceFingerprint = nfoContentFingerprint(content, true)
 
 	var movie NFOMovie
 	if err := s.unmarshalNFOXML(content, &movie, nfoPath); err != nil {
 		return nil, fmt.Errorf("解析 NFO 文件失败: %w", err)
 	}
+	presence, err := nfoXMLFieldPresence(content)
+	if err != nil {
+		return nil, fmt.Errorf("解析 NFO 字段失败: %w", err)
+	}
 
-	data.Title = firstNonEmpty(movie.Title, data.Title)
-	data.Code = firstNonEmpty(movie.Num, data.Code)
-	data.ReleaseDate = firstNonEmpty(movie.ReleaseDate, movie.Premiered, movie.Release, data.ReleaseDate)
-	data.Director = firstNonEmpty(joinEditorList(movie.Directors), data.Director)
-	data.Series = firstNonEmpty(movie.Set.Value(), movie.Series, data.Series)
-	data.Publisher = firstNonEmpty(movie.Publisher, movie.Label, data.Publisher)
-	data.Maker = firstNonEmpty(movie.Maker, movie.Studio, data.Maker)
-	data.Genres = firstNonEmpty(joinEditorList(append(movie.Genres, movie.Tags...)), data.Genres)
-	data.Actors = firstNonEmpty(joinActorNames(movie.Actors), data.Actors)
-	data.Plot = firstNonEmpty(movie.Plot, movie.Outline, data.Plot)
-	data.Runtime = firstNonEmpty(formatEditorInt(movie.Runtime), data.Runtime)
-	data.Rating = firstNonEmpty(formatEditorFloat(movie.Rating), data.Rating)
+	if presence["title"] {
+		data.Title = strings.TrimSpace(movie.Title)
+	}
+	if presence["num"] {
+		data.Code = strings.TrimSpace(movie.Num)
+	}
+	switch {
+	case presence["releasedate"]:
+		data.ReleaseDate = strings.TrimSpace(movie.ReleaseDate)
+	case presence["premiered"]:
+		data.ReleaseDate = strings.TrimSpace(movie.Premiered)
+	case presence["release"]:
+		data.ReleaseDate = strings.TrimSpace(movie.Release)
+	}
+	if presence["director"] {
+		data.Director = joinEditorList(movie.Directors)
+	}
+	if presence["set"] || presence["series"] {
+		data.Series = firstNonEmpty(movie.Set.Value(), movie.Series)
+	}
+	if presence["publisher"] {
+		data.Publisher = strings.TrimSpace(movie.Publisher)
+	} else if presence["label"] {
+		data.Publisher = strings.TrimSpace(movie.Label)
+	}
+	if presence["maker"] {
+		data.Maker = strings.TrimSpace(movie.Maker)
+	} else if presence["studio"] {
+		data.Maker = strings.TrimSpace(movie.Studio)
+	}
+	if presence["genre"] || presence["tag"] {
+		data.Genres = joinEditorList(append(append([]string(nil), movie.Genres...), movie.Tags...))
+	}
+	if actorMetadata, actorErr := parseNFOActorMetadata(content); actorErr == nil {
+		if actorMetadata.ActorsPresent {
+			data.Actors = joinActorNames(actorMetadata.Actors)
+		}
+	} else {
+		return nil, fmt.Errorf("解析 NFO 演员失败: %w", actorErr)
+	}
+	if presence["plot"] {
+		data.Plot = strings.TrimSpace(movie.Plot)
+	} else if presence["outline"] {
+		data.Plot = strings.TrimSpace(movie.Outline)
+	}
+	if presence["runtime"] {
+		data.Runtime = formatEditorInt(movie.Runtime)
+	}
+	if presence["rating"] {
+		data.Rating = formatEditorFloat(movie.Rating)
+	}
 
 	return data, nil
 }
@@ -526,57 +645,42 @@ func (s *NFOService) SaveEditorData(nfoPath string, data *NFOEditorData) error {
 		return fmt.Errorf("empty nfo editor data")
 	}
 
-	var movie NFOMovie
-	if content, err := os.ReadFile(nfoPath); err == nil {
-		if err := s.unmarshalNFOXML(content, &movie, nfoPath); err != nil {
-			return fmt.Errorf("解析 NFO 文件失败: %w", err)
-		}
-	} else if !os.IsNotExist(err) {
+	original, info, exists, err := readNFOState(nfoPath)
+	if err != nil {
 		return fmt.Errorf("读取 NFO 文件失败: %w", err)
 	}
-
-	movie.XMLName = xml.Name{Local: "movie"}
-	movie.Title = strings.TrimSpace(data.Title)
-	movie.Num = strings.TrimSpace(data.Code)
-	movie.Premiered = strings.TrimSpace(data.ReleaseDate)
-	movie.ReleaseDate = strings.TrimSpace(data.ReleaseDate)
-	movie.Release = strings.TrimSpace(data.ReleaseDate)
-	seriesValue := strings.TrimSpace(data.Series)
-	movie.Set = newNFOSet(seriesValue)
-	movie.Series = seriesValue
-	movie.Directors = splitEditorValues(data.Director)
-	movie.Publisher = strings.TrimSpace(data.Publisher)
-	movie.Label = strings.TrimSpace(data.Publisher)
-	movie.Maker = strings.TrimSpace(data.Maker)
-	movie.Studio = strings.TrimSpace(data.Maker)
-	movie.Genres = splitEditorValues(data.Genres)
-	movie.Tags = append([]string(nil), movie.Genres...)
-	movie.Actors = buildEditorActors(data.Actors)
-	movie.Plot = strings.TrimSpace(data.Plot)
-
-	if runtime, err := strconv.Atoi(strings.TrimSpace(data.Runtime)); err == nil {
-		movie.Runtime = runtime
+	currentFingerprint := nfoContentFingerprint(original, exists)
+	if data.SourceFingerprint != "" && data.SourceFingerprint != currentFingerprint {
+		return fmt.Errorf("NFO save conflict: source file was modified externally")
 	}
-	if rating, err := strconv.ParseFloat(strings.TrimSpace(data.Rating), 64); err == nil {
-		movie.Rating = rating
+	saveData := data
+	if !exists {
+		copy := *data
+		copy.UpdatedFields = append([]string(nil), nfoEditorWritableFields...)
+		saveData = &copy
 	}
-	movie.Year = releaseYear(data.ReleaseDate, movie.Year)
-
-	output, err := xml.MarshalIndent(movie, "", "  ")
+	if len(saveData.UpdatedFields) == 0 {
+		return nil
+	}
+	mode := os.FileMode(0644)
+	if exists {
+		mode = info.Mode()
+		if mode.Perm()&0222 == 0 {
+			return fmt.Errorf("NFO file is read-only: %s", nfoPath)
+		}
+	} else {
+		original = []byte(xml.Header + "<movie></movie>\n")
+	}
+	output, err := buildEditedNFO(original, saveData)
 	if err != nil {
-		return fmt.Errorf("序列化 NFO 文件失败: %w", err)
+		return fmt.Errorf("更新 NFO XML 失败: %w", err)
 	}
-
-	if err := os.MkdirAll(filepath.Dir(nfoPath), 0755); err != nil {
-		return fmt.Errorf("创建 NFO 目录失败: %w", err)
+	if bytes.Equal(output, original) && exists {
+		return nil
 	}
-
-	fileContent := append([]byte(xml.Header), output...)
-	fileContent = append(fileContent, '\n')
-	if err := os.WriteFile(nfoPath, fileContent, 0644); err != nil {
-		return fmt.Errorf("写入 NFO 文件失败: %w", err)
+	if err := s.writeNFOAtomically(nfoPath, output, mode, currentFingerprint); err != nil {
+		return err
 	}
-
 	return nil
 }
 
@@ -584,16 +688,35 @@ func (s *NFOService) SaveEditorData(nfoPath string, data *NFOEditorData) error {
 
 // ParseMovieNFO 解析电影 NFO 文件并将数据应用到 Media 对象
 func (s *NFOService) ParseMovieNFO(nfoPath string, media *model.Media) error {
-	data, err := os.ReadFile(nfoPath)
+	if prepared := s.preparedNFOs[nfoPathKey(nfoPath)]; prepared != nil {
+		if prepared.movieErr == nil && prepared.movie != nil {
+			if prepared.fieldErr != nil {
+				return fmt.Errorf("parse NFO XML fields failed: %w", prepared.fieldErr)
+			}
+			applyPreparedNFOFileState(media, prepared)
+			s.applyMovieNFOToMedia(media, prepared.movie, prepared.fieldPresence)
+			return nil
+		}
+		if prepared.tvShowErr == nil && prepared.tvShow != nil {
+			if prepared.fieldErr != nil {
+				return fmt.Errorf("parse NFO XML fields failed: %w", prepared.fieldErr)
+			}
+			applyPreparedNFOFileState(media, prepared)
+			s.applyTVShowNFOToMedia(media, prepared.tvShow, prepared.fieldPresence)
+			return nil
+		}
+		return fmt.Errorf("parse NFO XML failed: %w", prepared.movieErr)
+	}
+
+	data, err := s.read(nfoPath)
 	if err != nil {
 		return fmt.Errorf("读取NFO文件失败: %w", err)
 	}
 
-	// 保留原始 XML 文本
-	media.NfoRawXml = string(data)
-	if info, statErr := os.Stat(nfoPath); statErr == nil && info != nil && !info.IsDir() {
-		nfoModTime := info.ModTime().UTC().Truncate(time.Second)
-		media.NfoModTime = &nfoModTime
+	var nfoModTime *time.Time
+	if info, statErr := s.stat(nfoPath); statErr == nil && info != nil && !info.IsDir() {
+		value := info.ModTime().UTC().Truncate(time.Second)
+		nfoModTime = &value
 	}
 
 	var nfo NFOMovie
@@ -604,17 +727,48 @@ func (s *NFOService) ParseMovieNFO(nfoPath string, media *model.Media) error {
 			return fmt.Errorf("解析NFO XML失败: %w", err)
 		}
 		// 如果是 tvshow 格式，转换后应用
-		s.applyTVShowNFOToMedia(media, &tvNFO)
+		presence, presenceErr := nfoXMLFieldPresence(data)
+		if presenceErr != nil {
+			return fmt.Errorf("解析NFO字段失败: %w", presenceErr)
+		}
+		media.NfoRawXml = string(data)
+		media.NfoModTime = nfoModTime
+		s.applyTVShowNFOToMedia(media, &tvNFO, presence)
 		return nil
 	}
 
-	s.applyMovieNFOToMedia(media, &nfo)
+	presence, err := nfoXMLFieldPresence(data)
+	if err != nil {
+		return fmt.Errorf("解析NFO字段失败: %w", err)
+	}
+	media.NfoRawXml = string(data)
+	media.NfoModTime = nfoModTime
+	s.applyMovieNFOToMedia(media, &nfo, presence)
 	return nil
+}
+
+func applyPreparedNFOFileState(media *model.Media, prepared *preparedNFOFile) {
+	media.NfoRawXml = string(prepared.data)
+	if prepared.info != nil && !prepared.info.IsDir() {
+		nfoModTime := prepared.info.ModTime().UTC().Truncate(time.Second)
+		media.NfoModTime = &nfoModTime
+	}
 }
 
 // ParseTVShowNFO 解析剧集 NFO 文件并将数据应用到 Series 对象
 func (s *NFOService) ParseTVShowNFO(nfoPath string, series *model.Series) error {
-	data, err := os.ReadFile(nfoPath)
+	if prepared := s.preparedNFOs[nfoPathKey(nfoPath)]; prepared != nil {
+		if prepared.tvShowErr != nil || prepared.tvShow == nil {
+			return fmt.Errorf("parse NFO XML failed: %w", prepared.tvShowErr)
+		}
+		if prepared.fieldErr != nil {
+			return fmt.Errorf("parse NFO XML fields failed: %w", prepared.fieldErr)
+		}
+		s.applyTVShowNFOToSeries(series, prepared.tvShow, prepared.fieldPresence)
+		return nil
+	}
+
+	data, err := s.read(nfoPath)
 	if err != nil {
 		return fmt.Errorf("读取NFO文件失败: %w", err)
 	}
@@ -624,30 +778,49 @@ func (s *NFOService) ParseTVShowNFO(nfoPath string, series *model.Series) error 
 		return fmt.Errorf("解析NFO XML失败: %w", err)
 	}
 
-	s.applyTVShowNFOToSeries(series, &nfo)
+	presence, err := nfoXMLFieldPresence(data)
+	if err != nil {
+		return fmt.Errorf("解析NFO字段失败: %w", err)
+	}
+	s.applyTVShowNFOToSeries(series, &nfo, presence)
 	return nil
+}
+
+// GetActorMetadataFromNFO extracts actors and whether the NFO explicitly
+// supplied actor metadata. An empty <actors/> or <actor/> is a valid empty list;
+// no actor element means the NFO did not authoritatively provide this field.
+func (s *NFOService) GetActorMetadataFromNFO(nfoPath string) (*NFOActorMetadata, error) {
+	if prepared := s.preparedNFOs[nfoPathKey(nfoPath)]; prepared != nil {
+		if prepared.actorsErr != nil {
+			return nil, prepared.actorsErr
+		}
+		if prepared.actorMetadata != nil {
+			copy := *prepared.actorMetadata
+			copy.Actors = append([]NFOActor(nil), prepared.actorMetadata.Actors...)
+			copy.Directors = append([]string(nil), prepared.actorMetadata.Directors...)
+			return &copy, nil
+		}
+		return nil, fmt.Errorf("unable to parse NFO file")
+	}
+
+	data, err := s.read(nfoPath)
+	if err != nil {
+		return nil, err
+	}
+	metadata, err := parseNFOActorMetadata(data)
+	if err != nil {
+		return nil, fmt.Errorf("无法解析NFO文件: %w", err)
+	}
+	return metadata, nil
 }
 
 // GetActorsFromNFO 从 NFO 文件中提取演员列表
 func (s *NFOService) GetActorsFromNFO(nfoPath string) ([]NFOActor, []string, error) {
-	data, err := os.ReadFile(nfoPath)
+	metadata, err := s.GetActorMetadataFromNFO(nfoPath)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	// 先尝试 movie
-	var movie NFOMovie
-	if err := s.unmarshalNFOXML(data, &movie, nfoPath); err == nil && movie.Title != "" {
-		return movie.Actors, movie.Directors, nil
-	}
-
-	// 再尝试 tvshow
-	var tvshow NFOTVShow
-	if err := s.unmarshalNFOXML(data, &tvshow, nfoPath); err == nil && tvshow.Title != "" {
-		return tvshow.Actors, tvshow.Directors, nil
-	}
-
-	return nil, nil, fmt.Errorf("无法解析NFO文件")
+	return metadata.Actors, metadata.Directors, nil
 }
 
 // ==================== 本地图片扫描 ====================
@@ -676,7 +849,7 @@ func (s *NFOService) FindLocalImages(dir string) (poster, backdrop string) {
 
 	for _, name := range posterNames {
 		path := filepath.Join(dir, name)
-		if _, err := os.Stat(path); err == nil {
+		if _, err := s.stat(path); err == nil {
 			poster = path
 			break
 		}
@@ -684,14 +857,14 @@ func (s *NFOService) FindLocalImages(dir string) (poster, backdrop string) {
 
 	for _, name := range backdropNames {
 		path := filepath.Join(dir, name)
-		if _, err := os.Stat(path); err == nil {
+		if _, err := s.stat(path); err == nil {
 			backdrop = path
 			break
 		}
 	}
 
 	imageExts := map[string]bool{".jpg": true, ".jpeg": true, ".png": true, ".webp": true}
-	entries, err := os.ReadDir(dir)
+	entries, err := s.listDir(dir)
 	if err == nil {
 		hasToken := func(name, token string) bool {
 			lower := strings.ToLower(name)
@@ -746,7 +919,7 @@ func (s *NFOService) FindLocalImages(dir string) (poster, backdrop string) {
 
 	// 如果没有找到标准命名的海报，尝试查找目录中的第一张图片作为海报
 	if poster == "" {
-		entries, err := os.ReadDir(dir)
+		entries, err := s.listDir(dir)
 		if err == nil {
 			imageExts := map[string]bool{".jpg": true, ".jpeg": true, ".png": true, ".webp": true}
 			for _, entry := range entries {
@@ -770,7 +943,7 @@ func (s *NFOService) FindLocalImages(dir string) (poster, backdrop string) {
 
 // FindNFOFile 在指定目录下查找 NFO 文件
 func (s *NFOService) FindNFOFile(dir string) string {
-	entries, err := os.ReadDir(dir)
+	entries, err := s.listDir(dir)
 	if err != nil {
 		return ""
 	}
@@ -787,7 +960,7 @@ func (s *NFOService) FindNFOForMedia(mediaFilePath string) string {
 	// 策略1: 同名 .nfo 文件
 	ext := filepath.Ext(mediaFilePath)
 	nfoPath := strings.TrimSuffix(mediaFilePath, ext) + ".nfo"
-	if _, err := os.Stat(nfoPath); err == nil {
+	if _, err := s.stat(nfoPath); err == nil {
 		return nfoPath
 	}
 
@@ -818,28 +991,30 @@ func normalizeReleaseDate(releasedate, premiered, release string) string {
 
 // ==================== 应用 NFO 数据（增强版） ====================
 
-func (s *NFOService) applyMovieNFOToMedia(media *model.Media, nfo *NFOMovie) {
-	if nfo.Title != "" {
+func (s *NFOService) applyMovieNFOToMedia(media *model.Media, nfo *NFOMovie, fields map[string]bool) {
+	if fields["title"] {
 		media.Title = nfo.Title
 	}
-	if nfo.OrigTitle != "" {
+	if fields["originaltitle"] {
 		media.OrigTitle = nfo.OrigTitle
 	}
-	if nfo.Year > 0 {
+	if fields["year"] {
 		media.Year = nfo.Year
 	}
-	if nfo.Plot != "" {
+	if fields["plot"] {
 		media.Overview = nfo.Plot
+	} else if fields["outline"] {
+		media.Overview = nfo.Outline
 	}
-	if nfo.Rating > 0 {
+	if fields["rating"] {
 		media.Rating = nfo.Rating
 	}
-	if nfo.Runtime > 0 {
+	if fields["runtime"] {
 		media.Runtime = nfo.Runtime
 	}
 	// genre 和 tag 合并去重展示
-	allGenres := append(nfo.Genres, nfo.Tags...)
-	if len(allGenres) > 0 {
+	if fields["genre"] || fields["tag"] {
+		allGenres := append(append([]string(nil), nfo.Genres...), nfo.Tags...)
 		seen := make(map[string]bool)
 		var deduped []string
 		for _, g := range allGenres {
@@ -851,70 +1026,119 @@ func (s *NFOService) applyMovieNFOToMedia(media *model.Media, nfo *NFOMovie) {
 		}
 		media.Genres = strings.Join(deduped, ",")
 	}
-	if nfo.Tagline != "" {
+	if fields["tagline"] {
 		media.Tagline = nfo.Tagline
 	}
-	if nfo.Studio != "" {
+	if fields["studio"] {
 		media.Studio = nfo.Studio
 	}
-	if nfo.Country != "" {
+	if fields["country"] {
 		media.Country = nfo.Country
 	}
-	if nfo.TMDbID > 0 {
+	if fields["tmdbid"] {
 		media.TMDbID = nfo.TMDbID
 	}
-	if nfo.DoubanID != "" {
+	if fields["doubanid"] {
 		media.DoubanID = nfo.DoubanID
 	}
 
 	// 日期归一化
-	normalized := normalizeReleaseDate(nfo.ReleaseDate, nfo.Premiered, nfo.Release)
-	if normalized != "" {
-		media.ReleaseDateNormalized = normalized
+	switch {
+	case fields["releasedate"]:
+		media.ReleaseDateNormalized = normalizeReleaseDate(nfo.ReleaseDate, "", "")
+	case fields["premiered"]:
+		media.ReleaseDateNormalized = normalizeReleaseDate(nfo.Premiered, "", "")
+	case fields["release"]:
+		media.ReleaseDateNormalized = normalizeReleaseDate(nfo.Release, "", "")
 	}
 
-	// 构建扩展字段 JSON
-	extra := NFOExtraFields{
-		SortTitle:    nfo.SortTitle,
-		Outline:      nfo.Outline,
-		OriginalPlot: nfo.OriginalPlot,
-		MPAA:         nfo.MPAA,
-		CustomRating: nfo.CustomRating,
-		CriticRating: nfo.CriticRating,
-		CountryCode:  nfo.CountryCode,
-		Maker:        nfo.Maker,
-		Publisher:    nfo.Publisher,
-		Label:        nfo.Label,
-		Num:          nfo.Num,
-		Poster:       nfo.Poster,
-		Cover:        nfo.Cover,
-		Fanart:       nfo.Fanart,
-		Tags:         nfo.Tags,
+	// Merge only fields actually present in the source NFO. Missing fields keep
+	// their previous database values; explicit empty elements clear them.
+	extra := parseNFOExtraFields(media.NfoExtraFields)
+	touchedExtra := false
+	stringExtraFields := []struct {
+		name  string
+		value string
+		dest  *string
+	}{
+		{"sorttitle", nfo.SortTitle, &extra.SortTitle},
+		{"outline", nfo.Outline, &extra.Outline},
+		{"originalplot", nfo.OriginalPlot, &extra.OriginalPlot},
+		{"mpaa", nfo.MPAA, &extra.MPAA},
+		{"customrating", nfo.CustomRating, &extra.CustomRating},
+		{"countrycode", nfo.CountryCode, &extra.CountryCode},
+		{"maker", nfo.Maker, &extra.Maker},
+		{"publisher", nfo.Publisher, &extra.Publisher},
+		{"label", nfo.Label, &extra.Label},
+		{"num", nfo.Num, &extra.Num},
+		{"poster", nfo.Poster, &extra.Poster},
+		{"cover", nfo.Cover, &extra.Cover},
+		{"fanart", nfo.Fanart, &extra.Fanart},
+	}
+	for _, field := range stringExtraFields {
+		if fields[field.name] {
+			*field.dest = field.value
+			touchedExtra = true
+		}
+	}
+	if fields["criticrating"] {
+		extra.CriticRating = nfo.CriticRating
+		touchedExtra = true
+	}
+	if fields["tag"] {
+		extra.Tags = append([]string(nil), nfo.Tags...)
+		touchedExtra = true
 	}
 
-	// 收集 provider IDs
-	providerIDs := make(map[string]string)
-	if nfo.JavbusID != "" {
-		providerIDs["javbusid"] = nfo.JavbusID
+	providerFields := []struct {
+		name  string
+		value string
+	}{
+		{"javbusid", nfo.JavbusID},
+		{"airav_ccid", nfo.AiravCcid},
+		{"javdbsearchid", nfo.JavdbSearchID},
 	}
-	if nfo.AiravCcid != "" {
-		providerIDs["airav_ccid"] = nfo.AiravCcid
-	}
-	if nfo.JavdbSearchID != "" {
-		providerIDs["javdbsearchid"] = nfo.JavdbSearchID
-	}
-	if len(providerIDs) > 0 {
-		extra.ProviderIDs = providerIDs
+	for _, field := range providerFields {
+		if !fields[field.name] {
+			continue
+		}
+		if extra.ProviderIDs == nil {
+			extra.ProviderIDs = make(map[string]string)
+		}
+		if field.value == "" {
+			delete(extra.ProviderIDs, field.name)
+		} else {
+			extra.ProviderIDs[field.name] = field.value
+		}
+		touchedExtra = true
 	}
 
-	// 只在有实际内容时序列化存储
-	if s.hasExtraContent(&extra) {
-		if data, err := json.Marshal(extra); err == nil {
-			media.NfoExtraFields = string(data)
+	if touchedExtra {
+		if s.hasExtraContent(&extra) {
+			if data, err := json.Marshal(extra); err == nil {
+				media.NfoExtraFields = string(data)
+			}
+		} else {
+			media.NfoExtraFields = ""
 		}
 	}
 
 	ApplyDerivedMediaFields(media)
+	if fields["maker"] {
+		media.Maker = nfo.Maker
+	} else if fields["studio"] {
+		media.Maker = nfo.Studio
+	}
+	if fields["publisher"] {
+		media.Label = nfo.Publisher
+	} else if fields["label"] {
+		media.Label = nfo.Label
+	}
+	if fields["num"] {
+		media.Code = normalizeMediaCode(nfo.Num)
+		media.CodePrefix = ParseCodePrefix(media.Code)
+	}
+	media.MetadataScore = ComputeMetadataScore(media)
 }
 
 // hasExtraContent 检查扩展字段是否有实际内容（避免写入空 JSON）
@@ -927,24 +1151,24 @@ func (s *NFOService) hasExtraContent(extra *NFOExtraFields) bool {
 		len(extra.ProviderIDs) > 0
 }
 
-func (s *NFOService) applyTVShowNFOToMedia(media *model.Media, nfo *NFOTVShow) {
-	if nfo.Title != "" {
+func (s *NFOService) applyTVShowNFOToMedia(media *model.Media, nfo *NFOTVShow, fields map[string]bool) {
+	if fields["title"] {
 		media.Title = nfo.Title
 	}
-	if nfo.OrigTitle != "" {
+	if fields["originaltitle"] {
 		media.OrigTitle = nfo.OrigTitle
 	}
-	if nfo.Year > 0 {
+	if fields["year"] {
 		media.Year = nfo.Year
 	}
-	if nfo.Plot != "" {
+	if fields["plot"] {
 		media.Overview = nfo.Plot
 	}
-	if nfo.Rating > 0 {
+	if fields["rating"] {
 		media.Rating = nfo.Rating
 	}
-	allGenres := append(nfo.Genres, nfo.Tags...)
-	if len(allGenres) > 0 {
+	if fields["genre"] || fields["tag"] {
+		allGenres := append(append([]string(nil), nfo.Genres...), nfo.Tags...)
 		seen := make(map[string]bool)
 		var deduped []string
 		for _, g := range allGenres {
@@ -956,36 +1180,38 @@ func (s *NFOService) applyTVShowNFOToMedia(media *model.Media, nfo *NFOTVShow) {
 		}
 		media.Genres = strings.Join(deduped, ",")
 	}
-	if nfo.Country != "" {
+	if fields["studio"] {
+		media.Studio = nfo.Studio
+	}
+	if fields["country"] {
 		media.Country = nfo.Country
 	}
 	// 日期归一化
-	normalized := normalizeReleaseDate(nfo.ReleaseDate, nfo.Premiered, "")
-	if normalized != "" {
-		media.ReleaseDateNormalized = normalized
+	if fields["releasedate"] || fields["premiered"] {
+		media.ReleaseDateNormalized = normalizeReleaseDate(nfo.ReleaseDate, nfo.Premiered, "")
 	}
 
 	ApplyDerivedMediaFields(media)
 }
 
-func (s *NFOService) applyTVShowNFOToSeries(series *model.Series, nfo *NFOTVShow) {
-	if nfo.Title != "" {
+func (s *NFOService) applyTVShowNFOToSeries(series *model.Series, nfo *NFOTVShow, fields map[string]bool) {
+	if fields["title"] {
 		series.Title = nfo.Title
 	}
-	if nfo.OrigTitle != "" {
+	if fields["originaltitle"] {
 		series.OrigTitle = nfo.OrigTitle
 	}
-	if nfo.Year > 0 {
+	if fields["year"] {
 		series.Year = nfo.Year
 	}
-	if nfo.Plot != "" {
+	if fields["plot"] {
 		series.Overview = nfo.Plot
 	}
-	if nfo.Rating > 0 {
+	if fields["rating"] {
 		series.Rating = nfo.Rating
 	}
-	allGenres := append(nfo.Genres, nfo.Tags...)
-	if len(allGenres) > 0 {
+	if fields["genre"] || fields["tag"] {
+		allGenres := append(append([]string(nil), nfo.Genres...), nfo.Tags...)
 		seen := make(map[string]bool)
 		var deduped []string
 		for _, g := range allGenres {
@@ -997,16 +1223,16 @@ func (s *NFOService) applyTVShowNFOToSeries(series *model.Series, nfo *NFOTVShow
 		}
 		series.Genres = strings.Join(deduped, ",")
 	}
-	if nfo.Studio != "" {
+	if fields["studio"] {
 		series.Studio = nfo.Studio
 	}
-	if nfo.Country != "" {
+	if fields["country"] {
 		series.Country = nfo.Country
 	}
-	if nfo.TMDbID > 0 {
+	if fields["tmdbid"] {
 		series.TMDbID = nfo.TMDbID
 	}
-	if nfo.DoubanID != "" {
+	if fields["doubanid"] {
 		series.DoubanID = nfo.DoubanID
 	}
 }

@@ -633,7 +633,12 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
             showMsg('NFO 已保存');
         } catch (error) {
             console.error(error);
-            showMsg(`保存 NFO 失败：${formatError(error)}`);
+            const message = formatError(error);
+            if (message.includes('UnsupportedNFOLayout')) {
+                showMsg('为避免数据丢失，此 NFO 结构暂不支持编辑');
+            } else {
+                showMsg(`保存 NFO 失败：${message}`);
+            }
         } finally {
             setNfoSaving(false);
         }

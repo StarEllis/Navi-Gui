@@ -251,3 +251,198 @@ func TestMediaRepoSearchHandlesQuotedKeyword(t *testing.T) {
 		t.Fatalf("expected Bob's Movie result, got %+v", results)
 	}
 }
+
+func seedAtomicSeriesGraph(t *testing.T, db *gorm.DB, episodeCount int) (model.Series, []string) {
+	t.Helper()
+
+	user := model.User{ID: "atomic-user", Username: "atomic", Password: "hash"}
+	library := model.Library{ID: "atomic-library", Name: "Atomic", Path: "C:/atomic"}
+	series := model.Series{
+		ID:           "atomic-series",
+		LibraryID:    library.ID,
+		Title:        "Atomic Show",
+		FolderPath:   "C:/atomic/show",
+		SeasonCount:  1,
+		EpisodeCount: episodeCount,
+	}
+	createAll(t, db, &user, &library, &series)
+
+	ids := make([]string, 0, episodeCount)
+	for i := 0; i < episodeCount; i++ {
+		mediaID := fmt.Sprintf("atomic-media-%03d", i)
+		ids = append(ids, mediaID)
+		createAll(t, db,
+			&model.Media{
+				ID:         mediaID,
+				LibraryID:  library.ID,
+				SeriesID:   series.ID,
+				Title:      "Atomic Show",
+				FilePath:   fmt.Sprintf("C:/atomic/show/S01E%03d.mkv", i+1),
+				MediaType:  "episode",
+				SeasonNum:  1,
+				EpisodeNum: i + 1,
+			},
+			&model.Favorite{ID: fmt.Sprintf("atomic-favorite-%03d", i), UserID: user.ID, MediaID: mediaID},
+			&model.WatchHistory{ID: fmt.Sprintf("atomic-watch-%03d", i), UserID: user.ID, MediaID: mediaID},
+		)
+	}
+	return series, ids
+}
+
+func assertAtomicSeriesGraph(t *testing.T, db *gorm.DB, seriesID string, wantRows int64, wantSeasons, wantEpisodes int) {
+	t.Helper()
+
+	for _, table := range []string{"media", "favorites", "watch_histories"} {
+		var count int64
+		if err := db.Table(table).Count(&count).Error; err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if count != wantRows {
+			t.Fatalf("expected %s rows = %d, got %d", table, wantRows, count)
+		}
+	}
+
+	var series model.Series
+	if err := db.First(&series, "id = ?", seriesID).Error; err != nil {
+		t.Fatalf("load series: %v", err)
+	}
+	if series.SeasonCount != wantSeasons || series.EpisodeCount != wantEpisodes {
+		t.Fatalf("expected series counts %d seasons/%d episodes, got %d/%d",
+			wantSeasons, wantEpisodes, series.SeasonCount, series.EpisodeCount)
+	}
+}
+
+func TestDeleteByIDsAndRepairSeriesRollsBackLaterBatchFailure(t *testing.T) {
+	db := newMediaRepoTestDB(t)
+	repo := &MediaRepo{db: db}
+	series, ids := seedAtomicSeriesGraph(t, db, mediaDeleteBatchSize+1)
+
+	trigger := fmt.Sprintf(`
+		CREATE TRIGGER fail_later_media_delete
+		BEFORE DELETE ON media
+		WHEN OLD.id = '%s'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected later batch failure');
+		END`, ids[len(ids)-1])
+	if err := db.Exec(trigger).Error; err != nil {
+		t.Fatalf("create delete failure trigger: %v", err)
+	}
+
+	deleted, err := repo.DeleteByIDsAndRepairSeries(ids)
+	if err == nil {
+		t.Fatal("expected later delete batch to fail")
+	}
+	if deleted != 0 {
+		t.Fatalf("expected rolled back delete count 0, got %d", deleted)
+	}
+	assertAtomicSeriesGraph(t, db, series.ID, int64(len(ids)), 1, len(ids))
+}
+
+func TestDeleteByIDsAndRepairSeriesRollsBackSeriesUpdateFailure(t *testing.T) {
+	db := newMediaRepoTestDB(t)
+	repo := &MediaRepo{db: db}
+	series, ids := seedAtomicSeriesGraph(t, db, 2)
+
+	trigger := `
+		CREATE TRIGGER fail_series_counter_update
+		BEFORE UPDATE OF episode_count ON series
+		WHEN OLD.id = 'atomic-series'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected series update failure');
+		END`
+	if err := db.Exec(trigger).Error; err != nil {
+		t.Fatalf("create series failure trigger: %v", err)
+	}
+
+	deleted, err := repo.DeleteByIDsAndRepairSeries(ids[:1])
+	if err == nil {
+		t.Fatal("expected series update to fail")
+	}
+	if deleted != 0 {
+		t.Fatalf("expected rolled back delete count 0, got %d", deleted)
+	}
+	assertAtomicSeriesGraph(t, db, series.ID, 2, 1, 2)
+}
+
+func TestDeleteByIDsAndRepairSeriesCommitsMediaAssociationsAndCounters(t *testing.T) {
+	db := newMediaRepoTestDB(t)
+	repo := &MediaRepo{db: db}
+	series, ids := seedAtomicSeriesGraph(t, db, 2)
+
+	deleted, err := repo.DeleteByIDsAndRepairSeries(ids[:1])
+	if err != nil {
+		t.Fatalf("delete media and repair series: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected one deleted media row, got %d", deleted)
+	}
+	assertAtomicSeriesGraph(t, db, series.ID, 1, 1, 1)
+}
+
+func TestDeleteByIDsAndRepairSeriesRemovesEmptySeriesAssociations(t *testing.T) {
+	db := newMediaRepoTestDB(t)
+	repo := &MediaRepo{db: db}
+	series, ids := seedAtomicSeriesGraph(t, db, 1)
+	person := model.Person{ID: "series-person", Name: "Series Person"}
+	scrapeTask := model.ScrapeTask{ID: "series-scrape", URL: "local", Source: "local", SeriesID: series.ID}
+	createAll(t, db,
+		&person,
+		&model.MediaPerson{ID: "series-media-person", SeriesID: series.ID, PersonID: person.ID, Role: "actor"},
+		&model.MediaShare{ID: "series-share", UserID: "atomic-user", GroupID: "group", SeriesID: series.ID},
+		&model.MediaLike{ID: "series-like", UserID: "atomic-user", SeriesID: series.ID},
+		&model.MediaRecommendation{ID: "series-recommendation", FromUserID: "atomic-user", ToUserID: "atomic-user", SeriesID: series.ID},
+		&model.ShareLink{ID: "series-link", Code: "series-link", CreatedBy: "atomic-user", SeriesID: series.ID},
+		&scrapeTask,
+		&model.ScrapeHistory{ID: "series-scrape-history", TaskID: scrapeTask.ID, Action: "created"},
+	)
+
+	deleted, err := repo.DeleteByIDsAndRepairSeries(ids)
+	if err != nil {
+		t.Fatalf("delete final episode: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected one deleted episode, got %d", deleted)
+	}
+	for name, target := range map[string]interface{}{
+		"series": &model.Series{}, "series people": &model.MediaPerson{}, "people": &model.Person{},
+		"shares": &model.MediaShare{}, "likes": &model.MediaLike{},
+		"recommendations": &model.MediaRecommendation{}, "share links": &model.ShareLink{},
+		"scrape tasks": &model.ScrapeTask{}, "scrape histories": &model.ScrapeHistory{},
+	} {
+		var count int64
+		if err := db.Model(target).Count(&count).Error; err != nil {
+			t.Fatalf("count %s: %v", name, err)
+		}
+		if count != 0 {
+			t.Fatalf("expected no %s after deleting empty series, got %d", name, count)
+		}
+	}
+}
+
+func TestDeleteByIDsAndRepairSeriesAllowsRecreateAtSameFolderPath(t *testing.T) {
+	db := newMediaRepoTestDB(t)
+	repo := &MediaRepo{db: db}
+	series, ids := seedAtomicSeriesGraph(t, db, 1)
+
+	if _, err := repo.DeleteByIDsAndRepairSeries(ids); err != nil {
+		t.Fatalf("delete final episode: %v", err)
+	}
+
+	var remaining int64
+	if err := db.Unscoped().Model(&model.Series{}).Where("folder_path = ?", series.FolderPath).Count(&remaining).Error; err != nil {
+		t.Fatalf("count series including soft deleted rows: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("empty series still occupies folder path: rows=%d", remaining)
+	}
+
+	recreated := model.Series{
+		ID:         "atomic-series-recreated",
+		LibraryID:  series.LibraryID,
+		Title:      series.Title,
+		FolderPath: series.FolderPath,
+	}
+	if err := db.Create(&recreated).Error; err != nil {
+		t.Fatalf("recreate series at the same folder path: %v", err)
+	}
+}

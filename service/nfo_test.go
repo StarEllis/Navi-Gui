@@ -124,12 +124,15 @@ func TestLoadEditorDataReadsNestedSetSeries(t *testing.T) {
 func TestSaveEditorDataWritesSeriesForEditorRoundTrip(t *testing.T) {
 	service := NewNFOService(zap.NewNop().Sugar())
 	nfoPath := writeTempNFO(t, nestedSetSeriesNFO)
+	loaded := loadEditorForSave(t, service, nfoPath)
 
 	if err := service.SaveEditorData(nfoPath, &NFOEditorData{
-		NFOPath: nfoPath,
-		Title:   "MIAA-085 title",
-		Code:    "MIAA-085",
-		Series:  "Updated Series Name",
+		NFOPath:           nfoPath,
+		Title:             "MIAA-085 title",
+		Code:              "MIAA-085",
+		Series:            "Updated Series Name",
+		SourceFingerprint: loaded.SourceFingerprint,
+		UpdatedFields:     []string{"series"},
 	}); err != nil {
 		t.Fatalf("SaveEditorData returned error: %v", err)
 	}

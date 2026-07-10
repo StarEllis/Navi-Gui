@@ -31,18 +31,19 @@ import (
 
 // App struct
 type App struct {
-	ctx             context.Context
-	db              *gorm.DB
-	repos           *repository.Repositories
-	scanner         *service.ScannerService
-	thumbnailWorker *service.ThumbnailWorker
-	artworkCache    *service.ArtworkCache
-	avatarService   *service.GfriendsAvatarService
-	logger          *zap.SugaredLogger
-	remote          *remoteAccessState
-	desktop         *desktopIntegration
-	scanMu          sync.Mutex
-	scanningLib     map[string]bool
+	ctx              context.Context
+	db               *gorm.DB
+	repos            *repository.Repositories
+	scanner          *service.ScannerService
+	thumbnailWorker  *service.ThumbnailWorker
+	artworkCache     *service.ArtworkCache
+	removeMediaCache func(string) error
+	avatarService    *service.GfriendsAvatarService
+	logger           *zap.SugaredLogger
+	remote           *remoteAccessState
+	desktop          *desktopIntegration
+	scanMu           sync.Mutex
+	scanningLib      map[string]bool
 }
 
 func NewApp() *App {
@@ -358,6 +359,21 @@ func (a *App) startScanWithOptions(lib *model.Library, mode string, options serv
 
 	go func() {
 		defer a.finishLibraryScan(lib.ID)
+
+		if mode == "overwrite" {
+			result, err := a.scanner.ScanLibraryOverwrite(a.db, lib, options)
+			if err != nil {
+				a.logger.Errorf("Scan error (mode=%s): %v", mode, err)
+				return
+			}
+			lib.LastScan = &result.LastScan
+			for _, warning := range result.CacheCleanupWarnings {
+				a.logger.Warnf("overwrite cache cleanup warning: %v", warning)
+			}
+			a.bumpRecommendationVersion()
+			a.clearRecommendationGenres()
+			return
+		}
 
 		_, err := a.scanner.ScanLibraryWithOptions(lib, options)
 		if err != nil {
@@ -1715,18 +1731,16 @@ func (a *App) GetNFOEditorData(mediaID string) (*service.NFOEditorData, error) {
 	return nfoService.LoadEditorData(a.resolveMediaNFOPath(media), media)
 }
 
-func (a *App) syncMediaFromNFO(mediaID string, nfoPath string) {
+func (a *App) syncMediaFromNFO(mediaID string, nfoPath string) error {
 	media, err := a.loadMediaForNFO(mediaID)
 	if err != nil {
-		a.logger.Warnf("sync media from nfo failed to load media: %v", err)
-		return
+		return fmt.Errorf("load media after NFO save: %w", err)
 	}
 
 	nfoService := service.NewNFOService(a.logger)
 	updated := *media
 	if err := nfoService.ParseMovieNFO(nfoPath, &updated); err != nil {
-		a.logger.Warnf("sync media from nfo parse failed: %v", err)
-		return
+		return fmt.Errorf("parse saved NFO: %w", err)
 	}
 
 	var poster, backdrop string
@@ -1770,13 +1784,20 @@ func (a *App) syncMediaFromNFO(mediaID string, nfoPath string) {
 		"nfo_mod_time":            updated.NfoModTime,
 		"release_date_normalized": updated.ReleaseDateNormalized,
 	}
-	if err := a.db.Model(&model.Media{}).Where("id = ?", mediaID).Updates(updates).Error; err != nil {
-		a.logger.Warnf("sync media from nfo update failed: %v", err)
-		return
+	if err := a.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&model.Media{}).Where("id = ?", mediaID).Updates(updates).Error; err != nil {
+			return fmt.Errorf("update media after NFO save: %w", err)
+		}
+		if a.scanner != nil {
+			if err := a.scanner.SyncActorsForMediaStrictWithDB(&updated, tx); err != nil {
+				return fmt.Errorf("sync actors after NFO save: %w", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
-	if a.scanner != nil {
-		a.scanner.SyncActorsForMedia(&updated)
-	}
+	return nil
 }
 
 func (a *App) SaveNFOEditorData(mediaID string, data *service.NFOEditorData) error {
@@ -1798,7 +1819,9 @@ func (a *App) SaveNFOEditorData(mediaID string, data *service.NFOEditorData) err
 		return err
 	}
 
-	a.syncMediaFromNFO(mediaID, nfoPath)
+	if err := a.syncMediaFromNFO(mediaID, nfoPath); err != nil {
+		return err
+	}
 	a.bumpRecommendationVersion()
 	a.invalidateRecommendationGenres(mediaID)
 	return nil
@@ -2203,23 +2226,44 @@ func (a *App) PlayRandomLibraryMedia(libraryID string) (string, error) {
 	return filepath.Base(media.FilePath), nil
 }
 
+type DeleteLibraryResult struct {
+	Deleted bool   `json:"deleted"`
+	Warning string `json:"warning,omitempty"`
+}
+
 // DeleteLibrary 删除一个媒体库及其关联的所有媒体记录
-func (a *App) DeleteLibrary(libraryID string) error {
-	if a.artworkCache != nil {
-		if mediaItems, err := a.repos.Media.ListByLibraryID(libraryID); err == nil {
-			for _, media := range mediaItems {
-				if err := a.artworkCache.RemoveMedia(media.ID); err != nil {
-					a.logger.Warnf("remove library media artwork cache failed: media=%s err=%v", media.ID, err)
-				}
+func (a *App) DeleteLibrary(libraryID string) (*DeleteLibraryResult, error) {
+	result, err := a.repos.DeleteLibraryAtomic(libraryID)
+	if err != nil {
+		return nil, err
+	}
+
+	var cacheErrs []error
+	if a.artworkCache != nil || a.removeMediaCache != nil {
+		for _, mediaID := range result.MediaIDs {
+			if err := a.removeLibraryMediaCache(mediaID); err != nil {
+				a.logger.Warnf("library deleted but artwork cache cleanup failed: media=%s err=%v", mediaID, err)
+				cacheErrs = append(cacheErrs, fmt.Errorf("media %s: %w", mediaID, err))
 			}
-		} else {
-			a.logger.Warnf("list library media for artwork cleanup failed: library=%s err=%v", libraryID, err)
 		}
 	}
-	if err := a.repos.Media.DeleteByLibraryID(libraryID); err != nil {
-		a.logger.Errorf("删除媒体库关联媒体失败: %v", err)
+	if len(cacheErrs) > 0 {
+		return &DeleteLibraryResult{
+			Deleted: true,
+			Warning: fmt.Sprintf("cache cleanup incomplete: %v", errors.Join(cacheErrs...)),
+		}, nil
 	}
-	return a.repos.Library.Delete(libraryID)
+	return &DeleteLibraryResult{Deleted: true}, nil
+}
+
+func (a *App) removeLibraryMediaCache(mediaID string) error {
+	if a.removeMediaCache != nil {
+		return a.removeMediaCache(mediaID)
+	}
+	if a.artworkCache == nil {
+		return nil
+	}
+	return a.artworkCache.RemoveMedia(mediaID)
 }
 
 // ScanLibraryWithMode 带刷新模式的扫描入口
@@ -2242,32 +2286,13 @@ func (a *App) ScanLibraryWithMode(libraryID string, mode string) error {
 		}
 	}()
 
-	if mode == "overwrite" {
-		if a.artworkCache != nil {
-			if mediaItems, listErr := a.repos.Media.ListByLibraryID(libraryID); listErr == nil {
-				for _, media := range mediaItems {
-					if cacheErr := a.artworkCache.RemoveMedia(media.ID); cacheErr != nil {
-						a.logger.Warnf("remove overwritten media artwork cache failed: media=%s err=%v", media.ID, cacheErr)
-					}
-				}
-			} else {
-				a.logger.Warnf("list library media for overwrite artwork cleanup failed: library=%s err=%v", libraryID, listErr)
-			}
-		}
-		if err := a.repos.Media.DeleteByLibraryID(libraryID); err != nil {
-			return err
-		}
-		if err := a.repos.Series.DeleteByLibraryID(libraryID); err != nil {
-			return err
-		}
-	}
-
 	options := service.ScanOptions{
 		Mode:        mode,
 		Incremental: mode == "incremental",
 		// Delete/update mode now handles deletes and sidecar changes inside the
 		// main sync pass instead of running a separate full-library existence sweep.
 		CleanDeleted: false,
+		Context:      a.ctx,
 	}
 	a.startScanWithOptions(lib, mode, options)
 	releaseScan = false
