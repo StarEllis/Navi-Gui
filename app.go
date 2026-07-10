@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,6 +13,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -39,6 +41,8 @@ type App struct {
 	logger          *zap.SugaredLogger
 	remote          *remoteAccessState
 	desktop         *desktopIntegration
+	scanMu          sync.Mutex
+	scanningLib     map[string]bool
 }
 
 func NewApp() *App {
@@ -47,6 +51,39 @@ func NewApp() *App {
 	}
 	app.desktop = newDesktopIntegration(app)
 	return app
+}
+
+func (a *App) tryBeginLibraryScan(libraryID string) bool {
+	if a == nil {
+		return false
+	}
+	libraryID = strings.TrimSpace(libraryID)
+	if libraryID == "" {
+		return false
+	}
+	a.scanMu.Lock()
+	defer a.scanMu.Unlock()
+	if a.scanningLib == nil {
+		a.scanningLib = make(map[string]bool)
+	}
+	if a.scanningLib[libraryID] {
+		return false
+	}
+	a.scanningLib[libraryID] = true
+	return true
+}
+
+func (a *App) finishLibraryScan(libraryID string) {
+	if a == nil {
+		return
+	}
+	libraryID = strings.TrimSpace(libraryID)
+	if libraryID == "" {
+		return
+	}
+	a.scanMu.Lock()
+	delete(a.scanningLib, libraryID)
+	a.scanMu.Unlock()
 }
 
 func (a *App) startup(ctx context.Context) {
@@ -320,6 +357,8 @@ func (a *App) startScanWithOptions(lib *model.Library, mode string, options serv
 	}
 
 	go func() {
+		defer a.finishLibraryScan(lib.ID)
+
 		_, err := a.scanner.ScanLibraryWithOptions(lib, options)
 		if err != nil {
 			a.logger.Errorf("Scan error (mode=%s): %v", mode, err)
@@ -1317,32 +1356,99 @@ func (a *App) UpdateDesktopSettings(settings *DesktopSettings) error {
 	}
 
 	previous, _ := a.GetDesktopSettings()
-	rollback := func() {
+	rollback := func(originalErr error) error {
 		if previous == nil {
-			return
+			return originalErr
 		}
-		if rollbackData, marshalErr := json.MarshalIndent(previous, "", "  "); marshalErr == nil {
-			_ = os.WriteFile(settingsPath, rollbackData, 0644)
+		if rollbackErr := a.restoreDesktopSettings(previous); rollbackErr != nil {
+			return fmt.Errorf("%w; rollback failed: %w", originalErr, rollbackErr)
 		}
-		_ = a.syncDesktopIntegration(previous)
-		_ = a.syncRemoteServices(previous)
+		return originalErr
 	}
 
+	if err := writeDesktopSettingsFile(settingsPath, settings); err != nil {
+		return err
+	}
+	if err := a.syncDesktopIntegration(settings); err != nil {
+		return rollback(err)
+	}
+	if err := a.syncRemoteServices(settings); err != nil {
+		return rollback(err)
+	}
+	return nil
+}
+
+func (a *App) restoreDesktopSettings(settings *DesktopSettings) error {
+	if settings == nil {
+		return nil
+	}
+	return errors.Join(
+		writeDesktopSettingsFile(settingsPath, settings),
+		a.syncDesktopIntegration(settings),
+		a.syncRemoteServices(settings),
+	)
+}
+
+func writeDesktopSettingsFile(path string, settings *DesktopSettings) error {
+	if settings == nil {
+		return fmt.Errorf("settings is nil")
+	}
 	data, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(settingsPath, data, 0644); err != nil {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return fmt.Errorf("settings path is empty")
+	}
+	dir := filepath.Dir(path)
+	if dir == "" {
+		dir = "."
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	if err := a.syncDesktopIntegration(settings); err != nil {
-		rollback()
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+"-*.tmp")
+	if err != nil {
 		return err
 	}
-	if err := a.syncRemoteServices(settings); err != nil {
-		rollback()
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
 		return err
 	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := replaceFile(tmpPath, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+func replaceFile(source string, target string) error {
+	if err := os.Rename(source, target); err == nil {
+		return nil
+	} else if _, statErr := os.Stat(target); statErr != nil {
+		return err
+	}
+
+	backup := fmt.Sprintf("%s.%d.bak", target, time.Now().UnixNano())
+	if err := os.Rename(target, backup); err != nil {
+		return err
+	}
+	if err := os.Rename(source, target); err != nil {
+		_ = os.Rename(backup, target)
+		return err
+	}
+	_ = os.Remove(backup)
 	return nil
 }
 
@@ -1357,18 +1463,22 @@ func (a *App) RestartApp() {
 		return
 	}
 
-	// 如果是正常运行模式，尝试拉起新进程
-	// 注意：在某些环境下可能失败，此处作为最小尝试
-	cmd := exec.Command(executable, os.Args[1:]...)
+	if err := startReplacementProcess(executable, os.Args[1:]); err != nil {
+		a.logger.Errorf("Failed to restart: %v", err)
+		return
+	}
+	os.Exit(0)
+}
+
+func startReplacementProcess(executable string, args []string) error {
+	if strings.TrimSpace(executable) == "" {
+		return fmt.Errorf("empty executable path")
+	}
+	cmd := exec.Command(executable, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
-
-	err = cmd.Start()
-	if err != nil {
-		a.logger.Errorf("Failed to restart: %v", err)
-	}
-	os.Exit(0)
+	return cmd.Start()
 }
 
 func startDetachedCommand(cmd *exec.Cmd) error {
@@ -1528,6 +1638,24 @@ func (a *App) DeleteMedia(mediaID string) error {
 		}
 	}
 	return a.repos.Media.DeleteByID(mediaID)
+}
+
+func (a *App) CleanOrphanedMediaAssociations() (repository.OrphanedMediaCleanupResult, error) {
+	if a.repos == nil || a.repos.Media == nil {
+		return repository.OrphanedMediaCleanupResult{}, fmt.Errorf("media repository is not initialized")
+	}
+
+	result, err := a.repos.Media.CleanOrphanedMediaAssociations()
+	if err != nil {
+		if a.logger != nil {
+			a.logger.Errorf("clean orphaned media associations failed: %v", err)
+		}
+		return result, err
+	}
+	if a.logger != nil && result.Total() > 0 {
+		a.logger.Infof("cleaned orphaned media associations: %+v", result)
+	}
+	return result, nil
 }
 
 // OpenNFO 尝试找到并打开关联的 .nfo 文件
@@ -2011,15 +2139,47 @@ func (a *App) GetMediaPreviews(mediaID string) ([]string, error) {
 
 // PlayFile 播放指定绝对路径的文件
 func (a *App) PlayFile(filePath string) error {
-	settings, _ := a.GetDesktopSettings()
-	if strings.TrimSpace(filePath) == "" {
+	totalStart := time.Now()
+	targetPath := strings.TrimSpace(filePath)
+	if targetPath == "" {
 		return fmt.Errorf("empty file path")
 	}
-	if err := startDetachedCommand(buildOpenFileCommand(filePath, preferredPlayerPath(settings, false))); err != nil {
+
+	settingsStart := time.Now()
+	settings, _ := a.GetDesktopSettings()
+	settingsCost := time.Since(settingsStart)
+
+	playerPath := preferredPlayerPath(settings, false)
+	cmd := buildOpenFileCommand(targetPath, playerPath)
+
+	startCostStart := time.Now()
+	err := startDetachedCommand(cmd)
+	startCost := time.Since(startCostStart)
+	if err != nil {
+		appendPlayLatencyLog("FAIL path=%q player=%q settings=%s start=%s total=%s err=%v",
+			targetPath, playerPath, settingsCost, startCost, time.Since(totalStart), err)
 		return err
 	}
-	a.markWatchedByFilePath(filePath)
+
+	watchedStart := time.Now()
+	a.markWatchedByFilePath(targetPath)
+	watchedCost := time.Since(watchedStart)
+
+	appendPlayLatencyLog("OK path=%q player=%q settings=%s start=%s mark_watched=%s total=%s",
+		targetPath, playerPath, settingsCost, startCost, watchedCost, time.Since(totalStart))
+
 	return nil
+}
+
+func appendPlayLatencyLog(format string, args ...interface{}) {
+	file, err := os.OpenFile("play_latency.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	line := fmt.Sprintf(format, args...)
+	_, _ = fmt.Fprintf(file, "%s %s\n", time.Now().Format(time.RFC3339Nano), line)
 }
 
 func (a *App) PlayRandomLibraryMedia(libraryID string) (string, error) {
@@ -2072,6 +2232,15 @@ func (a *App) ScanLibraryWithMode(libraryID string, mode string) error {
 	}
 	mode = normalizeScanMode(mode)
 	a.logger.Infof("ScanLibraryWithMode: id=%s mode=%s", libraryID, mode)
+	if !a.tryBeginLibraryScan(lib.ID) {
+		return fmt.Errorf("library %s is already scanning", lib.ID)
+	}
+	releaseScan := true
+	defer func() {
+		if releaseScan {
+			a.finishLibraryScan(lib.ID)
+		}
+	}()
 
 	if mode == "overwrite" {
 		if a.artworkCache != nil {
@@ -2101,6 +2270,7 @@ func (a *App) ScanLibraryWithMode(libraryID string, mode string) error {
 		CleanDeleted: false,
 	}
 	a.startScanWithOptions(lib, mode, options)
+	releaseScan = false
 	return nil
 }
 

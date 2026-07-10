@@ -517,6 +517,59 @@ export namespace model {
 
 }
 
+export namespace repository {
+	
+	export class OrphanedMediaCleanupResult {
+	    MediaPeople: number;
+	    WatchHistories: number;
+	    Favorites: number;
+	    TranscodeTasks: number;
+	    PlaylistItems: number;
+	    Bookmarks: number;
+	    Comments: number;
+	    ContentRatings: number;
+	    PlaybackStats: number;
+	    VideoChapters: number;
+	    VideoHighlights: number;
+	    AIAnalysisTasks: number;
+	    CoverCandidates: number;
+	    MediaTags: number;
+	    MediaShares: number;
+	    MediaLikes: number;
+	    Recommendations: number;
+	    ShareLinks: number;
+	    People: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new OrphanedMediaCleanupResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.MediaPeople = source["MediaPeople"];
+	        this.WatchHistories = source["WatchHistories"];
+	        this.Favorites = source["Favorites"];
+	        this.TranscodeTasks = source["TranscodeTasks"];
+	        this.PlaylistItems = source["PlaylistItems"];
+	        this.Bookmarks = source["Bookmarks"];
+	        this.Comments = source["Comments"];
+	        this.ContentRatings = source["ContentRatings"];
+	        this.PlaybackStats = source["PlaybackStats"];
+	        this.VideoChapters = source["VideoChapters"];
+	        this.VideoHighlights = source["VideoHighlights"];
+	        this.AIAnalysisTasks = source["AIAnalysisTasks"];
+	        this.CoverCandidates = source["CoverCandidates"];
+	        this.MediaTags = source["MediaTags"];
+	        this.MediaShares = source["MediaShares"];
+	        this.MediaLikes = source["MediaLikes"];
+	        this.Recommendations = source["Recommendations"];
+	        this.ShareLinks = source["ShareLinks"];
+	        this.People = source["People"];
+	    }
+	}
+
+}
+
 export namespace service {
 	
 	export class RelatedMediaItem {

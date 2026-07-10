@@ -6,7 +6,10 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 	"navi-desktop/model"
@@ -98,5 +101,69 @@ func TestGfriendsAvatarServiceNetworkFailureDoesNotBlockWhenNoIndexExists(t *tes
 	}
 	if person.ProfileURL != "" {
 		t.Fatalf("expected empty profile URL, got %q", person.ProfileURL)
+	}
+}
+
+func TestGfriendsAvatarServiceRefreshIndexOnlyDownloadsOnceConcurrently(t *testing.T) {
+	var hits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		time.Sleep(50 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"Content": {"StudioA": {"Actor.jpg": "Actor.jpg"}}}`)
+	}))
+	defer server.Close()
+
+	service := NewGfriendsAvatarService(GfriendsAvatarOptions{
+		CacheDir:     filepath.Join(t.TempDir(), "cache"),
+		ArtworkCache: NewArtworkCache(filepath.Join(t.TempDir(), "artwork"), nil),
+		Logger:       zap.NewNop().Sugar(),
+		IndexURLs:    []string{server.URL + "/Filetree.json"},
+		ContentBases: []string{server.URL + "/Content/"},
+	})
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if err := service.RefreshIndexIfNeeded(); err != nil {
+				t.Errorf("refresh index failed: %v", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("expected one index download, got %d", got)
+	}
+}
+
+func TestGfriendsAvatarServiceRejectsNonImageDownload(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "not an image")
+	}))
+	defer server.Close()
+
+	service := NewGfriendsAvatarService(GfriendsAvatarOptions{Client: server.Client()})
+	if _, err := service.downloadURL(server.URL + "/avatar.txt"); err == nil {
+		t.Fatalf("expected non-image download to be rejected")
+	}
+}
+
+func TestGfriendsAvatarServiceRejectsOversizedDownload(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		fmt.Fprint(w, strings.Repeat("x", (2<<20)+1))
+	}))
+	defer server.Close()
+
+	service := NewGfriendsAvatarService(GfriendsAvatarOptions{Client: server.Client()})
+	if _, err := service.downloadURL(server.URL + "/avatar.jpg"); err == nil {
+		t.Fatalf("expected oversized download to be rejected")
 	}
 }

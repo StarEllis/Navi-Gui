@@ -26,6 +26,7 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
@@ -817,30 +818,59 @@ func (a *App) updateJellyfinPlaybackState(itemID string, positionTicks int64, st
 
 	durationTicks := mediaDurationTicks(item.Media)
 	positionSeconds := ticksToSeconds(positionTicks)
+	durationSeconds := ticksToSeconds(durationTicks)
 	completed := stopped && durationTicks > 0 && positionTicks >= int64(float64(durationTicks)*0.9)
 
-	var history model.WatchHistory
-	err = a.db.Where("user_id = ? AND media_id = ?", desktopUserID, item.Media.ID).First(&history).Error
-	switch {
-	case err == nil:
-		history.Position = positionSeconds
-		history.Duration = ticksToSeconds(durationTicks)
-		if completed {
-			history.Completed = true
+	return a.db.Transaction(func(tx *gorm.DB) error {
+		var histories []model.WatchHistory
+		if err := tx.Where("user_id = ? AND media_id = ?", desktopUserID, item.Media.ID).
+			Order("updated_at DESC, created_at DESC").
+			Find(&histories).Error; err != nil {
+			return err
 		}
-		return a.db.Save(&history).Error
-	case err != nil && !errors.Is(err, gorm.ErrRecordNotFound):
-		return err
-	default:
-		history = model.WatchHistory{
+
+		if len(histories) > 0 {
+			history := histories[0]
+			history.Position = positionSeconds
+			history.Duration = durationSeconds
+			if completed {
+				history.Completed = true
+			}
+			if err := tx.Save(&history).Error; err != nil {
+				return err
+			}
+			if len(histories) <= 1 {
+				return nil
+			}
+			duplicateIDs := make([]string, 0, len(histories)-1)
+			for _, duplicate := range histories[1:] {
+				duplicateIDs = append(duplicateIDs, duplicate.ID)
+			}
+			return tx.Where("id IN ?", duplicateIDs).Delete(&model.WatchHistory{}).Error
+		}
+
+		history := model.WatchHistory{
+			ID:        stableWatchHistoryID(desktopUserID, item.Media.ID),
 			UserID:    desktopUserID,
 			MediaID:   item.Media.ID,
 			Position:  positionSeconds,
-			Duration:  ticksToSeconds(durationTicks),
+			Duration:  durationSeconds,
 			Completed: completed,
 		}
-		return a.db.Create(&history).Error
-	}
+		return tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "id"}},
+			DoUpdates: clause.Assignments(map[string]interface{}{
+				"position":   positionSeconds,
+				"duration":   durationSeconds,
+				"completed":  gorm.Expr("completed OR ?", completed),
+				"updated_at": time.Now(),
+			}),
+		}).Create(&history).Error
+	})
+}
+
+func stableWatchHistoryID(userID string, mediaID string) string {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("watch-history:"+userID+":"+mediaID)).String()
 }
 
 type jellyfinResolvedItem struct {

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"navi-desktop/model"
 )
 
@@ -13,6 +14,202 @@ import (
 
 type MediaRepo struct {
 	db *gorm.DB
+}
+
+type OrphanedMediaCleanupResult struct {
+	MediaPeople     int64
+	WatchHistories  int64
+	Favorites       int64
+	TranscodeTasks  int64
+	PlaylistItems   int64
+	Bookmarks       int64
+	Comments        int64
+	ContentRatings  int64
+	PlaybackStats   int64
+	VideoChapters   int64
+	VideoHighlights int64
+	AIAnalysisTasks int64
+	CoverCandidates int64
+	MediaTags       int64
+	MediaShares     int64
+	MediaLikes      int64
+	Recommendations int64
+	ShareLinks      int64
+	People          int64
+}
+
+func (r OrphanedMediaCleanupResult) Total() int64 {
+	return r.MediaPeople + r.WatchHistories + r.Favorites + r.TranscodeTasks +
+		r.PlaylistItems + r.Bookmarks + r.Comments + r.ContentRatings +
+		r.PlaybackStats + r.VideoChapters + r.VideoHighlights + r.AIAnalysisTasks +
+		r.CoverCandidates + r.MediaTags + r.MediaShares + r.MediaLikes +
+		r.Recommendations + r.ShareLinks + r.People
+}
+
+func (r *MediaRepo) deleteMediaWhere(query string, args ...interface{}) (int64, error) {
+	var rowsAffected int64
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		var ids []string
+		if err := tx.Unscoped().Model(&model.Media{}).Where(query, args...).Pluck("id", &ids).Error; err != nil {
+			return err
+		}
+
+		ids = normalizeIDs(ids)
+		if len(ids) == 0 {
+			return nil
+		}
+		if _, err := deleteMediaAssociationsByIDs(tx, ids); err != nil {
+			return err
+		}
+
+		result := tx.Unscoped().Where("id IN ?", ids).Delete(&model.Media{})
+		rowsAffected = result.RowsAffected
+		return result.Error
+	})
+	return rowsAffected, err
+}
+
+func normalizeIDs(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]bool, len(ids))
+	normalized := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		normalized = append(normalized, id)
+	}
+	return normalized
+}
+
+func deleteMediaAssociationsByIDs(tx *gorm.DB, ids []string) (OrphanedMediaCleanupResult, error) {
+	var result OrphanedMediaCleanupResult
+	var affectedPersonIDs []string
+	if err := tx.Model(&model.MediaPerson{}).
+		Where("media_id IN ?", ids).
+		Distinct("person_id").
+		Pluck("person_id", &affectedPersonIDs).Error; err != nil {
+		return result, err
+	}
+
+	deletions := []struct {
+		count  *int64
+		target interface{}
+	}{
+		{&result.MediaPeople, &model.MediaPerson{}},
+		{&result.WatchHistories, &model.WatchHistory{}},
+		{&result.Favorites, &model.Favorite{}},
+		{&result.TranscodeTasks, &model.TranscodeTask{}},
+		{&result.PlaylistItems, &model.PlaylistItem{}},
+		{&result.Bookmarks, &model.Bookmark{}},
+		{&result.Comments, &model.Comment{}},
+		{&result.ContentRatings, &model.ContentRating{}},
+		{&result.PlaybackStats, &model.PlaybackStats{}},
+		{&result.VideoChapters, &model.VideoChapter{}},
+		{&result.VideoHighlights, &model.VideoHighlight{}},
+		{&result.AIAnalysisTasks, &model.AIAnalysisTask{}},
+		{&result.CoverCandidates, &model.CoverCandidate{}},
+		{&result.MediaTags, &model.MediaTag{}},
+		{&result.MediaShares, &model.MediaShare{}},
+		{&result.MediaLikes, &model.MediaLike{}},
+		{&result.Recommendations, &model.MediaRecommendation{}},
+		{&result.ShareLinks, &model.ShareLink{}},
+	}
+
+	for _, deletion := range deletions {
+		count, err := deleteRowsByMediaIDs(tx, ids, deletion.target)
+		if err != nil {
+			return result, err
+		}
+		*deletion.count = count
+	}
+
+	if len(affectedPersonIDs) == 0 {
+		return result, nil
+	}
+	people, err := deletePeopleWithoutAnyMediaPeople(tx, affectedPersonIDs)
+	result.People = people
+	return result, err
+}
+
+func deleteRowsByMediaIDs(tx *gorm.DB, ids []string, target interface{}) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	result := tx.Unscoped().Where("media_id IN ?", ids).Delete(target)
+	return result.RowsAffected, result.Error
+}
+
+// CleanOrphanedMediaAssociations removes rows that already point at missing or soft-deleted media.
+func (r *MediaRepo) CleanOrphanedMediaAssociations() (OrphanedMediaCleanupResult, error) {
+	var cleaned OrphanedMediaCleanupResult
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		var err error
+		cleaned, err = deleteOrphanedMediaAssociations(tx)
+		return err
+	})
+	return cleaned, err
+}
+
+func deleteOrphanedMediaAssociations(tx *gorm.DB) (OrphanedMediaCleanupResult, error) {
+	var result OrphanedMediaCleanupResult
+	deletions := []struct {
+		count  *int64
+		target interface{}
+	}{
+		{&result.MediaPeople, &model.MediaPerson{}},
+		{&result.WatchHistories, &model.WatchHistory{}},
+		{&result.Favorites, &model.Favorite{}},
+		{&result.TranscodeTasks, &model.TranscodeTask{}},
+		{&result.PlaylistItems, &model.PlaylistItem{}},
+		{&result.Bookmarks, &model.Bookmark{}},
+		{&result.Comments, &model.Comment{}},
+		{&result.ContentRatings, &model.ContentRating{}},
+		{&result.PlaybackStats, &model.PlaybackStats{}},
+		{&result.VideoChapters, &model.VideoChapter{}},
+		{&result.VideoHighlights, &model.VideoHighlight{}},
+		{&result.AIAnalysisTasks, &model.AIAnalysisTask{}},
+		{&result.CoverCandidates, &model.CoverCandidate{}},
+		{&result.MediaTags, &model.MediaTag{}},
+		{&result.MediaShares, &model.MediaShare{}},
+		{&result.MediaLikes, &model.MediaLike{}},
+		{&result.Recommendations, &model.MediaRecommendation{}},
+		{&result.ShareLinks, &model.ShareLink{}},
+	}
+
+	for _, deletion := range deletions {
+		count, err := deleteOrphanedRows(tx, deletion.target)
+		if err != nil {
+			return result, err
+		}
+		*deletion.count = count
+	}
+
+	people, err := deletePeopleWithoutAnyMediaPeople(tx, nil)
+	result.People = people
+	return result, err
+}
+
+func deleteOrphanedRows(tx *gorm.DB, target interface{}) (int64, error) {
+	result := tx.Unscoped().Where(
+		"media_id IS NOT NULL AND media_id != '' AND media_id NOT IN (SELECT id FROM media WHERE deleted_at IS NULL)",
+	).Delete(target)
+	return result.RowsAffected, result.Error
+}
+
+func deletePeopleWithoutAnyMediaPeople(tx *gorm.DB, personIDs []string) (int64, error) {
+	personIDs = normalizeIDs(personIDs)
+	query := tx.Unscoped().Where("id NOT IN (SELECT person_id FROM media_people)")
+	if len(personIDs) > 0 {
+		query = query.Where("id IN ?", personIDs)
+	}
+	result := query.Delete(&model.Person{})
+	return result.RowsAffected, result.Error
 }
 
 func (r *MediaRepo) Create(media *model.Media) error {
@@ -62,10 +259,10 @@ func (r *MediaRepo) Search(keyword string, page, size int) ([]model.Media, int64
 	)
 	query.Count(&total)
 	// 优先显示标题精确匹配的结果，然后按评分降序
-	err := query.Order(
-		fmt.Sprintf("CASE WHEN title = '%s' THEN 0 WHEN title LIKE '%s%%' THEN 1 ELSE 2 END, rating DESC, created_at DESC",
-			keyword, keyword),
-	).Offset((page - 1) * size).Limit(size).Find(&media).Error
+	err := query.Order(clause.Expr{
+		SQL:  "CASE WHEN title = ? THEN 0 WHEN title LIKE ? THEN 1 ELSE 2 END, rating DESC, created_at DESC",
+		Vars: []interface{}{keyword, keyword + "%"},
+	}).Offset((page - 1) * size).Limit(size).Find(&media).Error
 	return media, total, err
 }
 
@@ -154,21 +351,20 @@ func (r *MediaRepo) SearchAdvanced(params SearchAdvancedParams) ([]model.Media, 
 }
 
 func (r *MediaRepo) DeleteByID(id string) error {
-	return r.db.Unscoped().Delete(&model.Media{}, "id = ?", id).Error
+	_, err := r.DeleteByIDs([]string{id})
+	return err
 }
 
 func (r *MediaRepo) DeleteByLibraryID(libraryID string) error {
-	return r.db.Unscoped().Where("library_id = ?", libraryID).Delete(&model.Media{}).Error
+	_, err := r.deleteMediaWhere("library_id = ?", libraryID)
+	return err
 }
 
 func (r *MediaRepo) CleanOrphanedByLibraryIDs(validLibraryIDs []string) (int64, error) {
-	var result *gorm.DB
 	if len(validLibraryIDs) == 0 {
-		result = r.db.Unscoped().Where("1 = 1").Delete(&model.Media{})
-	} else {
-		result = r.db.Unscoped().Where("library_id NOT IN ?", validLibraryIDs).Delete(&model.Media{})
+		return r.deleteMediaWhere("1 = 1")
 	}
-	return result.RowsAffected, result.Error
+	return r.deleteMediaWhere("library_id NOT IN ?", validLibraryIDs)
 }
 
 func (r *MediaRepo) Update(media *model.Media) error {
@@ -549,11 +745,11 @@ func (r *MediaRepo) UpdateFields(id string, fields map[string]interface{}) error
 
 // DeleteByIDs 批量删除指定 ID 的媒体记录（用于清理已删除文件）
 func (r *MediaRepo) DeleteByIDs(ids []string) (int64, error) {
+	ids = normalizeIDs(ids)
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	result := r.db.Unscoped().Where("id IN ?", ids).Delete(&model.Media{})
-	return result.RowsAffected, result.Error
+	return r.deleteMediaWhere("id IN ?", ids)
 }
 
 // MediaPathRecord 媒体文件路径记录（轻量结构，仅包含 ID、路径和关联的 SeriesID）

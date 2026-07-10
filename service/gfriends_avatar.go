@@ -18,7 +18,11 @@ import (
 	"navi-desktop/model"
 )
 
-const gfriendsIndexTTL = 7 * 24 * time.Hour
+const (
+	gfriendsIndexTTL              = 7 * 24 * time.Hour
+	maxGfriendsIndexDownloadBytes = 32 << 20
+	maxGfriendsAvatarBytes        = 2 << 20
+)
 
 var defaultGfriendsIndexURLs = []string{
 	"https://raw.githubusercontent.com/gfriends/gfriends/master/Filetree.json",
@@ -55,6 +59,7 @@ type GfriendsAvatarService struct {
 	contentBases []string
 	client       *http.Client
 
+	refreshMu   sync.Mutex
 	mu          sync.RWMutex
 	index       map[string]AvatarCandidate
 	indexLoaded bool
@@ -98,12 +103,15 @@ func (s *GfriendsAvatarService) RefreshIndexIfNeeded() error {
 		return nil
 	}
 
-	s.mu.RLock()
-	if s.indexLoaded && time.Since(s.indexStamp) < gfriendsIndexTTL {
-		s.mu.RUnlock()
+	if s.hasFreshIndex() {
 		return nil
 	}
-	s.mu.RUnlock()
+
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	if s.hasFreshIndex() {
+		return nil
+	}
 
 	indexPath := s.indexPath()
 	if info, err := os.Stat(indexPath); err == nil && time.Since(info.ModTime()) < gfriendsIndexTTL {
@@ -123,6 +131,12 @@ func (s *GfriendsAvatarService) RefreshIndexIfNeeded() error {
 		return s.loadIndexFromFile(indexPath, info.ModTime())
 	}
 	return nil
+}
+
+func (s *GfriendsAvatarService) hasFreshIndex() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.indexLoaded && time.Since(s.indexStamp) < gfriendsIndexTTL
 }
 
 func (s *GfriendsAvatarService) FindCandidate(actorName string) (*AvatarCandidate, bool) {
@@ -243,7 +257,7 @@ func (s *GfriendsAvatarService) downloadCandidate(candidate AvatarCandidate) ([]
 func (s *GfriendsAvatarService) downloadFirst(urls []string) ([]byte, error) {
 	var lastErr error
 	for _, rawURL := range urls {
-		data, err := s.downloadURL(rawURL)
+		data, err := s.downloadIndexURL(rawURL)
 		if err == nil {
 			return data, nil
 		}
@@ -255,10 +269,21 @@ func (s *GfriendsAvatarService) downloadFirst(urls []string) ([]byte, error) {
 	return nil, lastErr
 }
 
+func (s *GfriendsAvatarService) downloadIndexURL(rawURL string) ([]byte, error) {
+	return s.downloadURLLimited(rawURL, maxGfriendsIndexDownloadBytes, false)
+}
+
 func (s *GfriendsAvatarService) downloadURL(rawURL string) ([]byte, error) {
+	return s.downloadURLLimited(rawURL, maxGfriendsAvatarBytes, true)
+}
+
+func (s *GfriendsAvatarService) downloadURLLimited(rawURL string, maxBytes int64, requireImage bool) ([]byte, error) {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
 		return nil, fmt.Errorf("empty URL")
+	}
+	if maxBytes <= 0 {
+		return nil, fmt.Errorf("invalid download limit")
 	}
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -273,7 +298,38 @@ func (s *GfriendsAvatarService) downloadURL(rawURL string) ([]byte, error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if resp.ContentLength > maxBytes {
+		return nil, fmt.Errorf("download too large: %d bytes", resp.ContentLength)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("download too large: over %d bytes", maxBytes)
+	}
+	if requireImage {
+		if err := validateGfriendsImageContent(resp.Header.Get("Content-Type"), data); err != nil {
+			return nil, err
+		}
+	}
+	return data, nil
+}
+
+func validateGfriendsImageContent(contentType string, data []byte) error {
+	mediaType := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	if strings.HasPrefix(mediaType, "image/") {
+		return nil
+	}
+	if mediaType == "" || mediaType == "application/octet-stream" {
+		detected := strings.ToLower(http.DetectContentType(data))
+		if strings.HasPrefix(detected, "image/") {
+			return nil
+		}
+		return fmt.Errorf("unexpected content type: %s", detected)
+	}
+	return fmt.Errorf("unexpected content type: %s", contentType)
 }
 
 func (s *GfriendsAvatarService) candidateURL(candidate AvatarCandidate, baseIndex int) string {
