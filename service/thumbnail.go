@@ -1,12 +1,14 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"navi-desktop/config"
 	"navi-desktop/model"
@@ -54,9 +56,10 @@ func normalizeThumbnailSettings(settings ThumbnailSettings) ThumbnailSettings {
 }
 
 type ThumbnailService struct {
-	cfg          *config.Config
-	logger       *zap.SugaredLogger
-	artworkCache *ArtworkCache
+	cfg                *config.Config
+	logger             *zap.SugaredLogger
+	artworkCache       *ArtworkCache
+	captureFrameRunner func(context.Context, string, string, float64, int) error
 }
 
 func NewThumbnailService(cfg *config.Config, logger *zap.SugaredLogger) *ThumbnailService {
@@ -107,6 +110,10 @@ func (t *ThumbnailService) ShouldGeneratePreviews(media *model.Media, sidecars *
 }
 
 func (t *ThumbnailService) EnsurePrimaryArtwork(media *model.Media, sidecars *directorySidecarFiles, settings ThumbnailSettings) (bool, error) {
+	return t.EnsurePrimaryArtworkContext(context.Background(), media, sidecars, settings)
+}
+
+func (t *ThumbnailService) EnsurePrimaryArtworkContext(ctx context.Context, media *model.Media, sidecars *directorySidecarFiles, settings ThumbnailSettings) (bool, error) {
 	if media == nil {
 		return false, nil
 	}
@@ -118,7 +125,7 @@ func (t *ThumbnailService) EnsurePrimaryArtwork(media *model.Media, sidecars *di
 
 	var warnings []string
 	posterPath := t.generatedPosterPath(media)
-	if err := t.captureFrame(media.FilePath, mediaDurationSeconds(media)*0.25, posterPath, thumbnailPrimaryHeight); err != nil {
+	if err := t.captureFrameContext(ctx, media.FilePath, mediaDurationSeconds(media)*0.25, posterPath, thumbnailPrimaryHeight); err != nil {
 		warnings = append(warnings, fmt.Sprintf("poster: %v", err))
 	} else if fileExists(posterPath) {
 		if !samePath(media.PosterPath, posterPath) {
@@ -128,7 +135,7 @@ func (t *ThumbnailService) EnsurePrimaryArtwork(media *model.Media, sidecars *di
 	}
 
 	backdropPath := t.generatedBackdropPath(media)
-	if err := t.captureFrame(media.FilePath, mediaDurationSeconds(media)*0.58, backdropPath, thumbnailPrimaryHeight); err != nil {
+	if err := t.captureFrameContext(ctx, media.FilePath, mediaDurationSeconds(media)*0.58, backdropPath, thumbnailPrimaryHeight); err != nil {
 		warnings = append(warnings, fmt.Sprintf("fanart: %v", err))
 	} else if fileExists(backdropPath) {
 		if !samePath(media.BackdropPath, backdropPath) {
@@ -144,6 +151,10 @@ func (t *ThumbnailService) EnsurePrimaryArtwork(media *model.Media, sidecars *di
 }
 
 func (t *ThumbnailService) GeneratePreviews(media *model.Media, sidecars *directorySidecarFiles, settings ThumbnailSettings) (int, error) {
+	return t.GeneratePreviewsContext(context.Background(), media, sidecars, settings)
+}
+
+func (t *ThumbnailService) GeneratePreviewsContext(ctx context.Context, media *model.Media, sidecars *directorySidecarFiles, settings ThumbnailSettings) (int, error) {
 	if media == nil {
 		return 0, nil
 	}
@@ -165,11 +176,14 @@ func (t *ThumbnailService) GeneratePreviews(media *model.Media, sidecars *direct
 	generated := 0
 	var warnings []string
 	for index, seekSeconds := range targets {
+		if err := ctx.Err(); err != nil {
+			return generated, err
+		}
 		outputPath := t.generatedPreviewPath(media, index+1)
 		if fileExists(outputPath) {
 			continue
 		}
-		if err := t.captureFrame(media.FilePath, seekSeconds, outputPath, thumbnailPreviewHeight); err != nil {
+		if err := t.captureFrameContext(ctx, media.FilePath, seekSeconds, outputPath, thumbnailPreviewHeight); err != nil {
 			warnings = append(warnings, fmt.Sprintf("preview-%02d: %v", index+1, err))
 			continue
 		}
@@ -434,6 +448,10 @@ func (t *ThumbnailService) resolveThumbnailState(media *model.Media, sidecars *d
 }
 
 func (t *ThumbnailService) captureFrame(mediaPath string, seekSeconds float64, outputPath string, outputHeight int) error {
+	return t.captureFrameContext(context.Background(), mediaPath, seekSeconds, outputPath, outputHeight)
+}
+
+func (t *ThumbnailService) captureFrameContext(ctx context.Context, mediaPath string, seekSeconds float64, outputPath string, outputHeight int) error {
 	if strings.TrimSpace(mediaPath) == "" || strings.TrimSpace(outputPath) == "" {
 		return fmt.Errorf("empty media or output path")
 	}
@@ -443,21 +461,52 @@ func (t *ThumbnailService) captureFrame(mediaPath string, seekSeconds float64, o
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
 		return err
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if t == nil {
+		return fmt.Errorf("thumbnail service is unavailable")
+	}
+	if t.captureFrameRunner == nil && (t.cfg == nil || strings.TrimSpace(t.cfg.App.FFmpegPath) == "") {
+		return fmt.Errorf("ffmpeg configuration is unavailable")
+	}
+	ext := filepath.Ext(outputPath)
+	tempPath := strings.TrimSuffix(outputPath, ext) + ".part-" + uuid.NewString() + ext
+	defer os.Remove(tempPath)
 
-	cmd, cancel := newBackgroundCommand(mediaTranscodeTimeout, t.cfg.App.FFmpegPath,
-		"-y",
-		"-ss", strconv.FormatFloat(maxFloat(seekSeconds, 0), 'f', 3, 64),
-		"-i", mediaPath,
-		"-frames:v", "1",
-		"-vf", fmt.Sprintf("scale=-2:%d:force_original_aspect_ratio=decrease", outputHeight),
-		"-q:v", "2",
-		outputPath,
-	)
-	defer cancel()
-
-	if output, err := cmd.CombinedOutput(); err != nil {
-		_ = os.Remove(outputPath)
-		return fmt.Errorf("%w, output=%s", err, strings.TrimSpace(string(output)))
+	if t.captureFrameRunner != nil {
+		if err := t.captureFrameRunner(ctx, mediaPath, tempPath, seekSeconds, outputHeight); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return err
+		}
+	} else {
+		cmd, cancel := newBackgroundCommand(ctx, mediaTranscodeTimeout, t.cfg.App.FFmpegPath,
+			"-y",
+			"-ss", strconv.FormatFloat(maxFloat(seekSeconds, 0), 'f', 3, 64),
+			"-i", mediaPath,
+			"-frames:v", "1",
+			"-vf", fmt.Sprintf("scale=-2:%d:force_original_aspect_ratio=decrease", outputHeight),
+			"-q:v", "2",
+			tempPath,
+		)
+		defer cancel()
+		if output, err := cmd.CombinedOutput(); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return fmt.Errorf("%w, output=%s", err, strings.TrimSpace(string(output)))
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, outputPath); err != nil {
+		return err
 	}
 	return nil
 }

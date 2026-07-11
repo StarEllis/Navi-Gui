@@ -26,6 +26,17 @@ import {
     removeMediaFromCachedMediaLists,
 } from './utils/persistentCache';
 import { seedMediaDetailCache } from './utils/mediaDetailCache';
+import {
+	activateScanTaskFromEvent,
+	activateScanTaskFromResponse,
+	beginScanRequest,
+	clearScanTaskLifecycle,
+	completeScanTask,
+	createScanTaskLifecycle,
+	isCurrentScanEvent,
+    registerScanEventListeners,
+    scanEventIdentity,
+} from './utils/scanTaskEvents';
 
 type ViewName = 'libs' | 'settings' | 'actor' | 'genre' | 'watched' | 'favorite';
 type SortOrder = 'asc' | 'desc';
@@ -41,6 +52,7 @@ type FilterReturnContext = {
     filter: FilterState;
 } | null;
 type ScanProgressState = {
+    taskId: string;
     libraryId: string;
     libraryName: string;
     mode: string;
@@ -161,6 +173,7 @@ function App() {
     const [listMutation, setListMutation] = useState<MediaGridMutation | null>(null);
     const scanStartedAtRef = useRef<number | null>(null);
     const scanModeRef = useRef<string>('');
+    const scanTaskLifecycleRef = useRef(createScanTaskLifecycle());
     const resetTitleTimerRef = useRef<number | null>(null);
     const metadataRefreshTimerRef = useRef<number | null>(null);
     const currentLibRef = useRef<any>(null);
@@ -238,7 +251,11 @@ function App() {
 
     const startScanForLibrary = async (libraryId: string, mode: string) => {
         scanModeRef.current = mode;
-        await ScanLibraryWithMode(libraryId, mode);
+		const generation = beginScanRequest(scanTaskLifecycleRef.current, libraryId);
+        const task = await ScanLibraryWithMode(libraryId, mode);
+        if (typeof task?.task_id === 'string' && task.task_id) {
+			activateScanTaskFromResponse(scanTaskLifecycleRef.current, libraryId, generation, task.task_id);
+        }
     };
 
     const loadLibraries = async () => {
@@ -306,9 +323,14 @@ function App() {
             }
         });
 
-        const unsubStart = EventsOn("scan:started", (data: any) => {
+        const onScanStart = (data: any) => {
+            const { libraryId, taskId } = scanEventIdentity(data);
+            if (!libraryId || !taskId || !activateScanTaskFromEvent(scanTaskLifecycleRef.current, data)) {
+                return;
+            }
             scanStartedAtRef.current = Date.now();
             setScanProgress({
+                taskId,
                 libraryId: typeof data?.library_id === 'string' ? data.library_id : '',
                 libraryName: typeof data?.library_name === 'string' ? data.library_name : '',
                 mode: typeof data?.mode === 'string' ? data.mode : (scanModeRef.current || ''),
@@ -320,10 +342,15 @@ function App() {
                 message: typeof data?.message === 'string' ? data.message : '',
             });
             updateScanTitle(data, '扫描 ');
-        });
+        };
 
-        const unsubProgress = EventsOn("scan:progress", (data: any) => {
+        const onScanProgress = (data: any) => {
+            const { libraryId } = scanEventIdentity(data);
+            if (!isCurrentScanEvent(scanTaskLifecycleRef.current.activeTaskIDs.get(libraryId), data)) {
+                return;
+            }
             setScanProgress((prev) => ({
+                taskId: typeof data?.task_id === 'string' ? data.task_id : (prev?.taskId || ''),
                 libraryId: typeof data?.library_id === 'string' ? data.library_id : (prev?.libraryId || ''),
                 libraryName: typeof data?.library_name === 'string' ? data.library_name : (prev?.libraryName || ''),
                 mode: typeof data?.mode === 'string' ? data.mode : (prev?.mode || scanModeRef.current || ''),
@@ -335,9 +362,17 @@ function App() {
                 message: typeof data?.message === 'string' ? data.message : (prev?.message || ''),
             }));
             updateScanTitle(data, '扫描 ');
-        });
+        };
 
-        const unsubComplete = EventsOn("scan:completed", (data: any) => {
+        const acceptTerminal = (data: any): boolean => {
+			const { taskId } = scanEventIdentity(data);
+			return taskId !== '' && completeScanTask(scanTaskLifecycleRef.current, data);
+        };
+
+        const onScanComplete = (data: any) => {
+            if (!acceptTerminal(data)) {
+                return;
+            }
             showStatus(`扫描完成：${data?.library_name || ''}`);
             updateScanTitle(data, '完成 ');
             scanStartedAtRef.current = null;
@@ -346,7 +381,7 @@ function App() {
             clearScanProgress();
             loadLibraries();
             setContentRefreshVersion((prev) => prev + 1);
-        });
+        };
 
         const unsubMetadata = EventsOn("media:metadata-updated", (data: any) => {
             const activeLibraryId = currentLibRef.current?.id;
@@ -364,31 +399,57 @@ function App() {
             }, 250);
         });
 
-        const unsubFail = EventsOn("scan:failed", (data: any) => {
+        const onScanFail = (data: any) => {
+            if (!acceptTerminal(data)) {
+                return;
+            }
             showStatus(`扫描失败：${data?.message || '未知错误'}`);
             updateScanTitle(data, '失败 ');
             scanStartedAtRef.current = null;
             scanModeRef.current = '';
             scheduleTitleReset();
             clearScanProgress();
-        });
+        };
 
-        const unsubIncomplete = EventsOn("scan:incomplete", (data: any) => {
+        const onScanIncomplete = (data: any) => {
+            if (!acceptTerminal(data)) {
+                return;
+            }
             showStatus(`扫描未完成：${data?.message || '目录无法完整访问'}`);
             updateScanTitle(data, '未完成 ');
             scanStartedAtRef.current = null;
             scanModeRef.current = '';
             scheduleTitleReset();
             clearScanProgress();
-        });
+        };
+
+        const onScanCanceled = (data: any) => {
+            if (!acceptTerminal(data)) {
+                return;
+            }
+            showStatus('扫描已取消');
+            updateScanTitle(data, '已取消 ');
+            scanStartedAtRef.current = null;
+            scanModeRef.current = '';
+            scheduleTitleReset();
+            clearScanProgress();
+        };
+
+        const unsubscribeScanEvents = registerScanEventListeners(
+            (event, handler) => EventsOn(event, handler),
+            {
+                'scan:start': onScanStart,
+                'scan:progress': onScanProgress,
+                'scan:completed': onScanComplete,
+                'scan:failed': onScanFail,
+                'scan:incomplete': onScanIncomplete,
+                'scan:canceled': onScanCanceled,
+            },
+        );
 
         return () => {
-            unsubStart();
-            unsubProgress();
-            unsubComplete();
+            unsubscribeScanEvents();
             unsubMetadata();
-            unsubFail();
-            unsubIncomplete();
             if (resetTitleTimerRef.current) {
                 window.clearTimeout(resetTitleTimerRef.current);
             }
@@ -396,6 +457,7 @@ function App() {
                 window.clearTimeout(metadataRefreshTimerRef.current);
             }
             scanModeRef.current = '';
+			clearScanTaskLifecycle(scanTaskLifecycleRef.current);
             setAppTitle(APP_TITLE);
         };
     }, []);

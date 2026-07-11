@@ -22,3 +22,4 @@
 | NAVI-18 | P3 | 错误伪装为空状态，类型/键盘语义不足。 | MediaGrid.tsx、MediaCard.tsx、App/Settings | error/loading/empty 状态；生成类型；语义卡片和焦点管理。 | API 错误可见可重试；键盘完成操作；TS 契约测试通过。 | 可与 NAVI-10 合并。 | 批次 4：体验与维护 |
 | NAVI-19 | P3 | app.go 混合职责，存在未验证 V3 包袱。 | app.go、config/config.go、repository/repository.go | 仅渐进拆分扫描、设置/密钥、播放、远程；先确认 V3 调用。 | 核心行为不变且可独立单测；不删除未验证旧代码。 | P1/P2 稳定后。 | 批次 4：维护性 |
 | NAVI-20 | P2，待验证 | /local/ 直接服务前端路径；NFO 保存信任前端路径。 | main.go handler；app.go：SaveNFOEditorData | 由媒体 ID/受控根解析；保存时后端重算 NFO 路径。 | renderer 输入无法越界读写；安全边界集成测试通过。 | 先验证 renderer 威胁模型；与 NAVI-14 协同。 | 批次 2：安全收口 |
+| NAVI-21 | P3 | 批次 5 的扫描失败历史仅保留最近一次内存态记录，应用重启后不可查询。 | app.go：lastScanFailures；service/thumbnail_worker.go | 在建立版本化迁移体系后增加轻量任务失败历史表和保留策略；不得恢复已取消 context。 | 重启后可查询有限条失败历史，重试生成新任务 ID，历史表有容量上限。 | NAVI-16。 | 后续：任务历史持久化 |

@@ -31,6 +31,15 @@ func newTestApp(t *testing.T) *App {
 	if err := model.AutoMigrate(db); err != nil {
 		t.Fatalf("migrate sqlite failed: %v", err)
 	}
+	for _, statement := range []string{
+		"CREATE UNIQUE INDEX idx_libraries_path_key_active ON libraries(path_key) WHERE deleted_at IS NULL AND path_key <> ''",
+		"CREATE UNIQUE INDEX idx_media_library_path_active ON media(library_id, path_key) WHERE deleted_at IS NULL AND path_key <> ''",
+		"CREATE UNIQUE INDEX idx_series_library_folder_active ON series(library_id, folder_path_key) WHERE deleted_at IS NULL AND folder_path_key <> ''",
+	} {
+		if err := db.Exec(statement).Error; err != nil {
+			t.Fatalf("create sqlite index failed: %v", err)
+		}
+	}
 
 	return &App{
 		ctx:    context.Background(),
@@ -206,6 +215,10 @@ func TestUpdateJellyfinPlaybackStateCoalescesDuplicateHistoryRows(t *testing.T) 
 	}
 	if err := app.db.Create(media).Error; err != nil {
 		t.Fatalf("create media failed: %v", err)
+	}
+	// Simulate a pre-versioned database created before the composite constraint.
+	if err := app.db.Exec("DROP INDEX idx_watch_user_media").Error; err != nil {
+		t.Fatalf("drop history unique index failed: %v", err)
 	}
 	if err := app.db.Create(&model.WatchHistory{ID: "history-old-1", UserID: desktopUserID, MediaID: media.ID, Position: 10}).Error; err != nil {
 		t.Fatalf("create first duplicate history failed: %v", err)

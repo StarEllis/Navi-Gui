@@ -16,6 +16,7 @@ const (
 	ThumbnailStatusGenerated  = "generated"
 	ThumbnailStatusPartial    = "partial"
 	ThumbnailStatusFailed     = "failed"
+	ThumbnailStatusCanceled   = "canceled"
 	ThumbnailStatusStale      = "stale"
 )
 
@@ -31,6 +32,8 @@ func normalizeThumbnailStatus(status string) string {
 		return ThumbnailStatusPartial
 	case ThumbnailStatusFailed:
 		return ThumbnailStatusFailed
+	case ThumbnailStatusCanceled:
+		return ThumbnailStatusCanceled
 	case ThumbnailStatusStale:
 		return ThumbnailStatusStale
 	default:

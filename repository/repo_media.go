@@ -213,7 +213,27 @@ func deletePeopleWithoutAnyMediaPeople(tx *gorm.DB, personIDs []string) (int64, 
 }
 
 func (r *MediaRepo) Create(media *model.Media) error {
-	return r.db.Create(media).Error
+	media.PathKey = model.NormalizePathKey(media.FilePath)
+	if media.PathKey == "" {
+		return fmt.Errorf("media file path is empty")
+	}
+	result := r.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "library_id"}, {Name: "path_key"}},
+		TargetWhere: clause.Where{Exprs: []clause.Expression{
+			clause.Expr{SQL: "deleted_at IS NULL AND path_key <> ''"},
+		}},
+		DoNothing: true,
+	}).Create(media)
+	result = retryLegacyCreateWithoutPartialIndex(r.db, result, media)
+	if result.Error != nil || result.RowsAffected > 0 {
+		return result.Error
+	}
+	var existing model.Media
+	if err := r.db.Where("library_id = ? AND path_key = ?", media.LibraryID, media.PathKey).First(&existing).Error; err != nil {
+		return err
+	}
+	media.ID = existing.ID
+	return nil
 }
 
 func (r *MediaRepo) FindByID(id string) (*model.Media, error) {
@@ -224,7 +244,16 @@ func (r *MediaRepo) FindByID(id string) (*model.Media, error) {
 
 func (r *MediaRepo) FindByFilePath(filePath string) (*model.Media, error) {
 	var media model.Media
-	err := r.db.Where("file_path = ?", filePath).First(&media).Error
+	err := r.db.Where("path_key = ?", model.NormalizePathKey(filePath)).Order("created_at ASC").First(&media).Error
+	return &media, err
+}
+func (r *MediaRepo) FindByFilePathInLibrary(libraryID, filePath string) (*model.Media, error) {
+	var media model.Media
+	err := r.db.Where(
+		"library_id = ? AND path_key = ?",
+		libraryID,
+		model.NormalizePathKey(filePath),
+	).First(&media).Error
 	return &media, err
 }
 
@@ -368,7 +397,15 @@ func (r *MediaRepo) CleanOrphanedByLibraryIDs(validLibraryIDs []string) (int64, 
 }
 
 func (r *MediaRepo) Update(media *model.Media) error {
-	return r.db.Save(media).Error
+	if media.SeriesID != "" {
+		return r.db.Save(media).Error
+	}
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Omit("SeriesID").Save(media).Error; err != nil {
+			return err
+		}
+		return tx.Model(&model.Media{}).Where("id = ?", media.ID).UpdateColumn("series_id", nil).Error
+	})
 }
 
 func (r *MediaRepo) FindByIDs(ids []string) ([]model.Media, error) {
@@ -928,6 +965,25 @@ func (r *MediaRepo) UpdateThumbnailStatus(mediaID string, fields map[string]inte
 		return nil
 	}
 	return r.db.Model(&model.Media{}).Where("id = ?", mediaID).Updates(fields).Error
+}
+
+func (r *MediaRepo) RetryThumbnailTask(mediaID string) (bool, error) {
+	mediaID = strings.TrimSpace(mediaID)
+	if mediaID == "" {
+		return false, nil
+	}
+	result := r.db.Model(&model.Media{}).
+		Where("id = ?", mediaID).
+		Where("thumbnail_status IN ?", []string{"failed", "partial", "canceled"}).
+		Updates(map[string]interface{}{
+			"thumbnail_status":       "pending",
+			"thumbnail_retry_count":  0,
+			"thumbnail_next_attempt": nil,
+			"thumbnail_locked_at":    nil,
+			"thumbnail_locked_by":    "",
+			"thumbnail_error":        "",
+		})
+	return result.RowsAffected > 0, result.Error
 }
 
 func (r *MediaRepo) PromoteFailedThumbnailTasks() (int64, error) {

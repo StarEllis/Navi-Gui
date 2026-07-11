@@ -153,11 +153,11 @@ func (fm *FamilyMember) BeforeCreate(tx *gorm.DB) error {
 // MediaShare 视频分享记录
 type MediaShare struct {
 	ID        string    `json:"id" gorm:"primaryKey;type:text"`
-	UserID    string    `json:"user_id" gorm:"index;type:text;not null"`  // 分享者
-	GroupID   string    `json:"group_id" gorm:"index;type:text;not null"` // 目标家庭组
-	MediaID   string    `json:"media_id" gorm:"index;type:text"`          // 分享的媒体（可选）
-	SeriesID  string    `json:"series_id" gorm:"index;type:text"`         // 分享的剧集（可选）
-	Message   string    `json:"message" gorm:"type:text"`                 // 分享附言
+	UserID    string    `json:"user_id" gorm:"index;type:text;not null"`       // 分享者
+	GroupID   string    `json:"group_id" gorm:"index;type:text;not null"`      // 目标家庭组
+	MediaID   string    `json:"media_id" gorm:"index;type:text;default:null"`  // 分享的媒体（可选）
+	SeriesID  string    `json:"series_id" gorm:"index;type:text;default:null"` // 分享的剧集（可选）
+	Message   string    `json:"message" gorm:"type:text"`                      // 分享附言
 	CreatedAt time.Time `json:"created_at"`
 
 	User   User        `json:"user,omitempty" gorm:"foreignKey:UserID"`
@@ -177,9 +177,9 @@ func (ms *MediaShare) BeforeCreate(tx *gorm.DB) error {
 type MediaLike struct {
 	ID        string    `json:"id" gorm:"primaryKey;type:text"`
 	UserID    string    `json:"user_id" gorm:"index;type:text;not null"`
-	MediaID   string    `json:"media_id" gorm:"index;type:text"`
-	SeriesID  string    `json:"series_id" gorm:"index;type:text"`
-	CommentID string    `json:"comment_id" gorm:"index;type:text"` // 也可以点赞评论
+	MediaID   string    `json:"media_id" gorm:"index;type:text;default:null"`
+	SeriesID  string    `json:"series_id" gorm:"index;type:text;default:null"`
+	CommentID string    `json:"comment_id" gorm:"index;type:text;default:null"` // 也可以点赞评论
 	CreatedAt time.Time `json:"created_at"`
 
 	User User `json:"-" gorm:"foreignKey:UserID"`
@@ -197,8 +197,8 @@ type MediaRecommendation struct {
 	ID         string    `json:"id" gorm:"primaryKey;type:text"`
 	FromUserID string    `json:"from_user_id" gorm:"index;type:text;not null"` // 推荐者
 	ToUserID   string    `json:"to_user_id" gorm:"index;type:text;not null"`   // 被推荐者
-	MediaID    string    `json:"media_id" gorm:"index;type:text"`
-	SeriesID   string    `json:"series_id" gorm:"index;type:text"`
+	MediaID    string    `json:"media_id" gorm:"index;type:text;default:null"`
+	SeriesID   string    `json:"series_id" gorm:"index;type:text;default:null"`
 	Message    string    `json:"message" gorm:"type:text"` // 推荐理由
 	IsRead     bool      `json:"is_read" gorm:"default:false"`
 	CreatedAt  time.Time `json:"created_at"`

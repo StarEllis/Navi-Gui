@@ -86,8 +86,72 @@ func newRemoteAccessState() *remoteAccessState {
 }
 
 func (a *App) shutdown(_ context.Context) {
-	a.shutdownDesktopIntegration()
-	a.shutdownRemoteServices()
+	if a == nil {
+		return
+	}
+	a.shutdownOnce.Do(func() {
+		a.scanMu.Lock()
+		a.shuttingDown = true
+		cancels := make([]context.CancelFunc, 0, len(a.activeScanIDs))
+		for _, task := range a.activeScanIDs {
+			if task != nil && task.cancel != nil {
+				cancels = append(cancels, task.cancel)
+			}
+		}
+		a.scanMu.Unlock()
+
+		if a.eventHub != nil {
+			a.eventHub.Close()
+		}
+		if a.appCancel != nil {
+			a.appCancel()
+		}
+		for _, cancel := range cancels {
+			cancel()
+		}
+		if a.thumbnailWorker != nil {
+			a.thumbnailWorker.Stop()
+		}
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		waiters := 1
+		results := make(chan error, 3)
+		go func() {
+			a.scanWG.Wait()
+			results <- nil
+		}()
+		if a.thumbnailWorker != nil {
+			waiters++
+			go func() { results <- a.thumbnailWorker.Shutdown(shutdownCtx) }()
+		}
+		if a.scanner != nil {
+			waiters++
+			go func() { results <- a.scanner.Shutdown(shutdownCtx) }()
+		}
+
+		for completed := 0; completed < waiters; completed++ {
+			select {
+			case err := <-results:
+				if err != nil && a.logger != nil {
+					a.logger.Warnf("background shutdown incomplete: %v", err)
+				}
+			case <-shutdownCtx.Done():
+				if a.logger != nil {
+					a.logger.Warnf("background shutdown timed out after 8s; continuing application exit")
+				}
+				completed = waiters
+			}
+		}
+
+		a.shutdownDesktopIntegration()
+		a.shutdownRemoteServices()
+		if a.dbManager != nil {
+			if err := a.dbManager.Close(); err != nil && a.logger != nil {
+				a.logger.Warnf("database checkpoint or close failed: %v", err)
+			}
+		}
+	})
 }
 
 func (a *App) shutdownRemoteServices() {

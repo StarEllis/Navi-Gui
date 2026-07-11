@@ -1,7 +1,10 @@
 package repository
 
 import (
+	"fmt"
+
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"navi-desktop/model"
 )
 
@@ -17,7 +20,27 @@ type SeriesRepo struct {
 }
 
 func (r *SeriesRepo) Create(series *model.Series) error {
-	return r.db.Create(series).Error
+	series.FolderPathKey = model.NormalizePathKey(series.FolderPath)
+	if series.FolderPathKey == "" {
+		return fmt.Errorf("series folder path is empty")
+	}
+	result := r.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "library_id"}, {Name: "folder_path_key"}},
+		TargetWhere: clause.Where{Exprs: []clause.Expression{
+			clause.Expr{SQL: "deleted_at IS NULL AND folder_path_key <> ''"},
+		}},
+		DoNothing: true,
+	}).Create(series)
+	result = retryLegacyCreateWithoutPartialIndex(r.db, result, series)
+	if result.Error != nil || result.RowsAffected > 0 {
+		return result.Error
+	}
+	var existing model.Series
+	if err := r.db.Where("library_id = ? AND folder_path_key = ?", series.LibraryID, series.FolderPathKey).First(&existing).Error; err != nil {
+		return err
+	}
+	series.ID = existing.ID
+	return nil
 }
 
 func (r *SeriesRepo) FindByID(id string) (*model.Series, error) {
@@ -36,7 +59,16 @@ func (r *SeriesRepo) FindByIDOnly(id string) (*model.Series, error) {
 
 func (r *SeriesRepo) FindByFolderPath(folderPath string) (*model.Series, error) {
 	var series model.Series
-	err := r.db.Where("folder_path = ?", folderPath).First(&series).Error
+	err := r.db.Where("folder_path_key = ?", model.NormalizePathKey(folderPath)).First(&series).Error
+	return &series, err
+}
+func (r *SeriesRepo) FindByFolderPathInLibrary(libraryID, folderPath string) (*model.Series, error) {
+	var series model.Series
+	err := r.db.Where(
+		"library_id = ? AND folder_path_key = ?",
+		libraryID,
+		model.NormalizePathKey(folderPath),
+	).First(&series).Error
 	return &series, err
 }
 

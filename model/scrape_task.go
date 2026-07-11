@@ -16,8 +16,8 @@ type ScrapeTask struct {
 	MediaType string `json:"media_type" gorm:"type:text;default:movie"` // movie / tvshow
 	Status    string `json:"status" gorm:"type:text;default:pending"`   // pending / scraping / scraped / failed / translating / completed
 	Progress  int    `json:"progress" gorm:"default:0"`                 // 进度 0-100
-	MediaID   string `json:"media_id" gorm:"type:text"`                 // 关联的媒体ID（如果已匹配）
-	SeriesID  string `json:"series_id" gorm:"type:text"`                // 关联的剧集ID
+	MediaID   string `json:"media_id" gorm:"type:text;default:null"`    // 关联的媒体ID（如果已匹配）
+	SeriesID  string `json:"series_id" gorm:"type:text;default:null"`   // 关联的剧集ID
 	// 刮削结果
 	ResultTitle     string  `json:"result_title" gorm:"type:text"`
 	ResultOrigTitle string  `json:"result_orig_title" gorm:"type:text"`

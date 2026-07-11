@@ -18,21 +18,23 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"navi-desktop/config"
-	"navi-desktop/model"
-	"navi-desktop/repository"
-	"navi-desktop/service"
-
-	"github.com/glebarez/sqlite"
+	"github.com/google/uuid"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
+	"navi-desktop/config"
+	"navi-desktop/database"
+	"navi-desktop/model"
+	"navi-desktop/repository"
+	"navi-desktop/service"
 )
 
 // App struct
 type App struct {
 	ctx              context.Context
+	appCancel        context.CancelFunc
 	db               *gorm.DB
+	dbManager        *database.Manager
 	repos            *repository.Repositories
 	scanner          *service.ScannerService
 	thumbnailWorker  *service.ThumbnailWorker
@@ -42,13 +44,56 @@ type App struct {
 	logger           *zap.SugaredLogger
 	remote           *remoteAccessState
 	desktop          *desktopIntegration
+	eventHub         *service.WSHub
 	scanMu           sync.Mutex
 	scanningLib      map[string]bool
+	activeScans      map[string]*scanTask
+	activeScanIDs    map[string]*scanTask
+	lastScanTasks    map[string]ScanTaskInfo
+	lastScanFailures map[string]ScanTaskInfo
+	scanWG           sync.WaitGroup
+	shuttingDown     bool
+	shutdownOnce     sync.Once
+}
+
+const (
+	ScanTaskPending    = "pending"
+	ScanTaskRunning    = "running"
+	ScanTaskCompleted  = "completed"
+	ScanTaskIncomplete = "incomplete"
+	ScanTaskFailed     = "failed"
+	ScanTaskCanceled   = "canceled"
+)
+
+type ScanTaskInfo struct {
+	TaskID       string     `json:"task_id"`
+	LibraryID    string     `json:"library_id"`
+	LibraryName  string     `json:"library_name"`
+	Mode         string     `json:"mode"`
+	Status       string     `json:"status"`
+	FailureStage string     `json:"failure_stage,omitempty"`
+	Error        string     `json:"error,omitempty"`
+	Retryable    bool       `json:"retryable"`
+	StartedAt    time.Time  `json:"started_at"`
+	FinishedAt   *time.Time `json:"finished_at,omitempty"`
+}
+
+type scanTask struct {
+	info     ScanTaskInfo
+	ctx      context.Context
+	cancel   context.CancelFunc
+	done     chan struct{}
+	terminal bool
 }
 
 func NewApp() *App {
 	app := &App{
-		remote: newRemoteAccessState(),
+		remote:           newRemoteAccessState(),
+		scanningLib:      make(map[string]bool),
+		activeScans:      make(map[string]*scanTask),
+		activeScanIDs:    make(map[string]*scanTask),
+		lastScanTasks:    make(map[string]ScanTaskInfo),
+		lastScanFailures: make(map[string]ScanTaskInfo),
 	}
 	app.desktop = newDesktopIntegration(app)
 	return app
@@ -64,6 +109,9 @@ func (a *App) tryBeginLibraryScan(libraryID string) bool {
 	}
 	a.scanMu.Lock()
 	defer a.scanMu.Unlock()
+	if a.shuttingDown {
+		return false
+	}
 	if a.scanningLib == nil {
 		a.scanningLib = make(map[string]bool)
 	}
@@ -88,33 +136,27 @@ func (a *App) finishLibraryScan(libraryID string) {
 }
 
 func (a *App) startup(ctx context.Context) {
-	a.ctx = ctx
+	a.ctx, a.appCancel = context.WithCancel(ctx)
 
 	// 1. 初始化极简 logger
 	l, _ := zap.NewDevelopment()
 	a.logger = l.Sugar()
 
-	// 2. 初始化持久层配置 (SQLite本地库)
-	dbPath := "navi.db"
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+	// 2. 初始化带版本迁移、备份和连接级 PRAGMA 的 SQLite 持久层。
+	dbManager, err := database.Open("navi.db", database.DefaultOptions())
 	if err != nil {
-		a.logger.Fatalf("连接数据库失败: %v", err)
+		a.logger.Fatalf("连接或升级数据库失败: %v", err)
 	}
-	a.db = db
-	a.configureSQLitePerformance()
-
-	// 初始化库表结构
-	err = model.AutoMigrate(db)
-	if err != nil {
-		a.logger.Fatalf("数据库迁移失败: %v", err)
-	}
+	a.dbManager = dbManager
+	a.db = dbManager.DB()
 
 	// 3. 构建 Repositories 单例
 	a.repos = repository.NewRepositories(a.db)
 
 	// 4. 注入之前写好的最小化 Shim 层
 	cfg := config.NewConfig()
-	wsHub := service.NewWSHub(ctx)
+	wsHub := service.NewWSHub(a.ctx)
+	a.eventHub = wsHub
 	a.artworkCache = service.NewArtworkCache(cfg.Cache.CacheDir, a.logger)
 	a.avatarService = service.NewGfriendsAvatarService(service.GfriendsAvatarOptions{
 		CacheDir:     cfg.Cache.CacheDir,
@@ -153,7 +195,7 @@ func (a *App) startup(ctx context.Context) {
 
 	a.startPostStartupServices(thumbSvc, thumbnailSettingsProvider)
 
-	a.logger.Infof("Application backend started successfully! DB: %s", dbPath)
+	a.logger.Infof("Application backend started successfully! DB: %s", dbManager.Path())
 }
 
 func (a *App) startPostStartupServices(thumbSvc *service.ThumbnailService, thumbnailSettingsProvider func() service.ThumbnailSettings) {
@@ -165,9 +207,18 @@ func (a *App) startPostStartupServices(thumbSvc *service.ThumbnailService, thumb
 		}()
 
 		// Let Wails finish creating and painting the WebView before maintenance work starts.
-		time.Sleep(500 * time.Millisecond)
+		timer := time.NewTimer(500 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-timer.C:
+		}
 
 		a.migrateThumbnailTasksV2(thumbSvc, thumbnailSettingsProvider())
+		if a.ctx.Err() != nil {
+			return
+		}
 		if a.thumbnailWorker != nil {
 			a.thumbnailWorker.Start()
 		}
@@ -186,7 +237,7 @@ func (a *App) startPostStartupServices(thumbSvc *service.ThumbnailService, thumb
 }
 
 func (a *App) migrateThumbnailTasksV2(thumbSvc *service.ThumbnailService, settings service.ThumbnailSettings) {
-	if a.db == nil {
+	if a.db == nil || (a.ctx != nil && a.ctx.Err() != nil) {
 		return
 	}
 
@@ -227,6 +278,11 @@ func (a *App) migrateThumbnailTasksV2(thumbSvc *service.ThumbnailService, settin
 		Order("created_at ASC").
 		FindInBatches(&batch, 200, func(tx *gorm.DB, batchNum int) error {
 			for i := range batch {
+				if a.ctx != nil {
+					if err := a.ctx.Err(); err != nil {
+						return err
+					}
+				}
 				original := batch[i]
 				media := batch[i]
 				stats.scanned++
@@ -271,31 +327,15 @@ func (a *App) migrateThumbnailTasksV2(thumbSvc *service.ThumbnailService, settin
 			return nil
 		})
 	if result.Error != nil {
+		if errors.Is(result.Error, context.Canceled) {
+			return
+		}
 		a.logger.Warnf("thumbnail v2 migration failed: %v", result.Error)
 		return
 	}
 	if stats.updated > 0 {
 		a.logger.Infof("thumbnail v2 migration reconciled %d/%d media items (pending=%d stale=%d generated=%d)",
 			stats.updated, stats.scanned, stats.pending, stats.stale, stats.generated)
-	}
-}
-
-func (a *App) configureSQLitePerformance() {
-	if a.db == nil {
-		return
-	}
-
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL;",
-		"PRAGMA synchronous=NORMAL;",
-		"PRAGMA busy_timeout=5000;",
-		"PRAGMA temp_store=MEMORY;",
-	}
-
-	for _, pragma := range pragmas {
-		if err := a.db.Exec(pragma).Error; err != nil {
-			a.logger.Warnf("apply sqlite pragma failed: %s, err=%v", pragma, err)
-		}
 	}
 }
 
@@ -351,50 +391,199 @@ func normalizeScanMode(mode string) string {
 	}
 }
 
-func (a *App) startScanWithOptions(lib *model.Library, mode string, options service.ScanOptions) {
+func (a *App) registerScanTask(lib *model.Library, mode string) (*scanTask, error) {
+	if a == nil || lib == nil || strings.TrimSpace(lib.ID) == "" {
+		return nil, fmt.Errorf("library is required")
+	}
+	parent := a.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	now := time.Now().UTC()
+	task := &scanTask{
+		info: ScanTaskInfo{
+			TaskID:      uuid.NewString(),
+			LibraryID:   lib.ID,
+			LibraryName: lib.Name,
+			Mode:        mode,
+			Status:      ScanTaskPending,
+			StartedAt:   now,
+		},
+		ctx:    ctx,
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+
+	a.scanMu.Lock()
+	defer a.scanMu.Unlock()
+	if a.shuttingDown {
+		cancel()
+		return nil, fmt.Errorf("application is shutting down")
+	}
+	if a.scanningLib == nil {
+		a.scanningLib = make(map[string]bool)
+	}
+	if a.scanningLib[lib.ID] {
+		activeID := ""
+		if active := a.activeScans[lib.ID]; active != nil {
+			activeID = active.info.TaskID
+		}
+		cancel()
+		if activeID != "" {
+			return nil, fmt.Errorf("library %s is already scanning (task %s)", lib.ID, activeID)
+		}
+		return nil, fmt.Errorf("library %s is already scanning", lib.ID)
+	}
+	if a.activeScans == nil {
+		a.activeScans = make(map[string]*scanTask)
+	}
+	if a.activeScanIDs == nil {
+		a.activeScanIDs = make(map[string]*scanTask)
+	}
+	a.scanningLib[lib.ID] = true
+	a.activeScans[lib.ID] = task
+	a.activeScanIDs[task.info.TaskID] = task
+	return task, nil
+}
+
+func (a *App) startScanWithOptions(lib *model.Library, task *scanTask, options service.ScanOptions) {
 	if settings, err := a.GetDesktopSettings(); err == nil && settings != nil {
 		options.UseEverything = settings.UseEverything
 		options.EverythingAddr = settings.EverythingAddr
 	}
+	options.TaskID = task.info.TaskID
+	options.Context = task.ctx
+	options.SuppressTerminal = true
 
-	go func() {
-		defer a.finishLibraryScan(lib.ID)
-
-		if mode == "overwrite" {
-			result, err := a.scanner.ScanLibraryOverwrite(a.db, lib, options)
-			if err != nil {
-				a.logger.Errorf("Scan error (mode=%s): %v", mode, err)
-				return
-			}
-			lib.LastScan = &result.LastScan
-			for _, warning := range result.CacheCleanupWarnings {
-				a.logger.Warnf("overwrite cache cleanup warning: %v", warning)
-			}
-			a.bumpRecommendationVersion()
-			a.clearRecommendationGenres()
-			return
-		}
-
-		_, err := a.scanner.ScanLibraryWithOptions(lib, options)
-		if err != nil {
-			a.logger.Errorf("Scan error (mode=%s): %v", mode, err)
-			return
-		}
-
-		lastScanAt := time.Now().UTC().Truncate(time.Second)
-		updatedLib := *lib
-		updatedLib.LastScan = &lastScanAt
-		if err := a.repos.Library.Update(&updatedLib); err != nil {
-			a.logger.Errorf("update library last_scan failed (mode=%s): %v", mode, err)
-			return
-		}
-		lib.LastScan = &lastScanAt
-		a.bumpRecommendationVersion()
-		a.clearRecommendationGenres()
-	}()
+	a.scanMu.Lock()
+	if a.shuttingDown || task.terminal {
+		a.scanMu.Unlock()
+		a.finishScanTask(lib, task, options, service.OverwriteScanResult{}, context.Canceled)
+		return
+	}
+	a.scanWG.Add(1)
+	a.scanMu.Unlock()
+	go a.runScanTask(lib, task, options)
 }
 
-func (a *App) ScanLibrary(libraryID string) error {
+func (a *App) runScanTask(lib *model.Library, task *scanTask, options service.ScanOptions) {
+	defer a.scanWG.Done()
+	var result service.OverwriteScanResult
+	var scanErr error
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			scanErr = fmt.Errorf("scan panic: %v", recovered)
+			if a.logger != nil {
+				a.logger.Errorf("scan panic: library=%s task=%s err=%v", lib.ID, task.info.TaskID, recovered)
+			}
+		}
+		a.finishScanTask(lib, task, options, result, scanErr)
+	}()
+
+	a.scanMu.Lock()
+	if !task.terminal {
+		task.info.Status = ScanTaskRunning
+	}
+	a.scanMu.Unlock()
+
+	if a.scanner == nil || a.db == nil {
+		scanErr = fmt.Errorf("scanner is unavailable")
+		return
+	}
+	result, scanErr = a.scanner.ScanLibraryAtomic(a.db, lib, options)
+	if scanErr != nil {
+		if a.logger != nil && !errors.Is(scanErr, context.Canceled) {
+			a.logger.Errorf("scan error: library=%s task=%s mode=%s err=%v", lib.ID, task.info.TaskID, options.Mode, scanErr)
+		}
+		return
+	}
+
+	lib.LastScan = &result.LastScan
+	for _, warning := range result.CacheCleanupWarnings {
+		if a.logger != nil {
+			a.logger.Warnf("scan cache cleanup warning: %v", warning)
+		}
+	}
+	a.bumpRecommendationVersion()
+	a.clearRecommendationGenres()
+}
+
+func (a *App) finishScanTask(lib *model.Library, task *scanTask, options service.ScanOptions, result service.OverwriteScanResult, scanErr error) {
+	if a == nil || lib == nil || task == nil {
+		return
+	}
+	status := ScanTaskCompleted
+	if errors.Is(scanErr, context.Canceled) {
+		status = ScanTaskCanceled
+	} else if service.IsScanIncomplete(scanErr) {
+		status = ScanTaskIncomplete
+	} else if scanErr != nil {
+		status = ScanTaskFailed
+	}
+	now := time.Now().UTC()
+
+	a.scanMu.Lock()
+	if task.terminal {
+		a.scanMu.Unlock()
+		return
+	}
+	task.terminal = true
+	task.info.Status = status
+	task.info.FinishedAt = &now
+	task.info.Retryable = status == ScanTaskFailed || status == ScanTaskIncomplete
+	if scanErr != nil && status != ScanTaskCanceled {
+		task.info.Error = scanErr.Error()
+		task.info.FailureStage = scanTaskFailureStage(scanErr)
+	}
+	delete(a.scanningLib, lib.ID)
+	delete(a.activeScans, lib.ID)
+	delete(a.activeScanIDs, task.info.TaskID)
+	if a.lastScanTasks == nil {
+		a.lastScanTasks = make(map[string]ScanTaskInfo)
+	}
+	a.lastScanTasks[lib.ID] = task.info
+	if status == ScanTaskFailed || status == ScanTaskIncomplete {
+		if a.lastScanFailures == nil {
+			a.lastScanFailures = make(map[string]ScanTaskInfo)
+		}
+		a.lastScanFailures[lib.ID] = task.info
+	} else if status == ScanTaskCompleted || status == ScanTaskCanceled {
+		delete(a.lastScanFailures, lib.ID)
+	}
+	close(task.done)
+	shuttingDown := a.shuttingDown
+	a.scanMu.Unlock()
+	task.cancel()
+
+	if !shuttingDown && a.scanner != nil {
+		a.scanner.BroadcastScanTerminal(lib, options, result.Scanned, result.TotalTargets, result.Cleaned, scanErr)
+	}
+}
+
+func scanTaskFailureStage(err error) string {
+	if err == nil {
+		return ""
+	}
+	if service.IsScanIncomplete(err) {
+		return "enumeration"
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "ffprobe"), strings.Contains(message, "probe media"):
+		return "ffprobe"
+	case strings.Contains(message, "nfo"), strings.Contains(message, "metadata"):
+		return "metadata"
+	case strings.Contains(message, "strm"):
+		return "strm"
+	case strings.Contains(message, "transaction"), strings.Contains(message, "database"), strings.Contains(message, "last scan"):
+		return "database"
+	default:
+		return "scan"
+	}
+}
+
+func (a *App) ScanLibrary(libraryID string) (*ScanTaskInfo, error) {
 	return a.ScanLibraryWithMode(libraryID, "incremental")
 	/*
 		lib, err := a.repos.Library.FindByID(libraryID)
@@ -2268,23 +2457,17 @@ func (a *App) removeLibraryMediaCache(mediaID string) error {
 
 // ScanLibraryWithMode 带刷新模式的扫描入口
 // mode: "incremental" | "overwrite" | "delete_update"
-// NOTE: 当前 scanner 核心仍只走默认逻辑，mode 参数预留用于后续扩展
-func (a *App) ScanLibraryWithMode(libraryID string, mode string) error {
+func (a *App) ScanLibraryWithMode(libraryID string, mode string) (*ScanTaskInfo, error) {
 	lib, err := a.repos.Library.FindByID(libraryID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	mode = normalizeScanMode(mode)
 	a.logger.Infof("ScanLibraryWithMode: id=%s mode=%s", libraryID, mode)
-	if !a.tryBeginLibraryScan(lib.ID) {
-		return fmt.Errorf("library %s is already scanning", lib.ID)
+	task, err := a.registerScanTask(lib, mode)
+	if err != nil {
+		return nil, err
 	}
-	releaseScan := true
-	defer func() {
-		if releaseScan {
-			a.finishLibraryScan(lib.ID)
-		}
-	}()
 
 	options := service.ScanOptions{
 		Mode:        mode,
@@ -2292,11 +2475,135 @@ func (a *App) ScanLibraryWithMode(libraryID string, mode string) error {
 		// Delete/update mode now handles deletes and sidecar changes inside the
 		// main sync pass instead of running a separate full-library existence sweep.
 		CleanDeleted: false,
-		Context:      a.ctx,
 	}
-	a.startScanWithOptions(lib, mode, options)
-	releaseScan = false
+	a.startScanWithOptions(lib, task, options)
+	info := task.info
+	return &info, nil
+}
+
+func (a *App) CancelScan(taskID string) error {
+	if a == nil {
+		return nil
+	}
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return fmt.Errorf("task ID is required")
+	}
+	a.scanMu.Lock()
+	task := a.activeScanIDs[taskID]
+	if task == nil {
+		for _, previous := range a.lastScanTasks {
+			if previous.TaskID == taskID {
+				a.scanMu.Unlock()
+				return nil
+			}
+		}
+		a.scanMu.Unlock()
+		return fmt.Errorf("scan task %s is not running", taskID)
+	}
+	cancel := task.cancel
+	a.scanMu.Unlock()
+	cancel()
 	return nil
+}
+
+func (a *App) CancelLibraryScan(libraryID string) error {
+	if a == nil {
+		return nil
+	}
+	a.scanMu.Lock()
+	task := a.activeScans[strings.TrimSpace(libraryID)]
+	a.scanMu.Unlock()
+	if task == nil {
+		return nil
+	}
+	return a.CancelScan(task.info.TaskID)
+}
+
+func (a *App) GetLastScanTask(libraryID string) *ScanTaskInfo {
+	if a == nil {
+		return nil
+	}
+	libraryID = strings.TrimSpace(libraryID)
+	a.scanMu.Lock()
+	defer a.scanMu.Unlock()
+	if task := a.activeScans[libraryID]; task != nil {
+		info := task.info
+		return &info
+	}
+	info, ok := a.lastScanTasks[libraryID]
+	if !ok {
+		return nil
+	}
+	return &info
+}
+
+func (a *App) GetLastScanFailure(libraryID string) *ScanTaskInfo {
+	if a == nil {
+		return nil
+	}
+	a.scanMu.Lock()
+	defer a.scanMu.Unlock()
+	info, ok := a.lastScanFailures[strings.TrimSpace(libraryID)]
+	if !ok {
+		return nil
+	}
+	return &info
+}
+
+func (a *App) RetryFailedScan(libraryID string) (*ScanTaskInfo, error) {
+	if a == nil {
+		return nil, fmt.Errorf("application is unavailable")
+	}
+	libraryID = strings.TrimSpace(libraryID)
+	a.scanMu.Lock()
+	failed, ok := a.lastScanFailures[libraryID]
+	a.scanMu.Unlock()
+	if !ok || !failed.Retryable || (failed.Status != ScanTaskFailed && failed.Status != ScanTaskIncomplete) {
+		return nil, fmt.Errorf("library %s has no retryable failed scan", libraryID)
+	}
+	return a.ScanLibraryWithMode(libraryID, failed.Mode)
+}
+
+func (a *App) GetThumbnailFailure(mediaID string) (*service.ThumbnailTaskEventData, error) {
+	if a == nil || a.repos == nil || a.repos.Media == nil {
+		return nil, fmt.Errorf("media repository is unavailable")
+	}
+	mediaID = strings.TrimSpace(mediaID)
+	if a.thumbnailWorker != nil {
+		if failure := a.thumbnailWorker.LastFailure(mediaID); failure != nil {
+			return failure, nil
+		}
+	}
+	media, err := a.repos.Media.FindByID(mediaID)
+	if err != nil {
+		return nil, err
+	}
+	status := strings.ToLower(strings.TrimSpace(media.ThumbnailStatus))
+	if status != service.ThumbnailStatusFailed && status != service.ThumbnailStatusPartial {
+		return nil, nil
+	}
+	return &service.ThumbnailTaskEventData{
+		MediaID:   media.ID,
+		LibraryID: media.LibraryID,
+		Path:      media.FilePath,
+		Type:      "thumbnail",
+		Status:    status,
+		Phase:     "generation",
+		Message:   media.ThumbnailError,
+		Retryable: true,
+	}, nil
+}
+
+func (a *App) RetryThumbnailTask(mediaID string) (*service.ThumbnailTaskEventData, error) {
+	if a == nil || a.thumbnailWorker == nil || a.repos == nil || a.repos.Media == nil {
+		return nil, fmt.Errorf("thumbnail worker is unavailable")
+	}
+	media, err := a.repos.Media.FindByID(strings.TrimSpace(mediaID))
+	if err != nil {
+		return nil, err
+	}
+	return a.thumbnailWorker.Retry(media)
 }
 
 // SelectDirectory 调起真正的桌面级弹窗选择媒体库路径

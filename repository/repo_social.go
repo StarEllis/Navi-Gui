@@ -2,6 +2,7 @@ package repository
 
 import (
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"navi-desktop/model"
 )
 
@@ -12,15 +13,12 @@ type WatchHistoryRepo struct {
 }
 
 func (r *WatchHistoryRepo) Upsert(history *model.WatchHistory) error {
-	var existing model.WatchHistory
-	err := r.db.Where("user_id = ? AND media_id = ?", history.UserID, history.MediaID).First(&existing).Error
-	if err == gorm.ErrRecordNotFound {
-		return r.db.Create(history).Error
-	}
-	existing.Position = history.Position
-	existing.Duration = history.Duration
-	existing.Completed = history.Completed
-	return r.db.Save(&existing).Error
+	return r.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "user_id"}, {Name: "media_id"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"position", "duration", "completed", "updated_at",
+		}),
+	}).Create(history).Error
 }
 
 func (r *WatchHistoryRepo) ContinueWatching(userID string, limit int) ([]model.WatchHistory, error) {
@@ -146,7 +144,10 @@ type FavoriteRepo struct {
 }
 
 func (r *FavoriteRepo) Add(fav *model.Favorite) error {
-	return r.db.Create(fav).Error
+	return r.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "user_id"}, {Name: "media_id"}},
+		DoNothing: true,
+	}).Create(fav).Error
 }
 
 func (r *FavoriteRepo) Remove(userID, mediaID string) error {

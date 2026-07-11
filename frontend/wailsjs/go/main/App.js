@@ -6,6 +6,14 @@ export function CleanOrphanedMediaAssociations() {
   return window['go']['main']['App']['CleanOrphanedMediaAssociations']();
 }
 
+export function CancelLibraryScan(arg1) {
+  return window['go']['main']['App']['CancelLibraryScan'](arg1);
+}
+
+export function CancelScan(arg1) {
+  return window['go']['main']['App']['CancelScan'](arg1);
+}
+
 export function CreateLibrary(arg1) {
   return window['go']['main']['App']['CreateLibrary'](arg1);
 }
@@ -42,6 +50,14 @@ export function GetLibraries() {
   return window['go']['main']['App']['GetLibraries']();
 }
 
+export function GetLastScanFailure(arg1) {
+  return window['go']['main']['App']['GetLastScanFailure'](arg1);
+}
+
+export function GetLastScanTask(arg1) {
+  return window['go']['main']['App']['GetLastScanTask'](arg1);
+}
+
 export function GetMediaDetail(arg1) {
   return window['go']['main']['App']['GetMediaDetail'](arg1);
 }
@@ -70,6 +86,10 @@ export function GetSeriesStats(arg1) {
   return window['go']['main']['App']['GetSeriesStats'](arg1);
 }
 
+export function GetThumbnailFailure(arg1) {
+  return window['go']['main']['App']['GetThumbnailFailure'](arg1);
+}
+
 export function OpenMediaFolder(arg1) {
   return window['go']['main']['App']['OpenMediaFolder'](arg1);
 }
@@ -92,6 +112,14 @@ export function PlayWithExternalPlayer(arg1) {
 
 export function RestartApp() {
   return window['go']['main']['App']['RestartApp']();
+}
+
+export function RetryFailedScan(arg1) {
+  return window['go']['main']['App']['RetryFailedScan'](arg1);
+}
+
+export function RetryThumbnailTask(arg1) {
+  return window['go']['main']['App']['RetryThumbnailTask'](arg1);
 }
 
 export function SaveNFOEditorData(arg1, arg2) {

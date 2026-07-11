@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"navi-desktop/model"
 )
 
@@ -15,7 +16,27 @@ type LibraryRepo struct {
 }
 
 func (r *LibraryRepo) Create(lib *model.Library) error {
-	return r.db.Create(lib).Error
+	lib.PathKey = model.LibraryPathKey(lib.Path)
+	if lib.PathKey == "" {
+		return fmt.Errorf("library path is empty")
+	}
+	result := r.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "path_key"}},
+		TargetWhere: clause.Where{Exprs: []clause.Expression{
+			clause.Expr{SQL: "deleted_at IS NULL AND path_key <> ''"},
+		}},
+		DoNothing: true,
+	}).Create(lib)
+	result = retryLegacyCreateWithoutPartialIndex(r.db, result, lib)
+	if result.Error != nil || result.RowsAffected > 0 {
+		return result.Error
+	}
+	var existing model.Library
+	if err := r.db.Where("path_key = ?", lib.PathKey).First(&existing).Error; err != nil {
+		return err
+	}
+	lib.ID = existing.ID
+	return nil
 }
 
 func (r *LibraryRepo) FindByID(id string) (*model.Library, error) {

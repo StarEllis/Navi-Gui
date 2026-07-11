@@ -7,6 +7,10 @@ import {service} from '../models';
 
 export function CleanOrphanedMediaAssociations():Promise<repository.OrphanedMediaCleanupResult>;
 
+export function CancelLibraryScan(arg1:string):Promise<void>;
+
+export function CancelScan(arg1:string):Promise<void>;
+
 export function CreateLibrary(arg1:model.Library):Promise<model.Library>;
 
 export function DeleteLibrary(arg1:string):Promise<main.DeleteLibraryResult>;
@@ -25,6 +29,10 @@ export function GetGenreStats(arg1:string):Promise<Array<main.StatsItem>>;
 
 export function GetLibraries():Promise<Array<model.Library>>;
 
+export function GetLastScanFailure(arg1:string):Promise<main.ScanTaskInfo|null>;
+
+export function GetLastScanTask(arg1:string):Promise<main.ScanTaskInfo|null>;
+
 export function GetMediaDetail(arg1:string):Promise<model.Media>;
 
 export function GetMediaDetailBundle(arg1:string):Promise<main.MediaDetailBundle>;
@@ -39,6 +47,8 @@ export function GetNFOEditorData(arg1:string):Promise<service.NFOEditorData>;
 
 export function GetSeriesStats(arg1:string):Promise<Array<main.StatsItem>>;
 
+export function GetThumbnailFailure(arg1:string):Promise<service.ThumbnailTaskEventData|null>;
+
 export function OpenMediaFolder(arg1:string):Promise<void>;
 
 export function OpenNFO(arg1:string):Promise<void>;
@@ -51,11 +61,15 @@ export function PlayWithExternalPlayer(arg1:string):Promise<void>;
 
 export function RestartApp():Promise<void>;
 
+export function RetryFailedScan(arg1:string):Promise<main.ScanTaskInfo>;
+
+export function RetryThumbnailTask(arg1:string):Promise<service.ThumbnailTaskEventData>;
+
 export function SaveNFOEditorData(arg1:string,arg2:service.NFOEditorData):Promise<void>;
 
-export function ScanLibrary(arg1:string):Promise<void>;
+export function ScanLibrary(arg1:string):Promise<main.ScanTaskInfo>;
 
-export function ScanLibraryWithMode(arg1:string,arg2:string):Promise<void>;
+export function ScanLibraryWithMode(arg1:string,arg2:string):Promise<main.ScanTaskInfo>;
 
 export function SelectDirectory():Promise<string>;
 

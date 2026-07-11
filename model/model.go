@@ -2,6 +2,8 @@ package model
 
 import (
 	"encoding/json"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -25,7 +27,8 @@ type User struct {
 type Library struct {
 	ID            string     `json:"id" gorm:"primaryKey;type:text"`
 	Name          string     `json:"name" gorm:"type:text;not null"`
-	Path          string     `json:"path" gorm:"type:text;not null"`      // 媒体文件目录路径
+	Path          string     `json:"path" gorm:"type:text;not null"` // 媒体文件目录路径
+	PathKey       string     `json:"-" gorm:"index;type:text"`
 	Type          string     `json:"type" gorm:"type:text;default:movie"` // movie / tvshow / mixed / other
 	LastScan      *time.Time `json:"last_scan"`
 	FolderPaths   []string   `json:"folder_paths,omitempty" gorm:"-"`
@@ -55,19 +58,20 @@ type Library struct {
 
 // Series 剧集合集（电视剧系列）
 type Series struct {
-	ID           string  `json:"id" gorm:"primaryKey;type:text"`
-	LibraryID    string  `json:"library_id" gorm:"index;type:text;not null"`
-	Title        string  `json:"title" gorm:"index;type:text;not null"` // 剧集名称
-	OrigTitle    string  `json:"orig_title" gorm:"type:text"`           // 原始标题
-	Year         int     `json:"year" gorm:"index"`
-	Overview     string  `json:"overview" gorm:"type:text"`
-	PosterPath   string  `json:"poster_path" gorm:"type:text"`
-	BackdropPath string  `json:"backdrop_path" gorm:"type:text"`
-	Rating       float64 `json:"rating"`
-	Genres       string  `json:"genres" gorm:"type:text"`
-	FolderPath   string  `json:"folder_path" gorm:"uniqueIndex;type:text;not null"` // 剧集根目录路径
-	SeasonCount  int     `json:"season_count"`                                      // 季数
-	EpisodeCount int     `json:"episode_count"`                                     // 总集数
+	ID            string  `json:"id" gorm:"primaryKey;type:text"`
+	LibraryID     string  `json:"library_id" gorm:"index;type:text;not null"`
+	Title         string  `json:"title" gorm:"index;type:text;not null"` // 剧集名称
+	OrigTitle     string  `json:"orig_title" gorm:"type:text"`           // 原始标题
+	Year          int     `json:"year" gorm:"index"`
+	Overview      string  `json:"overview" gorm:"type:text"`
+	PosterPath    string  `json:"poster_path" gorm:"type:text"`
+	BackdropPath  string  `json:"backdrop_path" gorm:"type:text"`
+	Rating        float64 `json:"rating"`
+	Genres        string  `json:"genres" gorm:"type:text"`
+	FolderPath    string  `json:"folder_path" gorm:"type:text;not null"` // 剧集根目录路径
+	FolderPathKey string  `json:"-" gorm:"index;type:text"`
+	SeasonCount   int     `json:"season_count"`  // 季数
+	EpisodeCount  int     `json:"episode_count"` // 总集数
 	// V2 扩展字段
 	TMDbID    int    `json:"tmdb_id" gorm:"index"`
 	DoubanID  string `json:"douban_id" gorm:"type:text"`
@@ -115,6 +119,44 @@ func normalizeLibraryPathList(paths []string) []string {
 		normalized = append(normalized, path)
 	}
 	return normalized
+}
+
+// NormalizePathKey applies Windows path identity rules consistently at every
+// database boundary: separators are unified, dot segments are cleaned and
+// comparisons are case-insensitive.
+func NormalizePathKey(value string) string {
+	value = strings.TrimSpace(strings.ReplaceAll(value, "/", "\\"))
+	if value == "" {
+		return ""
+	}
+	value = filepath.Clean(value)
+	volume := filepath.VolumeName(value)
+	root := volume + "\\"
+	if value != root && value != "\\" {
+		value = strings.TrimRight(value, "\\")
+	}
+	return strings.ToLower(value)
+}
+
+// LibraryPathKey returns a stable identity for the complete configured root
+// set. Root order does not create a second logical library.
+func LibraryPathKey(raw string) string {
+	config := ParseLibraryPathConfig(raw)
+	keys := make([]string, 0, len(config.Paths))
+	seen := make(map[string]struct{}, len(config.Paths))
+	for _, root := range config.Paths {
+		key := NormalizePathKey(root)
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, "")
 }
 
 func defaultLibraryPathConfig() LibraryPathConfig {
@@ -231,6 +273,7 @@ type Media struct {
 	Runtime            int        `json:"runtime"`                             // 时长（分钟）
 	Genres             string     `json:"genres" gorm:"type:text"`             // 逗号分隔的类型
 	FilePath           string     `json:"file_path" gorm:"type:text;not null"` // 视频文件绝对路径
+	PathKey            string     `json:"-" gorm:"index;type:text"`
 	FileSize           int64      `json:"file_size"`
 	FileCreatedAt      *time.Time `json:"file_created_at" gorm:"index"`
 	FileModTime        *time.Time `json:"file_mod_time"`
@@ -284,7 +327,7 @@ type Media struct {
 	ThumbnailFingerprint string     `json:"thumbnail_fingerprint" gorm:"type:text"`
 	ThumbnailError       string     `json:"thumbnail_error" gorm:"type:text"`
 	ThumbnailUpdatedAt   *time.Time `json:"thumbnail_updated_at"`
-	SeriesID             string     `json:"series_id" gorm:"index;type:text"`
+	SeriesID             string     `json:"series_id" gorm:"index;type:text;default:null"`
 	SeasonNum            int        `json:"season_num"`
 	EpisodeNum           int        `json:"episode_num"`
 	EpisodeTitle         string     `json:"episode_title" gorm:"type:text"` // 单集标题（如有）
@@ -324,7 +367,7 @@ func (p *Person) BeforeCreate(tx *gorm.DB) error {
 type MediaPerson struct {
 	ID        string `json:"id" gorm:"primaryKey;type:text"`
 	MediaID   string `json:"media_id" gorm:"index;type:text;not null"`
-	SeriesID  string `json:"series_id" gorm:"index;type:text"` // 也可以关联到 Series
+	SeriesID  string `json:"series_id" gorm:"index;type:text;default:null"` // 也可以关联到 Series
 	PersonID  string `json:"person_id" gorm:"index;type:text;not null"`
 	Role      string `json:"role" gorm:"type:text;not null"` // director / actor / writer
 	Character string `json:"character" gorm:"type:text"`     // 饰演角色名
@@ -332,7 +375,8 @@ type MediaPerson struct {
 	// 时间戳
 	CreatedAt time.Time `json:"created_at"`
 
-	Person Person `json:"person" gorm:"foreignKey:PersonID"`
+	Media  Media  `json:"-" gorm:"foreignKey:MediaID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
+	Person Person `json:"person" gorm:"foreignKey:PersonID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
 }
 
 func (mp *MediaPerson) BeforeCreate(tx *gorm.DB) error {
@@ -345,8 +389,8 @@ func (mp *MediaPerson) BeforeCreate(tx *gorm.DB) error {
 // WatchHistory 观看记录
 type WatchHistory struct {
 	ID        string    `json:"id" gorm:"primaryKey;type:text"`
-	UserID    string    `json:"user_id" gorm:"index;type:text;not null"`
-	MediaID   string    `json:"media_id" gorm:"index;type:text;not null"`
+	UserID    string    `json:"user_id" gorm:"index;uniqueIndex:idx_watch_user_media;type:text;not null"`
+	MediaID   string    `json:"media_id" gorm:"index;uniqueIndex:idx_watch_user_media;type:text;not null"`
 	Position  float64   `json:"position"`  // 观看进度（秒）
 	Duration  float64   `json:"duration"`  // 总时长（秒）
 	Completed bool      `json:"completed"` // 是否看完
@@ -360,8 +404,8 @@ type WatchHistory struct {
 // Favorite 收藏
 type Favorite struct {
 	ID        string    `json:"id" gorm:"primaryKey;type:text"`
-	UserID    string    `json:"user_id" gorm:"index;type:text;not null"`
-	MediaID   string    `json:"media_id" gorm:"index;type:text;not null"`
+	UserID    string    `json:"user_id" gorm:"index;uniqueIndex:idx_favorite_user_media;type:text;not null"`
+	MediaID   string    `json:"media_id" gorm:"index;uniqueIndex:idx_favorite_user_media;type:text;not null"`
 	CreatedAt time.Time `json:"created_at"`
 
 	User  User  `json:"-" gorm:"foreignKey:UserID"`
@@ -389,10 +433,25 @@ func (u *User) BeforeCreate(tx *gorm.DB) error {
 	return nil
 }
 
+func (l *Library) BeforeSave(tx *gorm.DB) error {
+	l.PathKey = LibraryPathKey(l.Path)
+	return nil
+}
+
 func (l *Library) BeforeCreate(tx *gorm.DB) error {
 	if l.ID == "" {
 		l.ID = uuid.New().String()
 	}
+	return nil
+}
+
+func (s *Series) BeforeSave(tx *gorm.DB) error {
+	s.FolderPathKey = NormalizePathKey(s.FolderPath)
+	return nil
+}
+
+func (m *Media) BeforeSave(tx *gorm.DB) error {
+	m.PathKey = NormalizePathKey(m.FilePath)
 	return nil
 }
 
@@ -684,18 +743,18 @@ func (mt *MediaTag) BeforeCreate(tx *gorm.DB) error {
 // ShareLink 分享链接
 type ShareLink struct {
 	ID            string     `json:"id" gorm:"primaryKey;type:text"`
-	Code          string     `json:"code" gorm:"uniqueIndex;type:text;not null"` // 短链接码（如 abc123）
-	MediaID       string     `json:"media_id" gorm:"index;type:text"`            // 分享的媒体ID（与SeriesID二选一）
-	SeriesID      string     `json:"series_id" gorm:"index;type:text"`           // 分享的剧集ID
-	CreatedBy     string     `json:"created_by" gorm:"index;type:text;not null"` // 创建者用户ID
-	Title         string     `json:"title" gorm:"type:text"`                     // 分享标题（可自定义）
-	Description   string     `json:"description" gorm:"type:text"`               // 分享描述
-	Password      string     `json:"password,omitempty" gorm:"type:text"`        // 访问密码（可选）
-	MaxViews      int        `json:"max_views" gorm:"default:0"`                 // 最大访问次数（0=不限）
-	ViewCount     int        `json:"view_count" gorm:"default:0"`                // 已访问次数
-	AllowDownload bool       `json:"allow_download" gorm:"default:false"`        // 是否允许下载
-	ExpiresAt     *time.Time `json:"expires_at"`                                 // 过期时间（nil=永不过期）
-	IsActive      bool       `json:"is_active" gorm:"default:true"`              // 是否启用
+	Code          string     `json:"code" gorm:"uniqueIndex;type:text;not null"`    // 短链接码（如 abc123）
+	MediaID       string     `json:"media_id" gorm:"index;type:text;default:null"`  // 分享的媒体ID（与SeriesID二选一）
+	SeriesID      string     `json:"series_id" gorm:"index;type:text;default:null"` // 分享的剧集ID
+	CreatedBy     string     `json:"created_by" gorm:"index;type:text;not null"`    // 创建者用户ID
+	Title         string     `json:"title" gorm:"type:text"`                        // 分享标题（可自定义）
+	Description   string     `json:"description" gorm:"type:text"`                  // 分享描述
+	Password      string     `json:"password,omitempty" gorm:"type:text"`           // 访问密码（可选）
+	MaxViews      int        `json:"max_views" gorm:"default:0"`                    // 最大访问次数（0=不限）
+	ViewCount     int        `json:"view_count" gorm:"default:0"`                   // 已访问次数
+	AllowDownload bool       `json:"allow_download" gorm:"default:false"`           // 是否允许下载
+	ExpiresAt     *time.Time `json:"expires_at"`                                    // 过期时间（nil=永不过期）
+	IsActive      bool       `json:"is_active" gorm:"default:true"`                 // 是否启用
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
 }
@@ -712,17 +771,17 @@ func (sl *ShareLink) BeforeCreate(tx *gorm.DB) error {
 // MatchRule 自定义匹配规则
 type MatchRule struct {
 	ID          string    `json:"id" gorm:"primaryKey;type:text"`
-	Name        string    `json:"name" gorm:"type:text;not null"`            // 规则名称
-	Description string    `json:"description" gorm:"type:text"`              // 规则描述
-	RuleType    string    `json:"rule_type" gorm:"index;type:text;not null"` // 规则类型：filename / path / regex / keyword
-	Pattern     string    `json:"pattern" gorm:"type:text;not null"`         // 匹配模式（正则/关键词/路径模式）
-	Action      string    `json:"action" gorm:"type:text;not null"`          // 动作：set_type / set_genre / set_tag / skip / set_library
-	ActionValue string    `json:"action_value" gorm:"type:text"`             // 动作参数值
-	Priority    int       `json:"priority" gorm:"default:0"`                 // 优先级（数字越大越先执行）
-	Enabled     bool      `json:"enabled" gorm:"default:true"`               // 是否启用
-	LibraryID   string    `json:"library_id" gorm:"index;type:text"`         // 限定媒体库（空=全局）
-	HitCount    int       `json:"hit_count" gorm:"default:0"`                // 命中次数
-	CreatedBy   string    `json:"created_by" gorm:"type:text"`               // 创建者
+	Name        string    `json:"name" gorm:"type:text;not null"`                 // 规则名称
+	Description string    `json:"description" gorm:"type:text"`                   // 规则描述
+	RuleType    string    `json:"rule_type" gorm:"index;type:text;not null"`      // 规则类型：filename / path / regex / keyword
+	Pattern     string    `json:"pattern" gorm:"type:text;not null"`              // 匹配模式（正则/关键词/路径模式）
+	Action      string    `json:"action" gorm:"type:text;not null"`               // 动作：set_type / set_genre / set_tag / skip / set_library
+	ActionValue string    `json:"action_value" gorm:"type:text"`                  // 动作参数值
+	Priority    int       `json:"priority" gorm:"default:0"`                      // 优先级（数字越大越先执行）
+	Enabled     bool      `json:"enabled" gorm:"default:true"`                    // 是否启用
+	LibraryID   string    `json:"library_id" gorm:"index;type:text;default:null"` // 限定媒体库（空=全局）
+	HitCount    int       `json:"hit_count" gorm:"default:0"`                     // 命中次数
+	CreatedBy   string    `json:"created_by" gorm:"type:text"`                    // 创建者
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }

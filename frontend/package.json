@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "test:delete-library": "node --test tests/libraryDeleteOutcome.test.mjs",
+    "test:scan-tasks": "node --test tests/scanTaskEvents.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -85,7 +85,7 @@ func (r *recordingScanBroadcaster) terminalEvents() []recordedScanEvent {
 	var terminal []recordedScanEvent
 	for _, event := range r.events {
 		switch event.eventType {
-		case EventScanCompleted, EventScanIncomplete, EventScanFailed:
+		case EventScanCompleted, EventScanIncomplete, EventScanFailed, EventScanCanceled:
 			terminal = append(terminal, event)
 		}
 	}
@@ -560,6 +560,8 @@ func TestOverwriteFailureDoesNotPoisonNextRefresh(t *testing.T) {
 
 func TestOverwriteCancellationMidScanRollsBack(t *testing.T) {
 	fixture := newOverwriteSafetyFixture(t, "movie", true)
+	recorder := &recordingScanBroadcaster{}
+	fixture.scanner.wsHub = recorder
 	ctx, cancel := context.WithCancel(context.Background())
 	fixture.scanner.walkFileTree = func(root string, walkFn filepath.WalkFunc) error {
 		return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -578,6 +580,10 @@ func TestOverwriteCancellationMidScanRollsBack(t *testing.T) {
 		t.Fatalf("expected canceled overwrite, got %v", err)
 	}
 	assertOverwriteOriginalState(t, fixture)
+	terminal := assertSingleScanTerminal(t, recorder, EventScanCanceled)
+	if terminal.data.Phase != "canceled" {
+		t.Fatalf("expected canceled phase, got %+v", terminal.data)
+	}
 }
 
 func TestOverwriteMetadataParseFailureRollsBack(t *testing.T) {

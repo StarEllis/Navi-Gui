@@ -1,6 +1,8 @@
 package repository
 
 import (
+	"strings"
+
 	"gorm.io/gorm"
 )
 
@@ -116,4 +118,17 @@ func NewRepositories(db *gorm.DB) *Repositories {
 // DB 返回底层数据库连接（供需要直接操作数据库的服务使用）
 func (r *Repositories) DB() *gorm.DB {
 	return r.db
+}
+
+func retryLegacyCreateWithoutPartialIndex(db *gorm.DB, result *gorm.DB, value interface{}) *gorm.DB {
+	if result == nil || result.Error == nil ||
+		!strings.Contains(result.Error.Error(), "ON CONFLICT clause does not match") {
+		return result
+	}
+	var migrationTableCount int64
+	if err := db.Raw("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'").
+		Scan(&migrationTableCount).Error; err != nil || migrationTableCount != 0 {
+		return result
+	}
+	return db.Create(value)
 }

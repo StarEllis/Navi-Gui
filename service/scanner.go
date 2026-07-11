@@ -20,6 +20,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 	"navi-desktop/config"
@@ -207,6 +208,13 @@ type ScannerService struct {
 	metadataNormal            chan metadataCompletionTask
 	metadataMu                sync.Mutex
 	metadataState             map[string]metadataTaskPriority
+	metadataAccepting         bool
+	metadataOwner             *ScannerService
+	metadataWorkerCtx         context.Context
+	metadataWorkerCancel      context.CancelFunc
+	metadataWorkerWG          sync.WaitGroup
+	metadataStopOnce          sync.Once
+	metadataStopDone          chan struct{}
 	thumbnailService          *ThumbnailService
 	thumbnailSettingsProvider ThumbnailSettingsProvider
 	artworkCache              *ArtworkCache
@@ -220,8 +228,10 @@ type ScannerService struct {
 	readFile                  func(string) ([]byte, error)
 	probeMediaFile            func(string) ([]byte, error)
 	scanContext               context.Context
+	scanTaskID                string
 	strictScan                bool
 	deferMetadata             bool
+	deferredMetadataTasks     []metadataCompletionTask
 	deferMediaEvents          bool
 	deferredMediaEvents       []MediaMetadataEventData
 	preparedPreviewCounts     map[string]int
@@ -230,39 +240,81 @@ type ScannerService struct {
 }
 
 func NewScannerService(mediaRepo *repository.MediaRepo, seriesRepo *repository.SeriesRepo, personRepo *repository.PersonRepo, mediaPersonRepo *repository.MediaPersonRepo, cfg *config.Config, logger *zap.SugaredLogger) *ScannerService {
+	workerCtx, workerCancel := context.WithCancel(context.Background())
 	service := &ScannerService{
-		mediaRepo:        mediaRepo,
-		seriesRepo:       seriesRepo,
-		personRepo:       personRepo,
-		mediaPersonRepo:  mediaPersonRepo,
-		cfg:              cfg,
-		logger:           logger,
-		nfoService:       NewNFOService(logger),
-		metadataHighPri:  make(chan metadataCompletionTask, metadataQueueBufferSize),
-		metadataNormal:   make(chan metadataCompletionTask, metadataQueueBufferSize),
-		metadataState:    make(map[string]metadataTaskPriority),
-		thumbnailService: NewThumbnailService(cfg, logger),
-		sidecarCache:     make(map[string]directorySidecarCacheEntry),
-		walkFileTree:     filepath.Walk,
-		statFile:         os.Stat,
-		readDir:          os.ReadDir,
-		readFile:         os.ReadFile,
+		mediaRepo:            mediaRepo,
+		seriesRepo:           seriesRepo,
+		personRepo:           personRepo,
+		mediaPersonRepo:      mediaPersonRepo,
+		cfg:                  cfg,
+		logger:               logger,
+		nfoService:           NewNFOService(logger),
+		metadataHighPri:      make(chan metadataCompletionTask, metadataQueueBufferSize),
+		metadataNormal:       make(chan metadataCompletionTask, metadataQueueBufferSize),
+		metadataState:        make(map[string]metadataTaskPriority),
+		metadataAccepting:    true,
+		metadataWorkerCtx:    workerCtx,
+		metadataWorkerCancel: workerCancel,
+		metadataStopDone:     make(chan struct{}),
+		thumbnailService:     NewThumbnailService(cfg, logger),
+		sidecarCache:         make(map[string]directorySidecarCacheEntry),
+		walkFileTree:         filepath.Walk,
+		statFile:             os.Stat,
+		readDir:              os.ReadDir,
+		readFile:             os.ReadFile,
 	}
 	service.startMetadataWorkers()
 	return service
 }
 
+func (s *ScannerService) cloneForScanContext(ctx context.Context, taskID string) *ScannerService {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return &ScannerService{
+		mediaRepo:                 s.mediaRepo,
+		seriesRepo:                s.seriesRepo,
+		personRepo:                s.personRepo,
+		mediaPersonRepo:           s.mediaPersonRepo,
+		matchRuleRepo:             s.matchRuleRepo,
+		cfg:                       s.cfg,
+		logger:                    s.logger,
+		wsHub:                     s.wsHub,
+		nfoService:                s.nfoService,
+		metadataHighPri:           s.metadataHighPri,
+		metadataNormal:            s.metadataNormal,
+		metadataOwner:             s,
+		thumbnailService:          s.thumbnailService,
+		thumbnailSettingsProvider: s.thumbnailSettingsProvider,
+		artworkCache:              s.artworkCache,
+		gfriendsAvatarService:     s.gfriendsAvatarService,
+		gfriendsAvatarsEnabled:    s.gfriendsAvatarsEnabled,
+		sidecarCache:              make(map[string]directorySidecarCacheEntry),
+		walkFileTree:              s.walkFileTree,
+		statFile:                  s.statFile,
+		readDir:                   s.readDir,
+		readFile:                  s.readFile,
+		probeMediaFile:            s.probeMediaFile,
+		scanContext:               ctx,
+		scanTaskID:                taskID,
+	}
+}
+
 type ScanOptions struct {
-	Mode           string
-	Incremental    bool
-	CleanDeleted   bool
-	UseEverything  bool
-	EverythingAddr string
-	Context        context.Context
+	TaskID           string
+	Mode             string
+	Incremental      bool
+	CleanDeleted     bool
+	UseEverything    bool
+	EverythingAddr   string
+	Context          context.Context
+	SuppressTerminal bool
 }
 
 type OverwriteScanResult struct {
 	Scanned              int
+	TotalTargets         int
+	Cleaned              int
 	DeletedMediaIDs      []string
 	CacheCleanupWarnings []error
 	LastScan             time.Time
@@ -468,9 +520,15 @@ func (s *ScannerService) prepareOverwriteIO(library *model.Library, options Scan
 			if err != nil {
 				return nil, fmt.Errorf("prepare metadata file %s: %w", entry.path, err)
 			}
+			if err := options.Context.Err(); err != nil {
+				return nil, err
+			}
 			prepared.files[nfoPathKey(entry.path)] = data
 			if ext == ".nfo" && s.nfoService != nil {
 				prepared.preparedNFOs[nfoPathKey(entry.path)] = s.nfoService.prepareNFO(entry.path, data, entry.info)
+				if err := options.Context.Err(); err != nil {
+					return nil, err
+				}
 			}
 		}
 		if !supportedExts[ext] {
@@ -488,6 +546,9 @@ func (s *ScannerService) prepareOverwriteIO(library *model.Library, options Scan
 					continue
 				}
 			}
+		}
+		if options.Incremental {
+			continue
 		}
 		if ext == ".strm" {
 			streamURL, err := parseSTRMData(prepared.files[nfoPathKey(entry.path)])
@@ -515,10 +576,17 @@ func (s *ScannerService) prepareOverwriteIO(library *model.Library, options Scan
 	return prepared, nil
 }
 
-// ScanLibraryOverwrite performs the complete overwrite scan against a single
-// database transaction. The live scanner and its cache remain untouched until
-// that transaction commits.
 func (s *ScannerService) ScanLibraryOverwrite(db *gorm.DB, library *model.Library, options ScanOptions) (OverwriteScanResult, error) {
+	options.Mode = "overwrite"
+	options.Incremental = false
+	options.CleanDeleted = true
+	return s.ScanLibraryAtomic(db, library, options)
+}
+
+// ScanLibraryAtomic performs all external I/O before applying the scan in one
+// database transaction. A canceled or failed preparation cannot mutate media
+// state, and a canceled transaction is rolled back by GORM.
+func (s *ScannerService) ScanLibraryAtomic(db *gorm.DB, library *model.Library, options ScanOptions) (OverwriteScanResult, error) {
 	var result OverwriteScanResult
 	var runResult scanRunResult
 	if db == nil {
@@ -527,42 +595,56 @@ func (s *ScannerService) ScanLibraryOverwrite(db *gorm.DB, library *model.Librar
 	if library == nil {
 		return result, fmt.Errorf("library is nil")
 	}
-	options.Mode = "overwrite"
-	options.Incremental = false
-	options.CleanDeleted = true
+	if strings.TrimSpace(options.Mode) == "" {
+		options.Mode = "incremental"
+	}
+	if strings.TrimSpace(options.TaskID) == "" {
+		options.TaskID = uuid.NewString()
+	}
 	if options.Context == nil {
 		options.Context = context.Background()
 	}
-	s.broadcastScanEvent(EventScanStarted, &ScanProgressData{
+	runScanner := s.cloneForScanContext(options.Context, options.TaskID)
+	runScanner.broadcastScanEvent(EventScanStarted, &ScanProgressData{
+		TaskID:      options.TaskID,
 		LibraryID:   library.ID,
 		LibraryName: library.Name,
 		Mode:        options.Mode,
+		Status:      "running",
 		Phase:       "preparing",
-		Message:     fmt.Sprintf("preparing overwrite scan: %s", library.Name),
+		Message:     fmt.Sprintf("preparing scan: %s", library.Name),
 	})
-	prepared, prepareErr := s.prepareOverwriteIO(library, options)
+	prepared, prepareErr := runScanner.prepareOverwriteIO(library, options)
 	if prepareErr != nil {
-		s.broadcastScanTerminal(library, options, runResult, prepareErr)
+		if !options.SuppressTerminal {
+			runScanner.broadcastScanTerminal(library, options, runResult, prepareErr)
+		}
 		return OverwriteScanResult{}, prepareErr
 	}
 	// The prepared snapshot is authoritative for this run. Reaching out to
 	// Everything again here would put network and filesystem I/O back in the tx.
 	options.UseEverything = false
 	var committedMediaEvents []MediaMetadataEventData
+	var committedMetadataTasks []metadataCompletionTask
 
-	err := db.Transaction(func(tx *gorm.DB) error {
+	err := db.WithContext(options.Context).Transaction(func(tx *gorm.DB) error {
+		if err := options.Context.Err(); err != nil {
+			return err
+		}
 		txRepos := repository.NewRepositories(tx)
 		before, err := txRepos.Media.ListIDAndPathByLibrary(library.ID)
 		if err != nil {
 			return fmt.Errorf("load media before overwrite: %w", err)
 		}
 
-		txScanner := s.cloneForAtomicScan(txRepos, options.Context, prepared)
+		txScanner := runScanner.cloneForAtomicScan(txRepos, options.Context, prepared)
 		runResult, err = txScanner.scanLibraryWithOptionsCore(library, options)
 		if err != nil {
 			return err
 		}
 		result.Scanned = runResult.Count
+		result.TotalTargets = runResult.TotalTargets
+		result.Cleaned = runResult.Cleaned
 
 		after, err := txRepos.Media.ListIDAndPathByLibrary(library.ID)
 		if err != nil {
@@ -578,27 +660,38 @@ func (s *ScannerService) ScanLibraryOverwrite(db *gorm.DB, library *model.Librar
 			}
 		}
 		result.LastScan = time.Now().UTC().Truncate(time.Second)
+		if err := options.Context.Err(); err != nil {
+			return err
+		}
 		updatedLibrary := *library
 		updatedLibrary.LastScan = &result.LastScan
 		if err := txRepos.Library.Update(&updatedLibrary); err != nil {
 			return fmt.Errorf("update library last scan: %w", err)
 		}
 		committedMediaEvents = append(committedMediaEvents, txScanner.deferredMediaEvents...)
-		return nil
+		committedMetadataTasks = append(committedMetadataTasks, txScanner.deferredMetadataTasks...)
+		return options.Context.Err()
 	})
 	if err != nil {
-		s.broadcastScanTerminal(library, options, runResult, err)
+		if !options.SuppressTerminal {
+			runScanner.broadcastScanTerminal(library, options, runResult, err)
+		}
 		return OverwriteScanResult{}, err
 	}
 	for _, event := range committedMediaEvents {
-		s.broadcastMediaMetadataEvent(event.MediaID, event.LibraryID, event.MetadataPhase, event.Message)
+		runScanner.broadcastMediaMetadataEvent(event.MediaID, event.LibraryID, event.MetadataPhase, event.Message)
 	}
-	s.broadcastScanTerminal(library, options, runResult, nil)
+	for _, task := range committedMetadataTasks {
+		s.enqueueMetadataCompletion(task.MediaID, task.LibraryID, task.Priority)
+	}
+	if !options.SuppressTerminal {
+		runScanner.broadcastScanTerminal(library, options, runResult, nil)
+	}
 
-	if s.artworkCache != nil {
+	if runScanner.artworkCache != nil {
 		for _, mediaID := range result.DeletedMediaIDs {
-			if cacheErr := s.artworkCache.RemoveMedia(mediaID); cacheErr != nil {
-				s.logger.Warnf("overwrite committed but artwork cache cleanup failed: media=%s err=%v", mediaID, cacheErr)
+			if cacheErr := runScanner.artworkCache.RemoveMedia(mediaID); cacheErr != nil {
+				runScanner.logger.Warnf("scan committed but artwork cache cleanup failed: media=%s err=%v", mediaID, cacheErr)
 				result.CacheCleanupWarnings = append(result.CacheCleanupWarnings, cacheErr)
 			}
 		}
@@ -607,6 +700,10 @@ func (s *ScannerService) ScanLibraryOverwrite(db *gorm.DB, library *model.Librar
 }
 
 func (s *ScannerService) cloneForAtomicScan(repos *repository.Repositories, ctx context.Context, prepared *preparedOverwriteIO) *ScannerService {
+	metadataOwner := s
+	if s.metadataOwner != nil {
+		metadataOwner = s.metadataOwner
+	}
 	clone := &ScannerService{
 		mediaRepo:                 repos.Media,
 		seriesRepo:                repos.Series,
@@ -618,6 +715,7 @@ func (s *ScannerService) cloneForAtomicScan(repos *repository.Repositories, ctx 
 		nfoService:                s.nfoService,
 		metadataHighPri:           s.metadataHighPri,
 		metadataNormal:            s.metadataNormal,
+		metadataOwner:             metadataOwner,
 		metadataState:             make(map[string]metadataTaskPriority),
 		thumbnailService:          s.thumbnailService,
 		thumbnailSettingsProvider: s.thumbnailSettingsProvider,
@@ -628,6 +726,7 @@ func (s *ScannerService) cloneForAtomicScan(repos *repository.Repositories, ctx 
 		readFile:                  prepared.readFile,
 		preparedProbes:            prepared.probes,
 		scanContext:               ctx,
+		scanTaskID:                s.scanTaskID,
 		strictScan:                true,
 		deferMetadata:             true,
 		deferMediaEvents:          true,
@@ -767,6 +866,7 @@ func (s *ScannerService) read(path string) ([]byte, error) {
 }
 
 type scanProgressTracker struct {
+	taskID  string
 	mode    string
 	total   int
 	current int
@@ -1562,9 +1662,16 @@ func shouldRefreshExistingMovieMediaWithStat(options ScanOptions, signature repo
 }
 
 func (s *ScannerService) ScanLibraryWithOptions(library *model.Library, options ScanOptions) (int, error) {
-	result, err := s.scanLibraryWithOptionsCore(library, options)
-	if library != nil {
-		s.broadcastScanTerminal(library, options, result, err)
+	if strings.TrimSpace(options.TaskID) == "" {
+		options.TaskID = uuid.NewString()
+	}
+	if options.Context == nil {
+		options.Context = context.Background()
+	}
+	runScanner := s.cloneForScanContext(options.Context, options.TaskID)
+	result, err := runScanner.scanLibraryWithOptionsCore(library, options)
+	if library != nil && !options.SuppressTerminal {
+		runScanner.broadcastScanTerminal(library, options, result, err)
 	}
 	return result.Count, err
 }
@@ -1591,9 +1698,11 @@ func (s *ScannerService) scanLibraryWithOptionsCore(library *model.Library, opti
 
 	if !s.scanStartAlreadyBroadcast {
 		s.broadcastScanEvent(EventScanStarted, &ScanProgressData{
+			TaskID:      options.TaskID,
 			LibraryID:   library.ID,
 			LibraryName: library.Name,
 			Mode:        options.Mode,
+			Status:      "running",
 			Phase:       "scanning",
 			Total:       totalTargets,
 			Message:     fmt.Sprintf("start scanning: %s", library.Name),
@@ -1699,15 +1808,19 @@ func (s *ScannerService) broadcastScanTerminal(library *model.Library, options S
 	}
 
 	s.broadcastScanEvent(eventType, &ScanProgressData{
-		LibraryID:   library.ID,
-		LibraryName: library.Name,
-		Mode:        options.Mode,
-		Phase:       phase,
-		NewFound:    result.Count,
-		Current:     result.TotalTargets,
-		Total:       result.TotalTargets,
-		Cleaned:     result.Cleaned,
-		Message:     message,
+		TaskID:       options.TaskID,
+		LibraryID:    library.ID,
+		LibraryName:  library.Name,
+		Mode:         options.Mode,
+		Status:       phase,
+		Phase:        phase,
+		FailureStage: scanFailureStage(scanErr),
+		Retryable:    scanErr != nil && !errors.Is(scanErr, context.Canceled),
+		NewFound:     result.Count,
+		Current:      result.TotalTargets,
+		Total:        result.TotalTargets,
+		Cleaned:      result.Cleaned,
+		Message:      message,
 	})
 	s.logger.Infof("scan finished: %s, new=%d, cleaned=%d, err=%v", library.Name, result.Count, result.Cleaned, scanErr)
 }
@@ -1716,10 +1829,46 @@ func scanTerminalEvent(err error) string {
 	if err == nil {
 		return EventScanCompleted
 	}
+	if errors.Is(err, context.Canceled) {
+		return EventScanCanceled
+	}
 	if IsScanIncomplete(err) {
 		return EventScanIncomplete
 	}
 	return EventScanFailed
+}
+
+func scanFailureStage(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	if IsScanIncomplete(err) {
+		return "enumeration"
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "ffprobe"), strings.Contains(message, "probe media"):
+		return "ffprobe"
+	case strings.Contains(message, "nfo"), strings.Contains(message, "metadata"):
+		return "metadata"
+	case strings.Contains(message, "strm"):
+		return "strm"
+	case strings.Contains(message, "transaction"), strings.Contains(message, "database"), strings.Contains(message, "last scan"):
+		return "database"
+	default:
+		return "scan"
+	}
+}
+
+func (s *ScannerService) BroadcastScanTerminal(library *model.Library, options ScanOptions, scanned int, total int, cleaned int, scanErr error) {
+	s.broadcastScanTerminal(library, options, scanRunResult{
+		Count:        scanned,
+		TotalTargets: total,
+		Cleaned:      cleaned,
+	}, scanErr)
 }
 
 func (s *ScannerService) SetMatchRuleRepo(repo *repository.MatchRuleRepo) {
@@ -1811,8 +1960,16 @@ func (s *ScannerService) startMetadataWorkers() {
 	}
 
 	for i := 0; i < workers; i++ {
-		go s.metadataWorkerLoop()
+		s.metadataWorkerWG.Add(1)
+		go func() {
+			defer s.metadataWorkerWG.Done()
+			s.metadataWorkerLoop()
+		}()
 	}
+	go func() {
+		s.metadataWorkerWG.Wait()
+		close(s.metadataStopDone)
+	}()
 }
 
 func (s *ScannerService) metadataWorkerLoop() {
@@ -1820,14 +1977,21 @@ func (s *ScannerService) metadataWorkerLoop() {
 		var task metadataCompletionTask
 
 		select {
+		case <-s.metadataWorkerCtx.Done():
+			return
 		case task = <-s.metadataHighPri:
 		default:
 			select {
+			case <-s.metadataWorkerCtx.Done():
+				return
 			case task = <-s.metadataHighPri:
 			case task = <-s.metadataNormal:
 			}
 		}
 
+		if s.metadataWorkerCtx.Err() != nil {
+			return
+		}
 		s.runMetadataCompletionTask(task)
 	}
 }
@@ -1845,11 +2009,34 @@ func (s *ScannerService) enqueueMetadataCompletion(mediaID string, libraryID str
 	if mediaID == "" {
 		return false
 	}
+	task := metadataCompletionTask{
+		MediaID:   mediaID,
+		LibraryID: libraryID,
+		Priority:  priority,
+	}
 	if s.deferMetadata {
+		s.deferredMetadataTasks = append(s.deferredMetadataTasks, task)
 		return true
+	}
+	if s.metadataOwner != nil {
+		return s.metadataOwner.enqueueMetadataCompletion(mediaID, libraryID, priority)
+	}
+	if s.metadataWorkerCtx != nil {
+		select {
+		case <-s.metadataWorkerCtx.Done():
+			return false
+		default:
+		}
 	}
 
 	s.metadataMu.Lock()
+	if !s.metadataAccepting {
+		s.metadataMu.Unlock()
+		return false
+	}
+	if s.metadataState == nil {
+		s.metadataState = make(map[string]metadataTaskPriority)
+	}
 	current, exists := s.metadataState[mediaID]
 	switch {
 	case !exists:
@@ -1865,19 +2052,54 @@ func (s *ScannerService) enqueueMetadataCompletion(mediaID string, libraryID str
 	}
 	s.metadataMu.Unlock()
 
-	task := metadataCompletionTask{
-		MediaID:   mediaID,
-		LibraryID: libraryID,
-		Priority:  priority,
-	}
-
+	queue := s.metadataNormal
 	if priority == metadataTaskPriorityHigh {
-		s.metadataHighPri <- task
-		return true
+		queue = s.metadataHighPri
 	}
+	if queue == nil {
+		s.metadataMu.Lock()
+		delete(s.metadataState, mediaID)
+		s.metadataMu.Unlock()
+		return false
+	}
+	select {
+	case queue <- task:
+		return true
+	case <-contextDone(s.scanContext):
+	case <-contextDone(s.metadataWorkerCtx):
+	}
+	s.metadataMu.Lock()
+	delete(s.metadataState, mediaID)
+	s.metadataMu.Unlock()
+	return false
+}
 
-	s.metadataNormal <- task
-	return true
+func contextDone(ctx context.Context) <-chan struct{} {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Done()
+}
+
+func (s *ScannerService) Shutdown(ctx context.Context) error {
+	if s == nil || s.metadataWorkerCancel == nil {
+		return nil
+	}
+	s.metadataStopOnce.Do(func() {
+		s.metadataMu.Lock()
+		s.metadataAccepting = false
+		s.metadataMu.Unlock()
+		s.metadataWorkerCancel()
+	})
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-s.metadataStopDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (s *ScannerService) runMetadataCompletionTask(task metadataCompletionTask) {
@@ -2572,7 +2794,7 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 					continue
 				}
 
-				existing, findErr := s.mediaRepo.FindByFilePath(mediaPath)
+				existing, findErr := s.mediaRepo.FindByFilePathInLibrary(library.ID, mediaPath)
 				if findErr != nil || existing == nil {
 					if s.strictScan && findErr != nil {
 						return count, result, fmt.Errorf("load existing movie %s: %w", mediaPath, findErr)
@@ -2598,7 +2820,7 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 		}
 
 		if options.Mode == "delete_update" && existingSignatures == nil {
-			existing, findErr := s.mediaRepo.FindByFilePath(mediaPath)
+			existing, findErr := s.mediaRepo.FindByFilePathInLibrary(library.ID, mediaPath)
 			if findErr == nil && existing != nil {
 				sidecars := getSidecars(mediaPath)
 				updated, refreshErr := s.refreshExistingMovieMedia(library, existing, mediaPath, info, sidecars, true)
@@ -2739,17 +2961,30 @@ type pendingMedia struct {
 const mediaProbeTimeout = 30 * time.Second
 const mediaTranscodeTimeout = 2 * time.Minute
 
-func newBackgroundCommand(timeout time.Duration, executable string, args ...string) (*exec.Cmd, context.CancelFunc) {
-	if timeout <= 0 {
-		cmd := exec.Command(executable, args...)
-		configureBackgroundCommand(cmd)
-		return cmd, func() {}
+func newBackgroundCommand(parent context.Context, timeout time.Duration, executable string, args ...string) (*exec.Cmd, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx := parent
+	cancel := func() {}
+	if timeout <= 0 {
+		ctx, cancel = context.WithCancel(parent)
+	} else {
+		ctx, cancel = context.WithTimeout(parent, timeout)
+	}
 	cmd := exec.CommandContext(ctx, executable, args...)
 	configureBackgroundCommand(cmd)
 	return cmd, cancel
+}
+
+func (s *ScannerService) commandContext() context.Context {
+	if s != nil && s.scanContext != nil {
+		return s.scanContext
+	}
+	if s != nil && s.metadataWorkerCtx != nil {
+		return s.metadataWorkerCtx
+	}
+	return context.Background()
 }
 
 // parallelProbe 使用 Worker Pool 并行执行 FFprobe 探测
@@ -2767,24 +3002,38 @@ func (s *ScannerService) parallelProbe(items []pendingMedia) {
 		index int
 	}
 
-	jobs := make(chan probeJob, len(items))
+	ctx := s.commandContext()
+	jobs := make(chan probeJob, workers)
 	var wg sync.WaitGroup
 
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for job := range jobs {
-				media := items[job.index].media
-				if err := s.probeMediaInfo(media); err != nil {
-					s.logger.Warnf("media probe failed: path=%s stage=%v", media.FilePath, err)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case job, ok := <-jobs:
+					if !ok {
+						return
+					}
+					media := items[job.index].media
+					if err := s.probeMediaInfo(media); err != nil && !errors.Is(err, context.Canceled) {
+						s.logger.Warnf("media probe failed: path=%s stage=%v", media.FilePath, err)
+					}
 				}
 			}
 		}()
 	}
 
+enqueue:
 	for i := range items {
-		jobs <- probeJob{index: i}
+		select {
+		case <-ctx.Done():
+			break enqueue
+		case jobs <- probeJob{index: i}:
+		}
 	}
 	close(jobs)
 	wg.Wait()
@@ -3011,7 +3260,7 @@ func (s *ScannerService) scanMixedLibrary(library *model.Library) (int, *scanRoo
 				return nil
 			}
 			result.addFile(path)
-			if existing, err := s.mediaRepo.FindByFilePath(path); err == nil {
+			if existing, err := s.mediaRepo.FindByFilePathInLibrary(library.ID, path); err == nil {
 				s.requestMetadataCompletionIfNeeded(existing)
 				return nil // 已存在
 			} else if s.strictScan && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -3057,7 +3306,7 @@ func (s *ScannerService) scanMixedLibrary(library *model.Library) (int, *scanRoo
 		}
 		filePath := filepath.Join(library.Path, entry.Name())
 		result.addFile(filePath)
-		if existing, err := s.mediaRepo.FindByFilePath(filePath); err == nil {
+		if existing, err := s.mediaRepo.FindByFilePathInLibrary(library.ID, filePath); err == nil {
 			s.requestMetadataCompletionIfNeeded(existing)
 			continue // 已存在
 		} else if s.strictScan && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -3301,7 +3550,7 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, *scanRo
 			if supportedExts[ext] {
 				filePath := filepath.Join(library.Path, entry.Name())
 				result.addFile(filePath)
-				if existing, err := s.mediaRepo.FindByFilePath(filePath); err == nil {
+				if existing, err := s.mediaRepo.FindByFilePathInLibrary(library.ID, filePath); err == nil {
 					s.requestMetadataCompletionIfNeeded(existing)
 					continue // 已存在
 				} else if s.strictScan && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -3429,7 +3678,7 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, *scanRo
 		// 使用"__loose__:系列名"作为虚拟文件夹路径来区分
 		virtualFolderPath := filepath.Join(library.Path, "__loose__:"+actualSeriesName)
 
-		series, err := s.seriesRepo.FindByFolderPath(virtualFolderPath)
+		series, err := s.seriesRepo.FindByFolderPathInLibrary(library.ID, virtualFolderPath)
 		if err != nil {
 			series = &model.Series{
 				LibraryID:  library.ID,
@@ -3590,7 +3839,7 @@ func (s *ScannerService) scanMultiSeasonSeries(library *model.Library, seriesTit
 		if err := s.checkScanCanceled(); err != nil {
 			return 0, err
 		}
-		if existing, err := s.seriesRepo.FindByFolderPath(f.path); err == nil {
+		if existing, err := s.seriesRepo.FindByFolderPathInLibrary(library.ID, f.path); err == nil {
 			series = existing
 			break
 		}
@@ -3755,7 +4004,7 @@ func (s *ScannerService) scanMultiSeasonSeries(library *model.Library, seriesTit
 			// 检查是否已存在，如果存在则修正可能的脏数据（如 episode_title、season_num、episode_num）
 			epAdjusted := ep
 			epAdjusted.SeasonNum = seasonNum
-			if existing, err := s.mediaRepo.FindByFilePath(ep.FilePath); err == nil {
+			if existing, err := s.mediaRepo.FindByFilePathInLibrary(library.ID, ep.FilePath); err == nil {
 				seasonSet[seasonNum] = true
 				if _, updateErr := s.updateExistingEpisodeRecord(existing, series.ID, seriesTitle, epAdjusted); updateErr != nil && s.strictScan {
 					return totalNewCount, fmt.Errorf("update existing episode %s: %w", ep.FilePath, updateErr)
@@ -3827,7 +4076,7 @@ func (s *ScannerService) scanSeriesFolder(library *model.Library, folderPath, se
 	s.logger.Infof("扫描剧集: %s (%s)", seriesTitle, folderPath)
 
 	// 查找或创建剧集合集条目
-	series, err := s.seriesRepo.FindByFolderPath(folderPath)
+	series, err := s.seriesRepo.FindByFolderPathInLibrary(library.ID, folderPath)
 	if err != nil {
 		// 新剧集，创建合集条目
 		series = &model.Series{
@@ -3905,7 +4154,7 @@ func (s *ScannerService) scanSeriesFolder(library *model.Library, folderPath, se
 			return newCount, err
 		}
 		// 检查是否已存在，如果存在则修正可能的脏数据
-		if existing, err := s.mediaRepo.FindByFilePath(ep.FilePath); err == nil {
+		if existing, err := s.mediaRepo.FindByFilePathInLibrary(library.ID, ep.FilePath); err == nil {
 			seasonSet[ep.SeasonNum] = true
 			if _, updateErr := s.updateExistingEpisodeRecord(existing, series.ID, seriesTitle, ep); updateErr != nil && s.strictScan {
 				return newCount, fmt.Errorf("update existing episode %s: %w", ep.FilePath, updateErr)
@@ -4406,6 +4655,17 @@ func (s *ScannerService) extractSeriesTitle(folderName string) string {
 
 // broadcastScanEvent 广播扫描事件
 func (s *ScannerService) broadcastScanEvent(eventType string, data *ScanProgressData) {
+	if data != nil {
+		if data.TaskID == "" {
+			data.TaskID = s.scanTaskID
+		}
+		if data.Status == "" {
+			switch eventType {
+			case EventScanStarted, EventScanProgress:
+				data.Status = "running"
+			}
+		}
+	}
 	if data != nil && data.LibraryID != "" {
 		switch eventType {
 		case EventScanStarted:
@@ -4414,7 +4674,7 @@ func (s *ScannerService) broadcastScanEvent(eventType string, data *ScanProgress
 			if !shouldBroadcastScanProgress(data) {
 				return
 			}
-		case EventScanCompleted, EventScanIncomplete, EventScanFailed:
+		case EventScanCompleted, EventScanIncomplete, EventScanFailed, EventScanCanceled:
 			defer resetScanProgressThrottle(data.LibraryID)
 		}
 	}
@@ -4481,8 +4741,9 @@ func (s *ScannerService) beginScanProgress(library *model.Library, mode string, 
 
 	scanProgressStateStore.Lock()
 	scanProgressStateStore.items[library.ID] = &scanProgressTracker{
-		mode:  mode,
-		total: total,
+		taskID: s.scanTaskID,
+		mode:   mode,
+		total:  total,
 	}
 	scanProgressStateStore.Unlock()
 }
@@ -4530,6 +4791,7 @@ func (s *ScannerService) advanceScanProgress(library *model.Library, message str
 	scanProgressStateStore.Unlock()
 
 	s.broadcastScanEvent(EventScanProgress, &ScanProgressData{
+		TaskID:      tracker.taskID,
 		LibraryID:   library.ID,
 		LibraryName: library.Name,
 		Mode:        mode,
@@ -4610,7 +4872,10 @@ func isPathWithinRoot(path string, root string) bool {
 	return os.IsPathSeparator(path[len(root)])
 }
 
-func (s *ScannerService) listMovieEntriesWithEverything(library *model.Library, addr string, result *scanRootResult) ([]scanMediaEntry, error) {
+func (s *ScannerService) listMovieEntriesWithEverything(ctx context.Context, library *model.Library, addr string, result *scanRootResult) ([]scanMediaEntry, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	addr = normalizeEverythingAddr(addr)
 	if library == nil || addr == "" {
 		return nil, fmt.Errorf("everything address is empty")
@@ -4627,6 +4892,9 @@ func (s *ScannerService) listMovieEntriesWithEverything(library *model.Library, 
 	seen := make(map[string]bool)
 	entries := make([]scanMediaEntry, 0)
 	for _, rootPath := range rootPaths {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		rootPath = filepath.Clean(strings.TrimSpace(rootPath))
 		if rootPath == "" {
 			continue
@@ -4643,6 +4911,9 @@ func (s *ScannerService) listMovieEntriesWithEverything(library *model.Library, 
 		receivedResults := 0
 		expectedResults := 0
 		for offset := 0; ; offset += pageSize {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			params := url.Values{}
 			params.Set("json", "1")
 			params.Set("path_column", "1")
@@ -4651,7 +4922,11 @@ func (s *ScannerService) listMovieEntriesWithEverything(library *model.Library, 
 			params.Set("offset", strconv.Itoa(offset))
 			params.Set("search", query)
 
-			resp, err := client.Get(addr + "/?" + params.Encode())
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, addr+"/?"+params.Encode(), nil)
+			if err != nil {
+				return nil, err
+			}
+			resp, err := client.Do(req)
 			if err != nil {
 				return nil, err
 			}
@@ -4678,6 +4953,9 @@ func (s *ScannerService) listMovieEntriesWithEverything(library *model.Library, 
 			receivedResults += len(payload.Results)
 
 			for _, item := range payload.Results {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				if !strings.EqualFold(strings.TrimSpace(item.Type), "file") {
 					continue
 				}
@@ -4739,6 +5017,9 @@ func (s *ScannerService) listMovieEntriesWithWalk(library *model.Library, result
 		}
 
 		err := s.walk(rootPath, func(path string, info os.FileInfo, walkErr error) error {
+			if err := s.checkScanCanceled(); err != nil {
+				return err
+			}
 			if walkErr != nil {
 				s.logger.Warnf("visit file failed: %s, err=%v", path, walkErr)
 				return walkErr
@@ -4777,6 +5058,9 @@ func (s *ScannerService) listMovieEntriesWithWalk(library *model.Library, result
 			return nil
 		})
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, err
+			}
 			return nil, &ScanIncompleteError{Root: rootPath, Err: err}
 		}
 	}
@@ -4789,9 +5073,12 @@ func (s *ScannerService) listMovieEntriesWithWalk(library *model.Library, result
 
 func (s *ScannerService) listMovieEntries(library *model.Library, options ScanOptions, result *scanRootResult) ([]scanMediaEntry, error) {
 	if options.UseEverything {
-		entries, err := s.listMovieEntriesWithEverything(library, options.EverythingAddr, result)
+		entries, err := s.listMovieEntriesWithEverything(options.Context, library, options.EverythingAddr, result)
 		if err == nil {
 			return entries, nil
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
 		}
 		s.logger.Warnf("list movie entries via Everything HTTP failed, fallback to walk: library=%s err=%v", library.Name, err)
 	}
@@ -4874,7 +5161,7 @@ func (s *ScannerService) runMediaProbe(mediaPath string) ([]byte, error) {
 	if s.cfg == nil || strings.TrimSpace(s.cfg.App.FFprobePath) == "" {
 		return nil, fmt.Errorf("ffprobe configuration is unavailable")
 	}
-	cmd, cancel := newBackgroundCommand(mediaProbeTimeout, s.cfg.App.FFprobePath,
+	cmd, cancel := newBackgroundCommand(s.commandContext(), mediaProbeTimeout, s.cfg.App.FFprobePath,
 		"-v", "quiet",
 		"-print_format", "json",
 		"-show_format",
@@ -4952,7 +5239,7 @@ func (s *ScannerService) applyFFprobeOutput(media *model.Media, output []byte) e
 
 // GetSubtitleTracks 获取媒体文件的内嵌字幕轨道列表
 func (s *ScannerService) GetSubtitleTracks(filePath string) ([]SubtitleTrack, error) {
-	cmd, cancel := newBackgroundCommand(mediaProbeTimeout, s.cfg.App.FFprobePath,
+	cmd, cancel := newBackgroundCommand(s.commandContext(), mediaProbeTimeout, s.cfg.App.FFprobePath,
 		"-v", "quiet",
 		"-print_format", "json",
 		"-show_streams",
@@ -5007,7 +5294,7 @@ func (s *ScannerService) ExtractSubtitle(filePath string, streamIndex int, outpu
 		return outputPath, nil
 	}
 
-	cmd, cancel := newBackgroundCommand(mediaTranscodeTimeout, s.cfg.App.FFmpegPath,
+	cmd, cancel := newBackgroundCommand(s.commandContext(), mediaTranscodeTimeout, s.cfg.App.FFmpegPath,
 		"-y",
 		"-i", filePath,
 		"-map", fmt.Sprintf("0:%d", streamIndex),
@@ -5307,7 +5594,7 @@ func (s *ScannerService) ConvertSubtitleToVTT(subtitlePath string) (string, erro
 	}
 
 	// 使用FFmpeg将字幕转换为WebVTT
-	cmd, cancel := newBackgroundCommand(mediaTranscodeTimeout, s.cfg.App.FFmpegPath,
+	cmd, cancel := newBackgroundCommand(s.commandContext(), mediaTranscodeTimeout, s.cfg.App.FFmpegPath,
 		"-y",
 		"-i", subtitlePath,
 		"-c:s", "webvtt",
