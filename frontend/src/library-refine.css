@@ -657,8 +657,8 @@ body {
   display: inline-block;
 }
 
-.workspace-action-btn:hover,
-.workspace-icon-btn:hover,
+.workspace-action-btn:hover:not(:disabled),
+.workspace-icon-btn:hover:not(:disabled),
 .workspace-menu-shell.open .workspace-action-btn {
   background: rgba(255, 255, 255, 0.08);
   border-color: rgba(255, 255, 255, 0.12);
@@ -672,6 +672,12 @@ body {
 
 .workspace-action-btn.compact {
   padding-right: 10px;
+}
+
+.workspace-action-btn:disabled,
+.workspace-dropdown-item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .workspace-icon-btn {
@@ -730,7 +736,7 @@ body {
   cursor: pointer;
 }
 
-.workspace-dropdown-item:hover,
+.workspace-dropdown-item:hover:not(:disabled),
 .workspace-dropdown-item.active {
   background: rgba(255, 255, 255, 0.06);
 }

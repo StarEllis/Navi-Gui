@@ -120,12 +120,12 @@ func TestSaveEditorDataDoesNotTreatNamespacedExtensionsAsStandardFields(t *testi
 	if !bytes.Contains(saved, []byte(`<title>Updated standard title</title>`)) {
 		t.Fatalf("standard title was not updated: %s", saved)
 	}
-	media := &model.Media{Title: "Database title"}
-	if err := service.ParseMovieNFO(path, media); err != nil {
-		t.Fatalf("parse namespaced NFO: %v", err)
+	editorData, err := service.LoadEditorData(path, &model.Media{Title: "Database title"})
+	if err != nil {
+		t.Fatalf("load namespaced NFO for editing: %v", err)
 	}
-	if media.Title != "Updated standard title" {
-		t.Fatalf("namespaced extension overrode standard title: %q", media.Title)
+	if editorData.Title != "Updated standard title" {
+		t.Fatalf("namespaced extension overrode standard editor title: %q", editorData.Title)
 	}
 
 	metadata, err := service.GetActorMetadataFromNFO(path)
@@ -328,7 +328,7 @@ func TestInvalidXMLDoesNotClearExistingMetadata(t *testing.T) {
 	}
 }
 
-func TestParseMovieNFOFieldPresenceDistinguishesMissingAndEmpty(t *testing.T) {
+func TestParseMovieNFOMatchesMainMissingAndEmptyBehavior(t *testing.T) {
 	service := NewNFOService(zap.NewNop().Sugar())
 	media := &model.Media{Title: "Existing", Overview: "Existing plot", Rating: 8, Genres: "Existing genre", Studio: "Existing studio"}
 	missingPath := writeTempNFO(t, `<movie><tagline>Only supplied field</tagline></movie>`)
@@ -343,12 +343,12 @@ func TestParseMovieNFOFieldPresenceDistinguishesMissingAndEmpty(t *testing.T) {
 	if err := service.ParseMovieNFO(emptyPath, media); err != nil {
 		t.Fatalf("parse NFO with explicit empty fields: %v", err)
 	}
-	if media.Title != "" || media.Overview != "" || media.Rating != 0 || media.Genres != "" || media.Studio != "" {
-		t.Fatalf("explicit empty fields did not clear existing values: %+v", media)
+	if media.Title != "Existing" || media.Overview != "Existing plot" || media.Rating != 8 || media.Genres != "" || media.Studio != "Existing studio" {
+		t.Fatalf("explicit empty fields did not match main parser behavior: %+v", media)
 	}
 }
 
-func TestParseMovieNFOUpdatesAuthoritativeDerivedFields(t *testing.T) {
+func TestParseMovieNFOKeepsExistingDerivedFields(t *testing.T) {
 	service := NewNFOService(zap.NewNop().Sugar())
 	media := &model.Media{
 		FilePath: "C:/media/OLD-001.mp4",
@@ -360,16 +360,16 @@ func TestParseMovieNFOUpdatesAuthoritativeDerivedFields(t *testing.T) {
 	if err := service.ParseMovieNFO(path, media); err != nil {
 		t.Fatalf("parse updated derived fields: %v", err)
 	}
-	if media.Code != "NEW-002" || media.CodePrefix != "NEW" || media.Maker != "New maker" || media.Label != "New publisher" {
-		t.Fatalf("derived fields remained stale: %+v", media)
+	if media.Code != "OLD-001" || media.CodePrefix != "OLD" || media.Maker != "Old maker" || media.Label != "Old publisher" {
+		t.Fatalf("scan parser replaced existing derived fields: %+v", media)
 	}
 
 	emptyPath := writeTempNFO(t, `<movie><num/><maker/><publisher/></movie>`)
 	if err := service.ParseMovieNFO(emptyPath, media); err != nil {
 		t.Fatalf("parse cleared derived fields: %v", err)
 	}
-	if media.Code != "" || media.CodePrefix != "" || media.Maker != "" || media.Label != "" {
-		t.Fatalf("explicit empty derived fields were not cleared: %+v", media)
+	if media.Code != "OLD-001" || media.CodePrefix != "OLD" || media.Maker != "Old maker" || media.Label != "Old publisher" {
+		t.Fatalf("explicit empty derived fields replaced existing values: %+v", media)
 	}
 }
 

@@ -52,36 +52,6 @@ export namespace main {
 	        this.warning = source["warning"];
 	    }
 	}
-	export class ScanTaskInfo {
-	    task_id: string;
-	    library_id: string;
-	    library_name: string;
-	    mode: string;
-	    status: string;
-	    failure_stage?: string;
-	    error?: string;
-	    retryable: boolean;
-	    started_at: any;
-	    finished_at?: any;
-
-	    static createFrom(source: any = {}) {
-	        return new ScanTaskInfo(source);
-	    }
-
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.task_id = source["task_id"];
-	        this.library_id = source["library_id"];
-	        this.library_name = source["library_name"];
-	        this.mode = source["mode"];
-	        this.status = source["status"];
-	        this.failure_stage = source["failure_stage"];
-	        this.error = source["error"];
-	        this.retryable = source["retryable"];
-	        this.started_at = source["started_at"];
-	        this.finished_at = source["finished_at"];
-	    }
-	}
 	export class DesktopSettings {
 	    player_path: string;
 	    use_external_player: boolean;
@@ -182,6 +152,56 @@ export namespace main {
 	        this.detail = this.convertValues(source["detail"], model.Media);
 	        this.files = source["files"];
 	        this.previews = source["previews"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class ScanTaskInfo {
+	    task_id: string;
+	    library_id: string;
+	    library_name: string;
+	    mode: string;
+	    status: string;
+	    failure_stage?: string;
+	    error?: string;
+	    retryable: boolean;
+	    // Go type: time
+	    started_at: any;
+	    // Go type: time
+	    finished_at?: any;
+
+	    static createFrom(source: any = {}) {
+	        return new ScanTaskInfo(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.task_id = source["task_id"];
+	        this.library_id = source["library_id"];
+	        this.library_name = source["library_name"];
+	        this.mode = source["mode"];
+	        this.status = source["status"];
+	        this.failure_stage = source["failure_stage"];
+	        this.error = source["error"];
+	        this.retryable = source["retryable"];
+	        this.started_at = this.convertValues(source["started_at"], null);
+	        this.finished_at = this.convertValues(source["finished_at"], null);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -616,35 +636,6 @@ export namespace repository {
 
 export namespace service {
 
-	export class ThumbnailTaskEventData {
-	    task_id: string;
-	    media_id: string;
-	    library_id: string;
-	    path: string;
-	    type: string;
-	    status: string;
-	    phase: string;
-	    message: string;
-	    retryable: boolean;
-
-	    static createFrom(source: any = {}) {
-	        return new ThumbnailTaskEventData(source);
-	    }
-
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.task_id = source["task_id"];
-	        this.media_id = source["media_id"];
-	        this.library_id = source["library_id"];
-	        this.path = source["path"];
-	        this.type = source["type"];
-	        this.status = source["status"];
-	        this.phase = source["phase"];
-	        this.message = source["message"];
-	        this.retryable = source["retryable"];
-	    }
-	}
-	
 	export class RelatedMediaItem {
 	    media: model.Media;
 	    reason: string;
@@ -733,7 +724,7 @@ export namespace service {
 	    video_codec: string;
 	    rating: string;
 	    source_fingerprint: string;
-	    updated_fields: Array<string>;
+	    updated_fields: string[];
 	
 	    static createFrom(source: any = {}) {
 	        return new NFOEditorData(source);
@@ -759,6 +750,35 @@ export namespace service {
 	        this.rating = source["rating"];
 	        this.source_fingerprint = source["source_fingerprint"];
 	        this.updated_fields = source["updated_fields"];
+	    }
+	}
+
+	export class ThumbnailTaskEventData {
+	    task_id: string;
+	    media_id: string;
+	    library_id: string;
+	    path: string;
+	    type: string;
+	    status: string;
+	    phase: string;
+	    message: string;
+	    retryable: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new ThumbnailTaskEventData(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.task_id = source["task_id"];
+	        this.media_id = source["media_id"];
+	        this.library_id = source["library_id"];
+	        this.path = source["path"];
+	        this.type = source["type"];
+	        this.status = source["status"];
+	        this.phase = source["phase"];
+	        this.message = source["message"];
+	        this.retryable = source["retryable"];
 	    }
 	}
 

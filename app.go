@@ -39,6 +39,7 @@ type App struct {
 	scanner          *service.ScannerService
 	thumbnailWorker  *service.ThumbnailWorker
 	artworkCache     *service.ArtworkCache
+	logFile          *os.File
 	removeMediaCache func(string) error
 	avatarService    *service.GfriendsAvatarService
 	logger           *zap.SugaredLogger
@@ -151,9 +152,16 @@ func (a *App) finishLibraryScan(libraryID string) {
 func (a *App) startup(ctx context.Context) {
 	a.ctx, a.appCancel = context.WithCancel(ctx)
 
-	// 1. 初始化极简 logger
-	l, _ := zap.NewDevelopment()
+	// 1. 初始化控制台和持久化日志
+	l, logFile, logErr := newApplicationLogger("navi.log")
+	if logErr != nil {
+		l, _ = zap.NewDevelopment()
+	}
 	a.logger = l.Sugar()
+	a.logFile = logFile
+	if logErr != nil {
+		a.logger.Warnf("open persistent application log failed: %v", logErr)
+	}
 
 	// 2. 初始化带版本迁移、备份和连接级 PRAGMA 的 SQLite 持久层。
 	dbManager, err := database.Open("navi.db", database.DefaultOptions())
@@ -506,6 +514,9 @@ func (a *App) startScanWithOptions(lib *model.Library, task *scanTask, options s
 	}
 	a.scanWG.Add(1)
 	a.scanMu.Unlock()
+	if a.logger != nil {
+		a.logger.Infof("scan task started: library=%s task=%s mode=%s roots=%d", lib.ID, task.info.TaskID, options.Mode, len(lib.RootPaths()))
+	}
 	go a.runScanTask(lib, task, options)
 }
 
@@ -529,11 +540,43 @@ func (a *App) runScanTask(lib *model.Library, task *scanTask, options service.Sc
 	}
 	a.scanMu.Unlock()
 
-	if a.scanner == nil || a.db == nil {
+	if a.scanner == nil || a.repos == nil {
 		scanErr = fmt.Errorf("scanner is unavailable")
 		return
 	}
-	result, scanErr = a.scanner.ScanLibraryAtomic(a.db, lib, options)
+	if err := options.Context.Err(); err != nil {
+		scanErr = err
+		return
+	}
+	if options.Mode == "overwrite" {
+		before, err := a.repos.Media.ListIDAndPathByLibrary(lib.ID)
+		if err != nil {
+			scanErr = fmt.Errorf("load media before overwrite: %w", err)
+			return
+		}
+		if err := a.repos.Media.DeleteByLibraryID(lib.ID); err != nil {
+			scanErr = err
+			return
+		}
+		if err := a.repos.Series.DeleteByLibraryID(lib.ID); err != nil {
+			scanErr = err
+			return
+		}
+		for _, record := range before {
+			result.DeletedMediaIDs = append(result.DeletedMediaIDs, record.ID)
+			if a.artworkCache != nil {
+				if err := a.artworkCache.RemoveMedia(record.ID); err != nil {
+					result.CacheCleanupWarnings = append(result.CacheCleanupWarnings, err)
+				}
+			}
+		}
+	}
+
+	scanResult, err := a.scanner.ScanLibraryWithOptionsResult(lib, options)
+	result.Scanned = scanResult.Scanned
+	result.TotalTargets = scanResult.TotalTargets
+	result.Cleaned = scanResult.Cleaned
+	scanErr = err
 	if scanErr != nil {
 		if a.logger != nil && !errors.Is(scanErr, context.Canceled) {
 			a.logger.Errorf("scan error: library=%s task=%s mode=%s err=%v", lib.ID, task.info.TaskID, options.Mode, scanErr)
@@ -541,7 +584,12 @@ func (a *App) runScanTask(lib *model.Library, task *scanTask, options service.Sc
 		return
 	}
 
+	result.LastScan = time.Now().UTC().Truncate(time.Second)
 	lib.LastScan = &result.LastScan
+	if err := a.repos.Library.Update(lib); err != nil {
+		scanErr = fmt.Errorf("update library last scan: %w", err)
+		return
+	}
 	for _, warning := range result.CacheCleanupWarnings {
 		if a.logger != nil {
 			a.logger.Warnf("scan cache cleanup warning: %v", warning)
@@ -597,6 +645,21 @@ func (a *App) finishScanTask(lib *model.Library, task *scanTask, options service
 	shuttingDown := a.shuttingDown
 	a.scanMu.Unlock()
 	task.cancel()
+	if a.logger != nil {
+		a.logger.Infof(
+			"scan task finished: library=%s task=%s mode=%s status=%s scanned=%d total=%d cleaned=%d duration=%s failure_stage=%s err=%v",
+			lib.ID,
+			task.info.TaskID,
+			options.Mode,
+			status,
+			result.Scanned,
+			result.TotalTargets,
+			result.Cleaned,
+			now.Sub(task.info.StartedAt).Round(time.Millisecond),
+			task.info.FailureStage,
+			scanErr,
+		)
+	}
 
 	if !shuttingDown && a.scanner != nil {
 		a.scanner.BroadcastScanTerminal(lib, options, result.Scanned, result.TotalTargets, result.Cleaned, scanErr)
@@ -2535,6 +2598,17 @@ func (a *App) ScanLibraryWithMode(libraryID string, mode string) (*ScanTaskInfo,
 	a.logger.Infof("ScanLibraryWithMode: id=%s mode=%s", libraryID, mode)
 	task, err := a.registerScanTask(lib, mode)
 	if err != nil {
+		a.scanMu.Lock()
+		active := a.activeScans[lib.ID]
+		if active != nil {
+			info := active.info
+			a.scanMu.Unlock()
+			if a.logger != nil {
+				a.logger.Infof("scan request joined active task: library=%s task=%s requested_mode=%s active_mode=%s", lib.ID, info.TaskID, mode, info.Mode)
+			}
+			return &info, nil
+		}
+		a.scanMu.Unlock()
 		return nil, err
 	}
 

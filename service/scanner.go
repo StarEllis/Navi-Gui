@@ -930,6 +930,7 @@ const (
 	metadataTaskPriorityRunning
 	scanProgressBroadcastMinInterval = 200 * time.Millisecond
 	scanProgressBroadcastMinStep     = 20
+	scanProgressLogStep              = 250
 	scanCreateBatchSize              = 100
 	metadataQueueBufferSize          = 16384
 )
@@ -1694,6 +1695,11 @@ func shouldRefreshExistingMovieMediaWithStat(options ScanOptions, signature repo
 }
 
 func (s *ScannerService) ScanLibraryWithOptions(library *model.Library, options ScanOptions) (int, error) {
+	result, err := s.ScanLibraryWithOptionsResult(library, options)
+	return result.Scanned, err
+}
+
+func (s *ScannerService) ScanLibraryWithOptionsResult(library *model.Library, options ScanOptions) (OverwriteScanResult, error) {
 	if strings.TrimSpace(options.TaskID) == "" {
 		options.TaskID = uuid.NewString()
 	}
@@ -1706,15 +1712,16 @@ func (s *ScannerService) ScanLibraryWithOptions(library *model.Library, options 
 	if library != nil && !options.SuppressTerminal {
 		runScanner.broadcastScanTerminal(library, options, result, err)
 	}
-	return result.Count, err
+	return OverwriteScanResult{
+		Scanned:      result.Count,
+		TotalTargets: result.TotalTargets,
+		Cleaned:      result.Cleaned,
+	}, err
 }
 
 func (s *ScannerService) scanLibraryWithOptionsCore(library *model.Library, options ScanOptions) (scanRunResult, error) {
 	if library == nil {
 		return scanRunResult{}, fmt.Errorf("library is nil")
-	}
-	if options.Mode == "overwrite" && !s.strictScan {
-		return scanRunResult{}, fmt.Errorf("overwrite scans must use ScanLibraryOverwrite")
 	}
 	if options.Context != nil {
 		select {
@@ -1756,7 +1763,7 @@ func (s *ScannerService) scanLibraryWithOptionsCore(library *model.Library, opti
 
 	var count int
 	var scanErr error
-	cleanDeleted := options.CleanDeleted || options.Mode == "delete_update" || options.Mode == "overwrite"
+	cleanDeleted := options.CleanDeleted || options.Mode == "delete_update"
 	snapshot := newScanRootSnapshot()
 	if len(normalizedRoots) == 0 {
 		scanErr = &ScanIncompleteError{Err: fmt.Errorf("library has no scan roots")}
@@ -1800,7 +1807,7 @@ func (s *ScannerService) scanLibraryWithOptionsCore(library *model.Library, opti
 		}
 	}
 	totalTargets = len(snapshot.filePaths)
-	if scanErr == nil && options.Mode == "overwrite" {
+	if scanErr == nil && options.Mode == "overwrite" && s.strictScan {
 		scanErr = s.forceRefreshSnapshotMetadata(library, snapshot)
 	}
 
@@ -2500,18 +2507,22 @@ func (s *ScannerService) syncActorsForMediaWithRepos(media *model.Media, strict 
 		return nil
 	}
 
-	actorMetadata, err := s.nfoService.GetActorMetadataFromNFO(nfoPath)
-	if err != nil {
-		if strict {
+	var actors []NFOActor
+	if strict {
+		actorMetadata, err := s.nfoService.GetActorMetadataFromNFO(nfoPath)
+		if err != nil {
 			return fmt.Errorf("parse actors from %s: %w", nfoPath, err)
 		}
-		return nil
-	}
-	if !actorMetadata.ActorsPresent {
-		return nil
-	}
-	if !strict && len(actorMetadata.Actors) == 0 {
-		return nil
+		if !actorMetadata.ActorsPresent {
+			return nil
+		}
+		actors = actorMetadata.Actors
+	} else {
+		var err error
+		actors, _, err = s.nfoService.GetActorsFromNFO(nfoPath)
+		if err != nil || len(actors) == 0 {
+			return nil
+		}
 	}
 
 	if err := mediaPersonRepo.DeleteByMediaID(media.ID); err != nil {
@@ -2521,7 +2532,7 @@ func (s *ScannerService) syncActorsForMediaWithRepos(media *model.Media, strict 
 		return nil
 	}
 	seen := make(map[string]bool)
-	for index, actor := range actorMetadata.Actors {
+	for index, actor := range actors {
 		name := strings.TrimSpace(actor.Name)
 		if name == "" || seen[name] {
 			continue
@@ -4827,7 +4838,16 @@ func (s *ScannerService) setScanProgressTotal(library *model.Library, total int)
 
 	scanProgressStateStore.Lock()
 	if tracker, ok := scanProgressStateStore.items[library.ID]; ok {
-		tracker.total = total
+		tracker.total = tracker.current + total
+		current := tracker.current
+		cumulativeTotal := tracker.total
+		taskID := tracker.taskID
+		mode := tracker.mode
+		scanProgressStateStore.Unlock()
+		if s.logger != nil {
+			s.logger.Infof("scan targets discovered: library=%s task=%s mode=%s current=%d root_targets=%d cumulative_total=%d", library.ID, taskID, mode, current, total, cumulativeTotal)
+		}
+		return
 	}
 	scanProgressStateStore.Unlock()
 }
@@ -4857,10 +4877,14 @@ func (s *ScannerService) advanceScanProgress(library *model.Library, message str
 	current := tracker.current
 	total := tracker.total
 	mode := tracker.mode
+	taskID := tracker.taskID
 	scanProgressStateStore.Unlock()
+	if s.logger != nil && (current == 1 || current%scanProgressLogStep == 0) {
+		s.logger.Infof("scan progress: library=%s task=%s mode=%s current=%d total=%d message=%q", library.ID, taskID, mode, current, total, message)
+	}
 
 	s.broadcastScanEvent(EventScanProgress, &ScanProgressData{
-		TaskID:      tracker.taskID,
+		TaskID:      taskID,
 		LibraryID:   library.ID,
 		LibraryName: library.Name,
 		Mode:        mode,

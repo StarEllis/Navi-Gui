@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import './App.css';
 import './library-refine.css';
 import {
@@ -149,6 +149,12 @@ function App() {
     const [view, setView] = useState<ViewName>('libs');
     const [libraries, setLibraries] = useState<any[]>(() => initialLibraryState.libraries);
     const [currentLib, setCurrentLib] = useState<any>(() => initialLibraryState.currentLibrary);
+    const [scanRequestPendingLibraryID, setScanRequestPendingLibraryID] = useState('');
+    const activeScan = useSyncExternalStore(
+        scanProgressStore.subscribe,
+        () => scanProgressStore.getSnapshot(currentLib?.id || ''),
+        () => null,
+    );
     const [searchKeyword, setSearchKeyword] = useState('');
     const [debouncedMediaSearch, setDebouncedMediaSearch] = useState('');
     const [showLibModal, setShowLibModal] = useState(false);
@@ -166,6 +172,7 @@ function App() {
     const [listMutation, setListMutation] = useState<MediaGridMutation | null>(null);
     const scanStartedAtRef = useRef<number | null>(null);
     const scanModeRef = useRef<string>('');
+    const scanRequestPendingRef = useRef(new Set<string>());
     const scanTaskLifecycleRef = useRef(createScanTaskLifecycle());
     const resetTitleTimerRef = useRef<number | null>(null);
     const metadataRefreshTimerRef = useRef<number | null>(null);
@@ -250,10 +257,22 @@ function App() {
 
     const startScanForLibrary = async (libraryId: string, mode: string) => {
         scanModeRef.current = mode;
-		const generation = beginScanRequest(scanTaskLifecycleRef.current, libraryId);
+        const generation = beginScanRequest(scanTaskLifecycleRef.current, libraryId);
         const task = await ScanLibraryWithMode(libraryId, mode);
         if (typeof task?.task_id === 'string' && task.task_id) {
-			activateScanTaskFromResponse(scanTaskLifecycleRef.current, libraryId, generation, task.task_id);
+            const activated = activateScanTaskFromResponse(scanTaskLifecycleRef.current, libraryId, generation, task.task_id);
+            if (activated && !scanProgressStore.getSnapshot(libraryId)) {
+                scanProgressStore.set({
+                    taskId: task.task_id,
+                    libraryId,
+                    libraryName: typeof task?.library_name === 'string' ? task.library_name : '',
+                    mode: typeof task?.mode === 'string' ? task.mode : mode,
+                    phase: 'starting',
+                    current: 0,
+                    total: 0,
+                    message: '正在启动扫描',
+                });
+            }
         }
     };
 
@@ -487,8 +506,9 @@ function App() {
                 window.clearTimeout(statusTimerRef.current);
             }
             scanModeRef.current = '';
-			scanProgressStore.clear();
-			clearScanTaskLifecycle(scanTaskLifecycleRef.current);
+            scanRequestPendingRef.current.clear();
+            scanProgressStore.clear();
+            clearScanTaskLifecycle(scanTaskLifecycleRef.current);
             setAppTitle(APP_TITLE);
         };
     }, []);
@@ -632,10 +652,19 @@ function App() {
         if (!currentLib) {
             return;
         }
+        const libraryId = currentLib.id;
+        if (activeScan || scanRequestPendingRef.current.has(libraryId)) {
+            return;
+        }
+        scanRequestPendingRef.current.add(libraryId);
+        setScanRequestPendingLibraryID(libraryId);
         try {
-            await startScanForLibrary(currentLib.id, mode);
+            await startScanForLibrary(libraryId, mode);
         } catch (error) {
             showStatus(`扫描启动失败：${formatError(error)}`);
+        } finally {
+            scanRequestPendingRef.current.delete(libraryId);
+            setScanRequestPendingLibraryID((current) => current === libraryId ? '' : current);
         }
     };
     const handleRandomPlay = async () => {
@@ -813,6 +842,7 @@ function App() {
                             onSearch={setSearchKeyword}
                             searchPlaceholder={searchPlaceholder}
                             searchDisabled={!searchEnabled}
+                            scanDisabled={Boolean(activeScan) || scanRequestPendingLibraryID === currentLib?.id}
                             onScanWithMode={showLibraryActions ? handleScanWithMode : undefined}
                             onEditLibrary={showLibraryActions && currentLib ? () => setEditingLib(currentLib) : undefined}
                             onRandomPlay={showListActions ? handleRandomPlay : undefined}

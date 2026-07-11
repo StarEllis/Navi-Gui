@@ -95,6 +95,7 @@ Navi 不是 Electron 套壳网页，而是用 Go 做桌面后端、React 做界�
 
 - `navi.db`：本地数据库
 - `settings.json`：桌面设置
+- `navi.log`：应用与扫描诊断日志（超过 20 MB 后轮换为 `navi.log.1`）
 - `remote_access.log`：远程访问日志
 - `cache/`：缓存目录
 

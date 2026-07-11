@@ -13,7 +13,8 @@ const ScanTaskPanel: React.FC<{ hidden: boolean; libraryId: string }> = ({ hidde
         return null;
     }
 
-    const progressText = `正在扫描: ${progress.current}/${progress.total > 0 ? progress.total : '...'}`;
+    const displayTotal = progress.total > 0 ? Math.max(progress.current, progress.total) : '...';
+    const progressText = `正在扫描: ${progress.current}/${displayTotal}`;
     return (
         <div className="scan-progress-panel" role="status" aria-live="polite">
             <div className="scan-progress-title">{progressText}</div>

@@ -37,6 +37,7 @@ interface TopBarProps {
     onSearch: (keyword: string) => void;
     searchPlaceholder?: string;
     searchDisabled?: boolean;
+    scanDisabled?: boolean;
     onScanWithMode?: (mode: string) => void;
     onEditLibrary?: () => void;
     onRandomPlay?: () => void;
@@ -133,6 +134,7 @@ const TopBar: React.FC<TopBarProps> = ({
     onSearch,
     searchPlaceholder = '\u641c\u7d22\u5a92\u4f53\u3001\u6f14\u5458\u3001\u6807\u7b7e',
     searchDisabled = false,
+    scanDisabled = false,
     onScanWithMode,
     onEditLibrary,
     onRandomPlay,
@@ -186,7 +188,17 @@ const TopBar: React.FC<TopBarProps> = ({
         }
     }, [searchPlaceholder]);
 
+    useEffect(() => {
+        if (scanDisabled) {
+            setOpenMenu(null);
+            setConfirmScanMode(null);
+        }
+    }, [scanDisabled]);
+
     const handleScanModeClick = (mode: string) => {
+        if (scanDisabled) {
+            return;
+        }
         setOpenMenu(null);
         setSearchContextMenu(null);
         if (mode === 'overwrite') {
@@ -443,6 +455,7 @@ const TopBar: React.FC<TopBarProps> = ({
                                 <button
                                     type="button"
                                     className="workspace-action-btn compact"
+                                    disabled={scanDisabled}
                                     onClick={() => {
                                         setSearchContextMenu(null);
                                         setOpenMenu((prev) => (prev === 'scan' ? null : 'scan'));
@@ -460,6 +473,7 @@ const TopBar: React.FC<TopBarProps> = ({
                                                 key={option.mode}
                                                 type="button"
                                                 className="workspace-dropdown-item"
+                                                disabled={scanDisabled}
                                                 onClick={() => handleScanModeClick(option.mode)}
                                             >
                                                 <span>{option.label}</span>
@@ -552,7 +566,11 @@ const TopBar: React.FC<TopBarProps> = ({
                             <button
                                 type="button"
                                 className="confirm-modal-btn primary"
+                                disabled={scanDisabled}
                                 onClick={() => {
+                                    if (scanDisabled) {
+                                        return;
+                                    }
                                     onScanWithMode?.('overwrite');
                                     setConfirmScanMode(null);
                                 }}

@@ -76,6 +76,29 @@ func TestScanTaskRegistryRejectsDuplicateAndAllowsRestartAfterCancel(t *testing.
 	app.finishScanTask(library, second, service.ScanOptions{TaskID: second.info.TaskID}, service.OverwriteScanResult{}, context.Canceled)
 }
 
+func TestScanLibraryWithModeReturnsExistingActiveTask(t *testing.T) {
+	app := newTestApp(t)
+	library := &model.Library{ID: "existing-scan", Name: "Existing Scan", Path: t.TempDir(), Type: "movie"}
+	if err := app.repos.Library.Create(library); err != nil {
+		t.Fatalf("create library: %v", err)
+	}
+	existing, err := app.registerScanTask(library, "incremental")
+	if err != nil {
+		t.Fatalf("register existing scan: %v", err)
+	}
+
+	returned, err := app.ScanLibraryWithMode(library.ID, "incremental")
+	if err != nil {
+		t.Fatalf("duplicate scan returned an error: %v", err)
+	}
+	if returned == nil || returned.TaskID != existing.info.TaskID {
+		t.Fatalf("duplicate scan returned task %+v, want %s", returned, existing.info.TaskID)
+	}
+
+	existing.cancel()
+	app.finishScanTask(library, existing, service.ScanOptions{TaskID: existing.info.TaskID}, service.OverwriteScanResult{}, context.Canceled)
+}
+
 func TestScanTaskEarlyFailureReleasesActiveStateOnce(t *testing.T) {
 	app := NewApp()
 	app.ctx = context.Background()
@@ -198,6 +221,53 @@ func TestCanceledScanIsNotRetryable(t *testing.T) {
 	}
 	if failure := app.GetLastScanFailure(library.ID); failure != nil {
 		t.Fatalf("canceled task remained retryable: %+v", failure)
+	}
+}
+
+func TestOverwriteScanClearsLibraryAndCompletesDirectly(t *testing.T) {
+	app := newTestApp(t)
+	attachTestScanner(t, app)
+	library := &model.Library{
+		ID:               "direct-overwrite",
+		Name:             "Direct Overwrite",
+		Path:             t.TempDir(),
+		Type:             "movie",
+		EnableFileFilter: false,
+	}
+	if err := app.repos.Library.Create(library); err != nil {
+		t.Fatalf("create library: %v", err)
+	}
+	if err := app.repos.Media.Create(&model.Media{
+		ID:        "stale-media",
+		LibraryID: library.ID,
+		Title:     "Stale",
+		FilePath:  filepath.Join(library.Path, "missing.mp4"),
+		MediaType: "movie",
+	}); err != nil {
+		t.Fatalf("create stale media: %v", err)
+	}
+
+	task, err := app.ScanLibraryWithMode(library.ID, "overwrite")
+	if err != nil {
+		t.Fatalf("start overwrite scan: %v", err)
+	}
+	last := waitForScanTerminal(t, app, library.ID, task.TaskID)
+	if last.Status != ScanTaskCompleted {
+		t.Fatalf("overwrite status=%s error=%s", last.Status, last.Error)
+	}
+	media, err := app.repos.Media.ListByLibraryID(library.ID)
+	if err != nil {
+		t.Fatalf("list media after overwrite: %v", err)
+	}
+	if len(media) != 0 {
+		t.Fatalf("overwrite retained stale media: %+v", media)
+	}
+	updated, err := app.repos.Library.FindByID(library.ID)
+	if err != nil {
+		t.Fatalf("reload library: %v", err)
+	}
+	if updated.LastScan == nil {
+		t.Fatal("overwrite did not update last scan time")
 	}
 }
 

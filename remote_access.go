@@ -165,6 +165,12 @@ func (a *App) shutdown(_ context.Context) {
 				a.logger.Warnf("database checkpoint or close failed: %v", err)
 			}
 		}
+		if a.logger != nil {
+			_ = a.logger.Sync()
+		}
+		if a.logFile != nil {
+			_ = a.logFile.Close()
+		}
 	})
 }
 

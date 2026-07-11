@@ -17,6 +17,27 @@ import (
 	"navi-desktop/repository"
 )
 
+func TestScanProgressTotalAccumulatesAcrossRoots(t *testing.T) {
+	library := &model.Library{ID: "progress-multi-root", Name: "Progress"}
+	scanner := &ScannerService{logger: zap.NewNop().Sugar(), scanTaskID: "progress-task"}
+	scanner.beginScanProgress(library, "incremental", 0)
+	t.Cleanup(func() { scanner.endScanProgress(library.ID) })
+
+	scanner.setScanProgressTotal(library, 3)
+	scanner.advanceScanProgress(library, "one")
+	scanner.advanceScanProgress(library, "two")
+	scanner.setScanProgressTotal(library, 4)
+
+	scanProgressStateStore.Lock()
+	tracker := scanProgressStateStore.items[library.ID]
+	current := tracker.current
+	total := tracker.total
+	scanProgressStateStore.Unlock()
+	if current != 2 || total != 6 {
+		t.Fatalf("progress current/total = %d/%d, want 2/6", current, total)
+	}
+}
+
 func TestShouldRefreshExistingMovieMediaIncrementalUpdatesChangedSidecar(t *testing.T) {
 	dir := t.TempDir()
 	mediaPath := filepath.Join(dir, "sample.mp4")
