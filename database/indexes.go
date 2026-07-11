@@ -24,6 +24,9 @@ var requiredIndexDefinitions = []requiredIndexDefinition{
 	{Name: "idx_libraries_path_key_active", Table: "libraries", Unique: true, Columns: []string{"path_key"}, Collations: []string{"BINARY"}, Where: "deleted_at IS NULL AND path_key <> ''"},
 	{Name: "idx_media_library_path_active", Table: "media", Unique: true, Columns: []string{"library_id", "path_key"}, Collations: []string{"BINARY", "BINARY"}, Where: "deleted_at IS NULL AND path_key <> ''"},
 	{Name: "idx_series_library_folder_active", Table: "series", Unique: true, Columns: []string{"library_id", "folder_path_key"}, Collations: []string{"BINARY", "BINARY"}, Where: "deleted_at IS NULL AND folder_path_key <> ''"},
+	{Name: "idx_watch_user_completed_updated", Table: "watch_histories", Columns: []string{"user_id", "completed", "updated_at"}, Collations: []string{"BINARY", "BINARY", "BINARY"}},
+	{Name: "idx_media_deleted_created", Table: "media", Columns: []string{"deleted_at", "created_at"}, Collations: []string{"BINARY", "BINARY"}},
+	{Name: "idx_media_library_type_deleted_created", Table: "media", Columns: []string{"library_id", "media_type", "deleted_at", "created_at"}, Collations: []string{"BINARY", "BINARY", "BINARY", "BINARY"}},
 }
 
 type sqliteIndexListRow struct {

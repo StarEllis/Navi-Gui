@@ -54,6 +54,16 @@ func DefaultMigrations() []Migration {
 				return stats, nil
 			},
 		},
+		{
+			Version: 4,
+			Name:    "jellyfin_query_indexes",
+			Apply: func(tx *gorm.DB) (MigrationStats, error) {
+				if err := ensureRequiredIndexes(tx); err != nil {
+					return nil, err
+				}
+				return MigrationStats{}, nil
+			},
+		},
 	}
 }
 

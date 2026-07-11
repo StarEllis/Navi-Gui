@@ -20,7 +20,7 @@ import (
 	"gorm.io/gorm"
 )
 
-func newTestApp(t *testing.T) *App {
+func newTestApp(t testing.TB) *App {
 	t.Helper()
 
 	dbName := strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
@@ -35,6 +35,9 @@ func newTestApp(t *testing.T) *App {
 		"CREATE UNIQUE INDEX idx_libraries_path_key_active ON libraries(path_key) WHERE deleted_at IS NULL AND path_key <> ''",
 		"CREATE UNIQUE INDEX idx_media_library_path_active ON media(library_id, path_key) WHERE deleted_at IS NULL AND path_key <> ''",
 		"CREATE UNIQUE INDEX idx_series_library_folder_active ON series(library_id, folder_path_key) WHERE deleted_at IS NULL AND folder_path_key <> ''",
+		"CREATE INDEX idx_watch_user_completed_updated ON watch_histories(user_id, completed, updated_at)",
+		"CREATE INDEX idx_media_deleted_created ON media(deleted_at, created_at)",
+		"CREATE INDEX idx_media_library_type_deleted_created ON media(library_id, media_type, deleted_at, created_at)",
 	} {
 		if err := db.Exec(statement).Error; err != nil {
 			t.Fatalf("create sqlite index failed: %v", err)

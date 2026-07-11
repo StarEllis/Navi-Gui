@@ -298,8 +298,11 @@ func (a *App) newJellyfinMux(settings *DesktopSettings) http.Handler {
 	mux.HandleFunc("GET /UserViews/GroupingOptions", a.requireJellyfinAuth(a.handleJellyfinUserViewGroupingOptions()))
 	mux.HandleFunc("GET /Users/{userId}/Views", a.requireJellyfinAuth(a.handleJellyfinUserViews(settings)))
 	mux.HandleFunc("GET /Users/{userId}/Items", a.requireJellyfinAuth(a.handleJellyfinItems(settings)))
+	mux.HandleFunc("GET /Users/{userId}/Items/Resume", a.requireJellyfinAuth(a.handleJellyfinResumeItems(settings)))
+	mux.HandleFunc("GET /Users/{userId}/Items/Latest", a.requireJellyfinAuth(a.handleJellyfinLatestItems(settings)))
 	mux.HandleFunc("GET /Users/{userId}/Items/{itemId}", a.requireJellyfinAuth(a.handleJellyfinItem(settings)))
 	mux.HandleFunc("GET /Items", a.requireJellyfinAuth(a.handleJellyfinItems(settings)))
+	mux.HandleFunc("GET /Items/Latest", a.requireJellyfinAuth(a.handleJellyfinLatestItems(settings)))
 	mux.HandleFunc("GET /Items/{itemId}", a.requireJellyfinAuth(a.handleJellyfinItem(settings)))
 	mux.HandleFunc("GET /Items/{itemId}/Images/{imageType}", a.requireJellyfinAuth(a.handleJellyfinImage(settings)))
 	mux.HandleFunc("HEAD /Items/{itemId}/Images/{imageType}", a.requireJellyfinAuth(a.handleJellyfinImage(settings)))
@@ -695,6 +698,44 @@ func (a *App) handleJellyfinItems(settings *DesktopSettings) http.HandlerFunc {
 	}
 }
 
+func (a *App) handleJellyfinResumeItems(settings *DesktopSettings) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		items, total, startIndex, err := a.queryJellyfinResumeItems(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		responseItems := make([]map[string]any, 0, len(items))
+		for _, item := range items {
+			dto, err := a.jellyfinItemDTO(settings, item)
+			if err == nil {
+				responseItems = append(responseItems, dto)
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"Items": responseItems, "TotalRecordCount": total, "StartIndex": startIndex,
+		})
+	}
+}
+
+func (a *App) handleJellyfinLatestItems(settings *DesktopSettings) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		items, err := a.queryJellyfinLatestItems(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		responseItems := make([]map[string]any, 0, len(items))
+		for _, item := range items {
+			dto, err := a.jellyfinItemDTO(settings, item)
+			if err == nil {
+				responseItems = append(responseItems, dto)
+			}
+		}
+		writeJSON(w, http.StatusOK, responseItems)
+	}
+}
+
 func (a *App) handleJellyfinItem(settings *DesktopSettings) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		item, err := a.resolveJellyfinItem(r.PathValue("itemId"))
@@ -938,11 +979,13 @@ func stableWatchHistoryID(userID string, mediaID string) string {
 }
 
 type jellyfinResolvedItem struct {
-	ID      string
-	Kind    string
-	Library *model.Library
-	Series  *model.Series
-	Media   *model.Media
+	ID           string
+	Kind         string
+	Library      *model.Library
+	Series       *model.Series
+	Media        *model.Media
+	UserData     map[string]any
+	CountsLoaded bool
 }
 
 func (a *App) resolveJellyfinItem(id string) (*jellyfinResolvedItem, error) {
@@ -985,92 +1028,7 @@ func (a *App) resolveJellyfinItem(id string) (*jellyfinResolvedItem, error) {
 }
 
 func (a *App) queryJellyfinItems(r *http.Request) ([]*jellyfinResolvedItem, int, int, error) {
-	query := r.URL.Query()
-	if ids := splitCSV(query.Get("ids")); len(ids) > 0 {
-		items := make([]*jellyfinResolvedItem, 0, len(ids))
-		for _, id := range ids {
-			item, err := a.resolveJellyfinItem(id)
-			if err == nil {
-				items = append(items, item)
-			}
-		}
-		return items, len(items), 0, nil
-	}
-
-	parentID := query.Get("parentId")
-	recursive := parseBool(query.Get("recursive"))
-	items, err := a.listJellyfinItems(parentID, recursive)
-	if err != nil {
-		return nil, 0, 0, err
-	}
-
-	includeTypes := toSet(splitCSV(query.Get("includeItemTypes")))
-	if len(includeTypes) > 0 {
-		filtered := items[:0]
-		for _, item := range items {
-			if includeTypes[strings.ToLower(jellyfinItemTypeName(item))] {
-				filtered = append(filtered, item)
-			}
-		}
-		items = filtered
-	}
-
-	if searchTerm := strings.TrimSpace(query.Get("searchTerm")); searchTerm != "" {
-		searchLower := strings.ToLower(searchTerm)
-		filtered := items[:0]
-		for _, item := range items {
-			if strings.Contains(strings.ToLower(jellyfinItemName(item)), searchLower) {
-				filtered = append(filtered, item)
-			}
-		}
-		items = filtered
-	}
-
-	if value := strings.TrimSpace(query.Get("isFavorite")); value != "" {
-		wantFavorite := parseBool(value)
-		filtered := items[:0]
-		for _, item := range items {
-			if item.Media == nil {
-				continue
-			}
-			userData, err := a.jellyfinUserData(item.Media.ID)
-			if err == nil && parseBool(fmt.Sprint(userData["IsFavorite"])) == wantFavorite {
-				filtered = append(filtered, item)
-			}
-		}
-		items = filtered
-	}
-
-	if value := strings.TrimSpace(query.Get("isPlayed")); value != "" {
-		wantPlayed := parseBool(value)
-		filtered := items[:0]
-		for _, item := range items {
-			if item.Media == nil {
-				continue
-			}
-			userData, err := a.jellyfinUserData(item.Media.ID)
-			if err == nil && parseBool(fmt.Sprint(userData["Played"])) == wantPlayed {
-				filtered = append(filtered, item)
-			}
-		}
-		items = filtered
-	}
-
-	sortJellyfinItems(items, splitCSV(query.Get("sortBy")), splitCSV(query.Get("sortOrder")))
-
-	startIndex := parsePositiveInt(query.Get("startIndex"))
-	limit := parsePositiveInt(query.Get("limit"))
-	total := len(items)
-	if startIndex > total {
-		return []*jellyfinResolvedItem{}, total, startIndex, nil
-	}
-	if limit > 0 && startIndex+limit < total {
-		items = items[startIndex : startIndex+limit]
-	} else {
-		items = items[startIndex:]
-	}
-
-	return items, total, startIndex, nil
+	return a.queryJellyfinItemsSQL(r)
 }
 
 func (a *App) listJellyfinItems(parentID string, recursive bool) ([]*jellyfinResolvedItem, error) {
@@ -1217,11 +1175,19 @@ func (a *App) jellyfinItemDTO(settings *DesktopSettings, item *jellyfinResolvedI
 	}
 	switch item.Kind {
 	case "library":
+		if item.CountsLoaded {
+			return a.jellyfinLibraryDTOWithChildCount(item.Library, item.Library.MediaCount), nil
+		}
 		return a.jellyfinLibraryDTO(settings, item.Library), nil
 	case "series":
+		if !item.CountsLoaded {
+			if err := a.hydrateJellyfinItems([]*jellyfinResolvedItem{item}); err != nil {
+				return nil, err
+			}
+		}
 		return a.jellyfinSeriesDTO(settings, item.Series)
 	case "media":
-		return a.jellyfinMediaDTO(settings, item.Media)
+		return a.jellyfinMediaDTOWithUserData(settings, item.Media, item.UserData)
 	default:
 		return nil, fmt.Errorf("unsupported item kind")
 	}
@@ -1240,6 +1206,10 @@ func (a *App) jellyfinLibraryDTO(_ *DesktopSettings, library *model.Library) map
 			childCount += len(media)
 		}
 	}
+	return a.jellyfinLibraryDTOWithChildCount(library, childCount)
+}
+
+func (a *App) jellyfinLibraryDTOWithChildCount(library *model.Library, childCount int) map[string]any {
 	return map[string]any{
 		"Name":                      library.Name,
 		"ServerId":                  a.remoteServerID(),
@@ -1258,10 +1228,6 @@ func (a *App) jellyfinSeriesDTO(_ *DesktopSettings, series *model.Series) (map[s
 	if series == nil {
 		return nil, fmt.Errorf("series is nil")
 	}
-	episodes, err := a.repos.Media.ListBySeriesID(series.ID)
-	if err != nil {
-		return nil, err
-	}
 	dto := map[string]any{
 		"Name":               series.Title,
 		"OriginalTitle":      series.OrigTitle,
@@ -1272,8 +1238,8 @@ func (a *App) jellyfinSeriesDTO(_ *DesktopSettings, series *model.Series) (map[s
 		"Overview":           series.Overview,
 		"ProductionYear":     series.Year,
 		"DateCreated":        series.CreatedAt.UTC().Format(time.RFC3339),
-		"ChildCount":         len(episodes),
-		"RecursiveItemCount": len(episodes),
+		"ChildCount":         series.EpisodeCount,
+		"RecursiveItemCount": series.EpisodeCount,
 		"Genres":             splitCSV(series.Genres),
 		"SortName":           series.Title,
 	}
@@ -1287,6 +1253,10 @@ func (a *App) jellyfinSeriesDTO(_ *DesktopSettings, series *model.Series) (map[s
 }
 
 func (a *App) jellyfinMediaDTO(settings *DesktopSettings, media *model.Media) (map[string]any, error) {
+	return a.jellyfinMediaDTOWithUserData(settings, media, nil)
+}
+
+func (a *App) jellyfinMediaDTOWithUserData(settings *DesktopSettings, media *model.Media, prefetchedUserData map[string]any) (map[string]any, error) {
 	if media == nil {
 		return nil, fmt.Errorf("media is nil")
 	}
@@ -1342,13 +1312,18 @@ func (a *App) jellyfinMediaDTO(settings *DesktopSettings, media *model.Media) (m
 		if media.EpisodeTitle != "" {
 			dto["EpisodeTitle"] = media.EpisodeTitle
 		}
-		if series, err := a.repos.Series.FindByIDOnly(media.SeriesID); err == nil {
+		series := media.Series
+		if prefetchedUserData == nil && (series == nil || strings.TrimSpace(series.Title) == "") {
+			series, _ = a.repos.Series.FindByIDOnly(media.SeriesID)
+		}
+		if series != nil && strings.TrimSpace(series.Title) != "" {
 			dto["SeriesName"] = series.Title
 			dto["SeasonName"] = fmt.Sprintf("Season %d", media.SeasonNum)
 		}
 	}
-	userData, err := a.jellyfinUserData(media.ID)
-	if err == nil {
+	if prefetchedUserData != nil {
+		dto["UserData"] = prefetchedUserData
+	} else if userData, err := a.jellyfinUserData(media.ID); err == nil {
 		dto["UserData"] = userData
 	}
 	return dto, nil

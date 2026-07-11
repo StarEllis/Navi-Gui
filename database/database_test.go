@@ -69,14 +69,14 @@ func TestNewDatabaseMigratesSequentiallyAndReopenIsIdempotent(t *testing.T) {
 		t.Fatalf("Open(new) error = %v", err)
 	}
 	version, err := manager.SchemaVersion()
-	if err != nil || version != 3 {
-		t.Fatalf("SchemaVersion() = %d, %v; want 3", version, err)
+	if err != nil || version != 4 {
+		t.Fatalf("SchemaVersion() = %d, %v; want 4", version, err)
 	}
 	var versions []int
 	if err := manager.DB().Model(&SchemaMigration{}).Order("version").Pluck("version", &versions).Error; err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(versions) != "[1 2 3]" {
+	if fmt.Sprint(versions) != "[1 2 3 4]" {
 		t.Fatalf("migration versions = %v", versions)
 	}
 	before, err := os.ReadDir(manager.BackupDir())
@@ -145,7 +145,7 @@ func TestHigherDatabaseVersionRejectsWriteOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.DB().Create(&SchemaMigration{Version: 4, Name: "future", AppliedAt: time.Now()}).Error; err != nil {
+	if err := manager.DB().Create(&SchemaMigration{Version: 5, Name: "future", AppliedAt: time.Now()}).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.Close(); err != nil {
@@ -795,7 +795,7 @@ func TestRestoreRejectsNewerNaviDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := candidate.DB().Create(&SchemaMigration{Version: 4, Name: "future", AppliedAt: time.Now().UTC()}).Error; err != nil {
+	if err := candidate.DB().Create(&SchemaMigration{Version: 5, Name: "future", AppliedAt: time.Now().UTC()}).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := candidate.Close(); err != nil {
@@ -839,6 +839,43 @@ func TestRequiredIndexDefinitionsAreValidatedAndRepaired(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestJellyfinPerformanceIndexesAreHealthyAndUsed(t *testing.T) {
+	manager := openTestManager(t, DefaultOptions())
+	db := manager.DB()
+	user, library, media := createCoreRows(t, db, "jellyfin-index")
+	history := model.WatchHistory{ID: "history-jellyfin-index", UserID: user.ID, MediaID: media.ID, UpdatedAt: time.Now()}
+	if err := db.Create(&history).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if report := manager.HealthCheck(context.Background(), true); !report.Healthy || len(report.MissingIndexes) != 0 {
+		t.Fatalf("health report=%#v", report)
+	}
+	assertPlanUses := func(sql, index string, args ...interface{}) {
+		t.Helper()
+		var rows []struct{ Detail string }
+		if err := db.Raw("EXPLAIN QUERY PLAN "+sql, args...).Scan(&rows).Error; err != nil {
+			t.Fatal(err)
+		}
+		details := fmt.Sprint(rows)
+		if !contains(details, index) || contains(details, "TEMP B-TREE FOR ORDER BY") {
+			t.Fatalf("plan=%s want index %s without temp sort", details, index)
+		}
+	}
+	assertPlanUses(
+		"SELECT * FROM watch_histories WHERE user_id = ? AND completed = ? ORDER BY updated_at DESC LIMIT 100",
+		"idx_watch_user_completed_updated", user.ID, false,
+	)
+	assertPlanUses(
+		"SELECT * FROM media WHERE deleted_at IS NULL AND library_id = ? AND media_type = ? AND id <> ? ORDER BY created_at DESC LIMIT 32",
+		"idx_media_library_type_deleted_created", library.ID, media.MediaType, "missing",
+	)
+	assertPlanUses(
+		"SELECT * FROM media WHERE deleted_at IS NULL AND (series_id = '' OR series_id IS NULL) AND library_id != '' ORDER BY created_at DESC LIMIT 100",
+		"idx_media_deleted_created",
+	)
 }
 
 func TestDuplicateSeriesMergeMovesAssociationsBeforeDelete(t *testing.T) {
