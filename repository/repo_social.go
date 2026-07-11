@@ -13,18 +13,20 @@ type WatchHistoryRepo struct {
 }
 
 func (r *WatchHistoryRepo) Upsert(history *model.WatchHistory) error {
-	return r.db.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "user_id"}, {Name: "media_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{
-			"position", "duration", "completed", "updated_at",
-		}),
-	}).Create(history).Error
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		return tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "user_id"}, {Name: "media_id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"position", "duration", "completed", "updated_at",
+			}),
+		}).Create(history).Error
+	})
 }
 
 func (r *WatchHistoryRepo) ContinueWatching(userID string, limit int) ([]model.WatchHistory, error) {
 	var histories []model.WatchHistory
 	err := r.db.Preload("Media").
-		Where("user_id = ? AND completed = ?", userID, false).
+		Where("user_id = ? AND position > 0 AND duration > 0 AND position / duration < ?", userID, 0.90).
 		Order("updated_at DESC").
 		Limit(limit).
 		Find(&histories).Error

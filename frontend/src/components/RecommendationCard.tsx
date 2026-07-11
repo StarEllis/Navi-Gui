@@ -3,6 +3,7 @@ import { Play } from 'lucide-react';
 import { PlayMedia } from "../../wailsjs/go/main/App";
 import { formatError, toLocalAssetUrl } from '../utils/media';
 import type { AppMedia, RecommendationItem } from '../types/wails';
+import { getMediaProgressPercent } from '../utils/mediaPlaybackState';
 
 interface RecommendationCardProps {
     item: RecommendationItem;
@@ -18,6 +19,7 @@ const RecommendationCard: React.FC<RecommendationCardProps> = ({ item, onSelectM
             ? media.backdrop_path.trim()
             : '';
     const coverUrl = posterPath ? toLocalAssetUrl(posterPath) : '';
+    const playbackProgress = getMediaProgressPercent(media);
 
     const handleQuickPlay = async (event: React.MouseEvent<HTMLButtonElement>) => {
         event.stopPropagation();
@@ -82,6 +84,18 @@ const RecommendationCard: React.FC<RecommendationCardProps> = ({ item, onSelectM
                         <Play size={16} fill="currentColor" />
                     </button>
                 </div>
+                {playbackProgress !== null && playbackProgress > 0 && (
+                    <div
+                        className="playback-progress-track recommendation-card-progress"
+                        role="progressbar"
+                        aria-label="Playback progress"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={Math.round(playbackProgress)}
+                    >
+                        <span className="playback-progress-value" style={{ width: `${playbackProgress}%` }} />
+                    </div>
+                )}
             </div>
             <div className="recommendation-card-copy">
                 <div className="recommendation-title" title={media.title || ''}>

@@ -20,6 +20,13 @@ func TestEnsureDesktopUserCreatesRequiredForeignKeyParent(t *testing.T) {
 	if user.Username != desktopUserID || user.Role != "user" {
 		t.Fatalf("unexpected desktop user: %+v", user)
 	}
+	if err := app.ensureDesktopUser(); err != nil {
+		t.Fatalf("ensure desktop user repeatedly: %v", err)
+	}
+	var count int64
+	if err := app.db.Unscoped().Model(&model.User{}).Where("id = ?", desktopUserID).Count(&count).Error; err != nil || count != 1 {
+		t.Fatalf("desktop user idempotency count=%d err=%v", count, err)
+	}
 }
 
 func TestEnsureWatchedPersistsForDesktopUser(t *testing.T) {

@@ -336,15 +336,19 @@ type Media struct {
 	UpdatedAt time.Time      `json:"updated_at"`
 	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
 
-	Library        Library      `json:"-" gorm:"foreignKey:LibraryID"`
-	Series         *Series      `json:"series,omitempty" gorm:"foreignKey:SeriesID"`
-	Actor          string       `json:"actor" gorm:"-"`
-	Actors         []MediaActor `json:"actors,omitempty" gorm:"-"`
-	SearchText     string       `json:"search_text" gorm:"type:text"`
-	SearchPinyin   string       `json:"-" gorm:"type:text"`
-	SearchInitials string       `json:"-" gorm:"type:text"`
-	IsFavorite     bool         `json:"is_favorite" gorm:"-"`
-	IsWatched      bool         `json:"is_watched" gorm:"-"`
+	Library         Library      `json:"-" gorm:"foreignKey:LibraryID"`
+	Series          *Series      `json:"series,omitempty" gorm:"foreignKey:SeriesID"`
+	Actor           string       `json:"actor" gorm:"-"`
+	Actors          []MediaActor `json:"actors,omitempty" gorm:"-"`
+	SearchText      string       `json:"search_text" gorm:"type:text"`
+	SearchPinyin    string       `json:"-" gorm:"type:text"`
+	SearchInitials  string       `json:"-" gorm:"type:text"`
+	IsFavorite      bool         `json:"is_favorite" gorm:"-"`
+	IsWatched       bool         `json:"is_watched" gorm:"-"`
+	WatchPosition   float64      `json:"position" gorm:"-"`
+	WatchDuration   float64      `json:"watch_duration" gorm:"-"`
+	ProgressPercent float64      `json:"progress_percent" gorm:"-"`
+	LastWatchedAt   *time.Time   `json:"last_watched_at,omitempty" gorm:"-"`
 }
 
 // Person 演职人员

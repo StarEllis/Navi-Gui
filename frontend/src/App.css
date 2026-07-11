@@ -4338,3 +4338,47 @@ body {
   -webkit-appearance: none;
   appearance: none;
 }
+
+.playback-progress-track {
+  height: 4px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.playback-progress-value {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: #4a9eff;
+  transition: width 0.2s ease;
+}
+
+.media-card-progress,
+.recommendation-card-progress {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.detail-playback-progress {
+  width: min(600px, 100%);
+  margin: -2px 0 12px;
+}
+
+.detail-playback-progress-copy {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 5px;
+  color: rgba(235, 240, 248, 0.78);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.detail-playback-progress-track {
+  border-radius: 2px;
+}

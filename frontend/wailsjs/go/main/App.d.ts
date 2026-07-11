@@ -53,8 +53,6 @@ export function OpenMediaFolder(arg1:string):Promise<void>;
 
 export function OpenNFO(arg1:string):Promise<void>;
 
-export function PlayFile(arg1:string):Promise<void>;
-
 export function PlayMedia(arg1:string,arg2:string):Promise<void>;
 
 export function PlayRandomLibraryMedia(arg1:string):Promise<string>;

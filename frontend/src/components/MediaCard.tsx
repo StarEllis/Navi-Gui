@@ -4,6 +4,7 @@ import { PlayMedia } from "../../wailsjs/go/main/App";
 import { toLocalAssetUrl } from '../utils/media';
 import { areMediaCardMediaPropsEqual, shouldOpenMediaFromCardKey } from '../utils/mediaCardState';
 import { markComponentRender } from '../utils/performanceDiagnostics';
+import { getMediaProgressPercent } from '../utils/mediaPlaybackState';
 
 interface MediaCardProps {
     media: any;
@@ -32,6 +33,7 @@ const MediaCard: React.FC<MediaCardProps> = ({ media, onSelectMedia, onQuickPlay
                 ? toLocalAssetUrl(media.backdrop_path)
                 : ''
     ), [media.backdrop_path, media.poster_path]);
+    const playbackProgress = getMediaProgressPercent(media);
     const handleQuickPlay = async (event: React.MouseEvent<HTMLButtonElement>) => {
         event.stopPropagation();
         const targetPath = typeof media?.file_path === 'string' ? media.file_path.trim() : '';
@@ -100,6 +102,18 @@ const MediaCard: React.FC<MediaCardProps> = ({ media, onSelectMedia, onQuickPlay
                         <Play size={26} strokeWidth={1.8} className="media-card-play-icon" fill="currentColor" />
                     </button>
                 </div>
+                {playbackProgress !== null && playbackProgress > 0 && (
+                    <div
+                        className="playback-progress-track media-card-progress"
+                        role="progressbar"
+                        aria-label="Playback progress"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={Math.round(playbackProgress)}
+                    >
+                        <span className="playback-progress-value" style={{ width: `${playbackProgress}%` }} />
+                    </div>
+                )}
             </div>
 
             <div className="media-info">

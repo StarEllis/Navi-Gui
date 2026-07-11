@@ -20,10 +20,17 @@ import LibraryEditModal from './components/LibraryEditModal';
 import MediaDetail from './components/MediaDetail';
 import {
     loadInitialLibraryState,
+    mergeMediaIntoCachedMediaLists,
     persistCurrentLibraryID,
     persistLibraries,
 } from './utils/persistentCache';
-import { mergeMediaDetailCacheEntry, seedMediaDetailCache } from './utils/mediaDetailCache';
+import { mergeMediaDetailCacheEntry, mergeMediaStateCacheEntry, seedMediaDetailCache } from './utils/mediaDetailCache';
+import {
+    applyMediaStateUpdate,
+    getChangedMediaStateFields,
+    normalizeMediaStateEvent,
+    type MediaStateUpdate,
+} from './utils/mediaPlaybackState';
 import { markComponentRender } from './utils/performanceDiagnostics';
 import { putBoundedScrollState } from './utils/listViewState';
 import ScanTaskPanel from './components/ScanTaskPanel';
@@ -170,6 +177,7 @@ function App() {
     const [sortStateByView, setSortStateByView] = useState<Record<SortViewName, SortConfig>>(DEFAULT_SORTS);
     const [gridScrollTops, setGridScrollTops] = useState<Record<string, number>>({});
     const [listMutation, setListMutation] = useState<MediaGridMutation | null>(null);
+    const [latestMediaStateUpdate, setLatestMediaStateUpdate] = useState<MediaStateUpdate | null>(null);
     const scanStartedAtRef = useRef<number | null>(null);
     const scanModeRef = useRef<string>('');
     const scanRequestPendingRef = useRef(new Set<string>());
@@ -178,6 +186,7 @@ function App() {
     const metadataRefreshTimerRef = useRef<number | null>(null);
     const statusTimerRef = useRef<number | null>(null);
     const currentLibRef = useRef<any>(null);
+    const mediaStateByIDRef = useRef(new Map<string, MediaStateUpdate>());
 
     const setAppTitle = (title: string) => {
         WindowSetTitle(title);
@@ -440,21 +449,39 @@ function App() {
         });
 
         const unsubMediaState = EventsOn("media:state-updated", (data: any) => {
-            const mediaID = typeof data?.media_id === 'string' ? data.media_id.trim() : '';
-            if (!mediaID) {
+            const update = normalizeMediaStateEvent(data);
+            if (!update) {
                 return;
             }
-            const patch: any = { id: mediaID };
-            if (typeof data?.is_watched === 'boolean') {
-                patch.is_watched = data.is_watched;
+
+            const previous = mediaStateByIDRef.current.get(update.id);
+            const current = previous || { id: update.id };
+            const next = applyMediaStateUpdate(current, update);
+            if (next === current) {
+                return;
             }
-            if (typeof data?.is_favorite === 'boolean') {
-                patch.is_favorite = data.is_favorite;
+            const changedFields = getChangedMediaStateFields(previous, next);
+            mediaStateByIDRef.current.delete(update.id);
+            mediaStateByIDRef.current.set(update.id, next);
+            while (mediaStateByIDRef.current.size > 256) {
+                const oldestMediaID = mediaStateByIDRef.current.keys().next().value;
+                if (!oldestMediaID) {
+                    break;
+                }
+                mediaStateByIDRef.current.delete(oldestMediaID);
             }
-            mergeMediaDetailCacheEntry(patch);
-            setListMutation({ type: 'merge', media: patch });
-            setSelectedMedia((prev: any) => (prev?.id === mediaID ? { ...prev, ...patch } : prev));
+
+            mergeMediaStateCacheEntry(update);
+            mergeMediaIntoCachedMediaLists(update, changedFields);
+            setListMutation({ type: 'merge', media: update, changedFields });
+            setSelectedMedia((prev: any) => (prev?.id === update.id ? applyMediaStateUpdate(prev, update) : prev));
+            setLatestMediaStateUpdate(update);
         });
+
+		const unsubPlayerSyncWarning = EventsOn("player:sync-warning", (data: any) => {
+			const message = typeof data?.message === 'string' ? data.message.trim() : '';
+			showStatus(message || 'PotPlayer 播放已启动，但进度同步不可用');
+		});
 
         const onScanFail = (data: any) => {
             if (!acceptTerminal(data, 'failed')) {
@@ -514,6 +541,7 @@ function App() {
             unsubscribeScanEvents();
             unsubMetadata();
             unsubMediaState();
+			unsubPlayerSyncWarning();
             if (resetTitleTimerRef.current) {
                 window.clearTimeout(resetTitleTimerRef.current);
             }
@@ -880,6 +908,7 @@ function App() {
                             <div className="detail-overlay-shell">
                                 <MediaDetail
                                     media={selectedMedia}
+                                    mediaStateUpdate={latestMediaStateUpdate}
                                     onClose={() => setSelectedMedia(null)}
                                     onSelectMedia={handleSelectMedia}
                                     onSelectFilter={applyFilterFromDetail}

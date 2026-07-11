@@ -1,4 +1,5 @@
 import { buildMediaSearchText } from './mediaSearch';
+import { shouldInvalidateMediaPagination } from './mediaPlaybackState';
 
 const LIBRARIES_STORAGE_KEY = 'navi.desktop.cache.libraries.v1';
 const CURRENT_LIBRARY_STORAGE_KEY = 'navi.desktop.cache.currentLibraryId.v1';
@@ -97,6 +98,15 @@ const pickCachedMediaFields = (item: any) => ({
     poster_path: typeof item?.poster_path === 'string' ? item.poster_path : '',
     backdrop_path: typeof item?.backdrop_path === 'string' ? item.backdrop_path : '',
     file_path: typeof item?.file_path === 'string' ? item.file_path : '',
+    duration: typeof item?.duration === 'number' ? item.duration : 0,
+    position: typeof item?.position === 'number' ? item.position : 0,
+    watch_duration: typeof item?.watch_duration === 'number' ? item.watch_duration : 0,
+    progress_percent: typeof item?.progress_percent === 'number' ? item.progress_percent : 0,
+    completed: Boolean(item?.completed),
+    last_watched_at: typeof item?.last_watched_at === 'string' ? item.last_watched_at : '',
+    playback_state: typeof item?.playback_state === 'string' ? item.playback_state : '',
+    // Revisions are process-local ordering tokens and must not survive restart.
+    revision: 0,
     search_text: buildMediaSearchText(item),
     is_favorite: Boolean(item?.is_favorite),
     is_watched: Boolean(item?.is_watched),
@@ -313,7 +323,22 @@ const mergeCachedMediaFields = (item: any, media: any) => ({
     }),
 });
 
-export const mergeMediaIntoCachedMediaLists = (media: any) => {
+const shouldInvalidateMediaListCacheKey = (cacheKey: string, changedFields: ReadonlyArray<string>) => {
+    if (changedFields.length === 0) {
+        return false;
+    }
+    try {
+        const parsed = JSON.parse(cacheKey);
+        if (!Array.isArray(parsed)) {
+            return false;
+        }
+        return shouldInvalidateMediaPagination(changedFields, String(parsed[4] || ''), String(parsed[2] || ''));
+    } catch (_error) {
+        return false;
+    }
+};
+
+export const mergeMediaIntoCachedMediaLists = (media: any, changedFields: ReadonlyArray<string> = []) => {
     const mediaID = typeof media?.id === 'string' ? media.id.trim() : '';
     if (!mediaID) {
         return;
@@ -322,12 +347,18 @@ export const mergeMediaIntoCachedMediaLists = (media: any) => {
     const store = readMediaListCacheStore();
     let changed = false;
     const nextEntries: Record<string, PersistedMediaListCacheEntry> = {};
+    const nextOrder: string[] = [];
 
     store.order.forEach((key) => {
         const entry = store.entries[key];
         if (!entry) {
             return;
         }
+        if (shouldInvalidateMediaListCacheKey(key, changedFields)) {
+            changed = true;
+            return;
+        }
+        nextOrder.push(key);
 
         let entryChanged = false;
         const nextItems = entry.items.map((item) => {
@@ -355,6 +386,7 @@ export const mergeMediaIntoCachedMediaLists = (media: any) => {
 
     writeUpdatedMediaListCacheStore({
         ...store,
+        order: nextOrder,
         entries: nextEntries,
     });
 };

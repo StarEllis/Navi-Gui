@@ -8,6 +8,13 @@ export type AppMedia = Omit<model.Media, "convertValues" | "series" | "actors"> 
     fanart_path?: string;
     publisher?: string;
     search_text?: string;
+    position?: number;
+    watch_duration?: number;
+    progress_percent?: number;
+    completed?: boolean;
+    last_watched_at?: string;
+    playback_state?: string;
+    revision?: number;
     series?: AppSeries;
     actors?: AppMediaActor[];
 };

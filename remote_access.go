@@ -140,6 +140,10 @@ func (a *App) shutdown(_ context.Context) {
 			waiters++
 			go func() { results <- a.artworkCache.ShutdownContext(shutdownCtx) }()
 		}
+		if a.playback != nil {
+			waiters++
+			go func() { results <- a.playback.Shutdown(shutdownCtx) }()
+		}
 
 		for completed := 0; completed < waiters; completed++ {
 			select {

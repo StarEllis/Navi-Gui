@@ -16,6 +16,7 @@ import {
     type MediaPageQuery,
 } from '../utils/mediaPagination';
 import { markComponentRender } from '../utils/performanceDiagnostics';
+import { shouldInvalidateMediaPagination } from '../utils/mediaPlaybackState';
 
 interface MediaGridProps {
     libraryId: string;
@@ -34,7 +35,7 @@ interface MediaGridProps {
 }
 
 export type MediaGridMutation =
-    | { type: 'merge'; media: any }
+    | { type: 'merge'; media: any; changedFields?: string[] }
     | { type: 'remove'; mediaId: string };
 
 const MEDIA_CARD_WIDTH = 178;
@@ -358,35 +359,52 @@ const MediaGrid: React.FC<MediaGridProps> = ({
             return;
         }
 
-        setPages((current) => {
-            let found = false;
-            const next = new Map<number, any[]>();
-            current.forEach((items, page) => {
-                const updated = items.flatMap((item) => {
-                    if (item?.id !== mediaID) {
-                        return [item];
+        let found = false;
+        let removedFromCurrentList = false;
+        const actualChangedFields = new Set<string>();
+        const nextPages = new Map<number, any[]>();
+        pagesRef.current.forEach((items, page) => {
+            const updated = items.flatMap((item) => {
+                if (item?.id !== mediaID) {
+                    return [item];
+                }
+                found = true;
+                if (mutation.type === 'remove') {
+                    removedFromCurrentList = true;
+                    return [];
+                }
+                Object.keys(mutation.media).forEach((field) => {
+                    if (!Object.is(item?.[field], mutation.media[field])) {
+                        actualChangedFields.add(field);
                     }
-                    found = true;
-                    if (mutation.type === 'remove') {
-                        return [];
-                    }
-                    const merged = { ...item, ...mutation.media };
-                    return matchesActiveFilter(merged, filterType, filterValue) ? [merged] : [];
                 });
-                next.set(page, updated);
+                const merged = { ...item, ...mutation.media };
+                if (!matchesActiveFilter(merged, filterType, filterValue)) {
+                    removedFromCurrentList = true;
+                    return [];
+                }
+                return [merged];
             });
-            if (found && (mutation.type === 'remove' || !matchesActiveFilter(mutation.media, filterType, filterValue))) {
-                setTotal((currentTotal) => Math.max(0, currentTotal - 1));
-            }
-            return found ? next : current;
+            nextPages.set(page, updated);
         });
+        if (found) {
+            pagesRef.current = nextPages;
+            setPages(nextPages);
+        }
+        if (removedFromCurrentList) {
+            const nextTotal = Math.max(0, totalRef.current - 1);
+            totalRef.current = nextTotal;
+            setTotal(nextTotal);
+            onCountChangeRef.current?.(nextTotal);
+        }
+
+        const changedFields = found
+            ? Array.from(actualChangedFields)
+            : mutation.type === 'merge'
+                ? (mutation.changedFields || Object.keys(mutation.media))
+                : [];
         const membershipOrOrderMayChange = mutation.type === 'remove'
-            || filterType === 'favorite'
-            || filterType === 'watched'
-            || filterType === 'unwatched'
-            || sortField === 'favorite_at'
-            || sortField === 'last_watched'
-            || sortField === 'rating';
+            || shouldInvalidateMediaPagination(changedFields, filterType, sortField);
         if (membershipOrOrderMayChange) {
             const generation = beginRequestGeneration();
             (visiblePagesRef.current.length > 0 ? visiblePagesRef.current : [1]).forEach((page) => loadPage(page, generation, true));

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -27,40 +28,45 @@ import (
 	"navi-desktop/model"
 	"navi-desktop/repository"
 	"navi-desktop/service"
+	"navi-desktop/service/player"
 )
 
 // App struct
 type App struct {
-	ctx              context.Context
-	appCancel        context.CancelFunc
-	db               *gorm.DB
-	dbManager        *database.Manager
-	repos            *repository.Repositories
-	scanner          *service.ScannerService
-	thumbnailWorker  *service.ThumbnailWorker
-	artworkCache     *service.ArtworkCache
-	logFile          *os.File
-	removeMediaCache func(string) error
-	avatarService    *service.GfriendsAvatarService
-	logger           *zap.SugaredLogger
-	remote           *remoteAccessState
-	desktop          *desktopIntegration
-	eventHub         *service.WSHub
-	scanMu           sync.Mutex
-	scanningLib      map[string]bool
-	activeScans      map[string]*scanTask
-	activeScanIDs    map[string]*scanTask
-	lastScanTasks    map[string]ScanTaskInfo
-	lastScanFailures map[string]ScanTaskInfo
-	scanWG           sync.WaitGroup
-	maintenanceWG    sync.WaitGroup
-	postStartupOnce  sync.Once
-	postStartupDelay time.Duration
-	migrationHook    func()
-	maintenanceHook  func(context.Context) error
-	shuttingDown     bool
-	shutdownOnce     sync.Once
-	shutdownTimeout  time.Duration
+	ctx                context.Context
+	appCancel          context.CancelFunc
+	db                 *gorm.DB
+	dbManager          *database.Manager
+	repos              *repository.Repositories
+	scanner            *service.ScannerService
+	thumbnailWorker    *service.ThumbnailWorker
+	artworkCache       *service.ArtworkCache
+	logFile            *os.File
+	removeMediaCache   func(string) error
+	avatarService      *service.GfriendsAvatarService
+	logger             *zap.SugaredLogger
+	remote             *remoteAccessState
+	desktop            *desktopIntegration
+	eventHub           *service.WSHub
+	playback           *player.PlaybackSessionManager
+	scanMu             sync.Mutex
+	scanningLib        map[string]bool
+	activeScans        map[string]*scanTask
+	activeScanIDs      map[string]*scanTask
+	lastScanTasks      map[string]ScanTaskInfo
+	lastScanFailures   map[string]ScanTaskInfo
+	scanWG             sync.WaitGroup
+	maintenanceWG      sync.WaitGroup
+	postStartupOnce    sync.Once
+	startupReady       chan struct{}
+	startupReadyOnce   sync.Once
+	postStartupDelay   time.Duration
+	migrationHook      func()
+	maintenanceHook    func(context.Context) error
+	shuttingDown       bool
+	shutdownOnce       sync.Once
+	shutdownTimeout    time.Duration
+	mediaStateRevision atomic.Uint64
 }
 
 const (
@@ -101,9 +107,45 @@ func NewApp() *App {
 		activeScanIDs:    make(map[string]*scanTask),
 		lastScanTasks:    make(map[string]ScanTaskInfo),
 		lastScanFailures: make(map[string]ScanTaskInfo),
+		startupReady:     make(chan struct{}),
 	}
 	app.desktop = newDesktopIntegration(app)
 	return app
+}
+
+const startupReadyTimeout = 15 * time.Second
+
+func (a *App) markStartupReady() {
+	if a == nil || a.startupReady == nil {
+		return
+	}
+	a.startupReadyOnce.Do(func() {
+		close(a.startupReady)
+	})
+}
+
+func (a *App) waitForStartup() error {
+	if a == nil {
+		return errors.New("application is not initialized")
+	}
+	if a.startupReady == nil {
+		return nil
+	}
+
+	select {
+	case <-a.startupReady:
+		return nil
+	default:
+	}
+
+	timer := time.NewTimer(startupReadyTimeout)
+	defer timer.Stop()
+	select {
+	case <-a.startupReady:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("application startup did not complete within %s", startupReadyTimeout)
+	}
 }
 
 func (a *App) reserveArtworkPath(path string) (func(), bool) {
@@ -181,6 +223,11 @@ func (a *App) startup(ctx context.Context) {
 	cfg := config.NewConfig()
 	wsHub := service.NewWSHub(a.ctx)
 	a.eventHub = wsHub
+	a.playback = player.NewPlaybackSessionManager(
+		player.NewPotPlayerAdapter(),
+		player.NewGormHistoryStore(a.db, desktopUserID),
+		playbackEventSink{app: a}, a.logger, player.DefaultManagerOptions(),
+	)
 	a.artworkCache = service.NewArtworkCache(cfg.Cache.CacheDir, a.logger)
 	a.avatarService = service.NewGfriendsAvatarService(service.GfriendsAvatarOptions{
 		CacheDir:     cfg.Cache.CacheDir,
@@ -218,6 +265,7 @@ func (a *App) startup(ctx context.Context) {
 	// a.scanner.SetMatchRuleRepo(a.repos.MatchRule)
 
 	a.startPostStartupServices(thumbSvc, thumbnailSettingsProvider)
+	a.markStartupReady()
 
 	a.logger.Infof("Application backend started successfully! DB: %s", dbManager.Path())
 }
@@ -407,6 +455,15 @@ func (a *App) hydrateLibraryForClient(lib *model.Library) {
 // -----------------------------------------------------
 
 func (a *App) GetLibraries() ([]model.Library, error) {
+	if err := a.waitForStartup(); err != nil {
+		return nil, err
+	}
+	if a.repos == nil {
+		return nil, errors.New("application repositories are not initialized")
+	}
+	if a.db == nil {
+		return nil, errors.New("application database is not initialized")
+	}
 	libs, err := a.repos.Library.List()
 	if err != nil {
 		return nil, err
@@ -820,6 +877,7 @@ func (a *App) hydrateMediaState(media *model.Media) {
 	favoriteSet, watchedSet := a.loadMediaStateSets([]string{media.ID})
 	media.IsFavorite = favoriteSet[media.ID]
 	media.IsWatched = watchedSet[media.ID]
+	a.hydrateMediaProgress(media)
 }
 
 func (a *App) hydrateMediaSliceStates(mediaItems []model.Media) {
@@ -828,6 +886,49 @@ func (a *App) hydrateMediaSliceStates(mediaItems []model.Media) {
 		mediaItems[i].IsFavorite = favoriteSet[mediaItems[i].ID]
 		mediaItems[i].IsWatched = watchedSet[mediaItems[i].ID]
 	}
+	a.hydrateMediaSliceProgress(mediaItems)
+}
+
+func (a *App) hydrateMediaProgress(media *model.Media) {
+	if media == nil || media.ID == "" {
+		return
+	}
+	var history model.WatchHistory
+	if err := a.db.Where("user_id = ? AND media_id = ?", desktopUserID, media.ID).First(&history).Error; err != nil {
+		return
+	}
+	applyMediaProgress(media, history)
+}
+
+func (a *App) hydrateMediaSliceProgress(mediaItems []model.Media) {
+	ids := collectMediaIDs(mediaItems)
+	if len(ids) == 0 {
+		return
+	}
+	var histories []model.WatchHistory
+	if err := a.db.Where("user_id = ? AND media_id IN ?", desktopUserID, ids).Find(&histories).Error; err != nil {
+		a.logger.Warnf("load playback progress failed: %v", err)
+		return
+	}
+	byMedia := make(map[string]model.WatchHistory, len(histories))
+	for _, history := range histories {
+		byMedia[history.MediaID] = history
+	}
+	for i := range mediaItems {
+		if history, ok := byMedia[mediaItems[i].ID]; ok {
+			applyMediaProgress(&mediaItems[i], history)
+		}
+	}
+}
+
+func applyMediaProgress(media *model.Media, history model.WatchHistory) {
+	media.WatchPosition = history.Position
+	media.WatchDuration = history.Duration
+	if history.Duration > 0 {
+		media.ProgressPercent = history.Position / history.Duration * 100
+	}
+	updatedAt := history.UpdatedAt
+	media.LastWatchedAt = &updatedAt
 }
 
 type mediaActorSearchRow struct {
@@ -994,6 +1095,12 @@ func isBrowsableGenre(token string, actorKeys map[string]bool) bool {
 }
 
 func (a *App) GetMediaList(libraryID string, page, size int, sortBy, sortOrder, keyword string, filterType, filterValue string) (interface{}, error) {
+	if err := a.waitForStartup(); err != nil {
+		return nil, err
+	}
+	if a.db == nil {
+		return nil, errors.New("application database is not initialized")
+	}
 	// 扩展原生后端的检索逻辑，增加分类过滤支持
 	query := a.db.Model(&model.Media{})
 	if sortBy == "last_watched" {
@@ -1897,13 +2004,12 @@ func (a *App) ensureWatched(mediaID string) error {
 	var wh model.WatchHistory
 	err := a.db.Where("media_id = ? AND user_id = ?", mediaID, desktopUserID).First(&wh).Error
 	if err == nil {
-		var updateErr error
 		if wh.Completed {
-			updateErr = a.db.Model(&wh).Update("updated_at", time.Now()).Error
+			wh.UpdatedAt = time.Now()
 		} else {
 			wh.Completed = true
-			updateErr = a.db.Save(&wh).Error
 		}
+		updateErr := a.repos.WatchHistory.Upsert(&wh)
 		if updateErr == nil {
 			a.broadcastMediaState(mediaID, boolPtr(true), nil)
 		}
@@ -1918,7 +2024,7 @@ func (a *App) ensureWatched(mediaID string) error {
 		MediaID:   mediaID,
 		Completed: true,
 	}
-	if err := a.db.Create(&newWh).Error; err != nil {
+	if err := a.repos.WatchHistory.Upsert(&newWh); err != nil {
 		return err
 	}
 	a.broadcastMediaState(mediaID, boolPtr(true), nil)
@@ -1937,20 +2043,8 @@ func (a *App) broadcastMediaState(mediaID string, watched *bool, favorite *bool)
 		MediaID:    mediaID,
 		IsWatched:  watched,
 		IsFavorite: favorite,
+		Revision:   a.mediaStateRevision.Add(1),
 	})
-}
-
-func (a *App) markWatchedByFilePath(filePath string) error {
-	filePath = strings.TrimSpace(filePath)
-	if filePath == "" {
-		return fmt.Errorf("empty file path")
-	}
-
-	media, err := a.repos.Media.FindByFilePath(filePath)
-	if err != nil {
-		return err
-	}
-	return a.ensureWatched(media.ID)
 }
 
 // PlayWithExternalPlayer 调用系统原生的外部播放器或配置播放器打开媒体
@@ -1962,9 +2056,6 @@ func (a *App) PlayWithExternalPlayer(mediaID string) error {
 	settings, _ := a.GetDesktopSettings()
 	if err := startDetachedCommand(buildOpenFileCommand(media.FilePath, preferredPlayerPath(settings, true))); err != nil {
 		return err
-	}
-	if err := a.ensureWatched(media.ID); err != nil {
-		a.logger.Errorf("mark watched after external play failed: media=%s err=%v", media.ID, err)
 	}
 	return nil
 }
@@ -2019,7 +2110,8 @@ func (a *App) ToggleWatched(mediaID string) error {
 	err := a.db.Where("media_id = ? AND user_id = ?", mediaID, desktopUserID).First(&wh).Error
 	if err == nil {
 		wh.Completed = !wh.Completed
-		if err := a.db.Save(&wh).Error; err != nil {
+		wh.UpdatedAt = time.Now()
+		if err := a.repos.WatchHistory.Upsert(&wh); err != nil {
 			return err
 		}
 		a.broadcastMediaState(mediaID, boolPtr(wh.Completed), nil)
@@ -2033,7 +2125,7 @@ func (a *App) ToggleWatched(mediaID string) error {
 		MediaID:   mediaID,
 		Completed: true,
 	}
-	if err := a.db.Create(&newWh).Error; err != nil {
+	if err := a.repos.WatchHistory.Upsert(&newWh); err != nil {
 		return err
 	}
 	a.broadcastMediaState(mediaID, boolPtr(true), nil)
@@ -2557,7 +2649,25 @@ func (a *App) GetMediaPreviews(mediaID string) ([]string, error) {
 	return a.getMediaPreviews(media), nil
 }
 
-// PlayMedia starts playback and records the watched state against the stable media ID.
+type playbackEventSink struct{ app *App }
+
+func (s playbackEventSink) MediaStateUpdated(event player.StateEvent) {
+	if s.app == nil || s.app.eventHub == nil {
+		return
+	}
+	completed := event.Completed
+	isWatched := event.IsWatched
+	position, duration, progress := event.Position, event.Duration, event.ProgressPercent
+	lastWatchedAt := event.LastWatchedAt
+	playbackState := string(event.PlaybackState)
+	s.app.eventHub.BroadcastEvent(service.EventMediaStateUpdated, service.MediaStateEventData{
+		MediaID: event.MediaID, Position: &position, Duration: &duration,
+		ProgressPercent: &progress, Completed: &completed, IsWatched: &isWatched,
+		LastWatchedAt: &lastWatchedAt, PlaybackState: &playbackState, Revision: s.app.mediaStateRevision.Add(1),
+	})
+}
+
+// PlayMedia starts playback and tracks progress against the stable media ID.
 func (a *App) PlayMedia(mediaID string, filePath string) error {
 	mediaID = strings.TrimSpace(mediaID)
 	if mediaID == "" {
@@ -2571,56 +2681,46 @@ func (a *App) PlayMedia(mediaID string, filePath string) error {
 	if targetPath == "" {
 		targetPath = strings.TrimSpace(media.FilePath)
 	}
-	return a.playFileAndMark(targetPath, media.ID)
-}
-
-func (a *App) PlayFile(filePath string) error {
-	return a.playFileAndMark(strings.TrimSpace(filePath), "")
-}
-
-func (a *App) playFileAndMark(targetPath string, mediaID string) error {
 	totalStart := time.Now()
 	if targetPath == "" {
 		return fmt.Errorf("empty file path")
 	}
-
-	settingsStart := time.Now()
+	if a.playback != nil {
+		settings, _ := a.GetDesktopSettings()
+		playerPath := preferredPlayerPath(settings, false)
+		if isPotPlayerExecutable(playerPath) {
+			err := a.playback.Play(a.ctx, media.ID, targetPath, playerPath)
+			if err == nil {
+				appendPlayLatencyLog("OK_TRACKING path=%q media=%q total=%s", targetPath, media.ID, time.Since(totalStart))
+				return nil
+			}
+			var startedWarning *player.StartedWithoutSyncError
+			if errors.As(err, &startedWarning) {
+				a.logger.Warnf("PotPlayer started without progress sync: media=%s err=%v", media.ID, err)
+				if a.eventHub != nil {
+					a.eventHub.BroadcastEvent(service.EventPlayerSyncWarning, map[string]string{"media_id": media.ID, "message": err.Error()})
+				}
+				appendPlayLatencyLog("OK_SYNC_DISABLED path=%q media=%q total=%s err=%v", targetPath, media.ID, time.Since(totalStart), err)
+				return nil
+			}
+			if !errors.Is(err, player.ErrUnsupported) {
+				return err
+			}
+		}
+	}
 	settings, _ := a.GetDesktopSettings()
-	settingsCost := time.Since(settingsStart)
-
 	playerPath := preferredPlayerPath(settings, false)
-	cmd := buildOpenFileCommand(targetPath, playerPath)
-
-	startCostStart := time.Now()
-	err := startDetachedCommand(cmd)
-	startCost := time.Since(startCostStart)
-	if err != nil {
-		appendPlayLatencyLog("FAIL path=%q player=%q settings=%s start=%s total=%s err=%v",
-			targetPath, playerPath, settingsCost, startCost, time.Since(totalStart), err)
+	if err := startDetachedCommand(buildOpenFileCommand(targetPath, playerPath)); err != nil {
+		appendPlayLatencyLog("FAIL path=%q player=%q total=%s err=%v", targetPath, playerPath, time.Since(totalStart), err)
 		return err
 	}
-
-	watchedStart := time.Now()
-	var watchedErr error
-	if strings.TrimSpace(mediaID) != "" {
-		watchedErr = a.ensureWatched(mediaID)
-	} else {
-		watchedErr = a.markWatchedByFilePath(targetPath)
-	}
-	watchedCost := time.Since(watchedStart)
-	if watchedErr != nil {
-		if a.logger != nil {
-			a.logger.Errorf("mark watched after play failed: media=%s path=%s err=%v", mediaID, targetPath, watchedErr)
-		}
-		appendPlayLatencyLog("OK_WATCH_FAILED path=%q media=%q player=%q settings=%s start=%s mark_watched=%s total=%s err=%v",
-			targetPath, mediaID, playerPath, settingsCost, startCost, watchedCost, time.Since(totalStart), watchedErr)
-		return nil
-	}
-
-	appendPlayLatencyLog("OK path=%q media=%q player=%q settings=%s start=%s mark_watched=%s total=%s",
-		targetPath, mediaID, playerPath, settingsCost, startCost, watchedCost, time.Since(totalStart))
-
+	appendPlayLatencyLog("OK_UNTRACKED path=%q media=%q player=%q total=%s", targetPath, media.ID, playerPath, time.Since(totalStart))
 	return nil
+}
+
+func isPotPlayerExecutable(path string) bool {
+	name := strings.ToLower(filepath.Base(strings.TrimSpace(path)))
+	return name == "potplayermini64.exe" || name == "potplayermini.exe" || name == "potplayer64.exe" || name == "potplayer.exe"
 }
 
 func appendPlayLatencyLog(format string, args ...interface{}) {

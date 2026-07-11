@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -22,6 +23,7 @@ const (
 	EventThumbnailCanceled    = "thumbnail:canceled"
 	EventMediaMetadataUpdated = "media:metadata-updated"
 	EventMediaStateUpdated    = "media:state-updated"
+	EventPlayerSyncWarning    = "player:sync-warning"
 )
 
 // ScanProgressData holds the payload for a scan progress event.
@@ -61,9 +63,16 @@ type MediaMetadataEventData struct {
 }
 
 type MediaStateEventData struct {
-	MediaID    string `json:"media_id"`
-	IsWatched  *bool  `json:"is_watched,omitempty"`
-	IsFavorite *bool  `json:"is_favorite,omitempty"`
+	MediaID         string     `json:"media_id"`
+	Position        *float64   `json:"position,omitempty"`
+	Duration        *float64   `json:"duration,omitempty"`
+	ProgressPercent *float64   `json:"progress_percent,omitempty"`
+	Completed       *bool      `json:"completed,omitempty"`
+	IsWatched       *bool      `json:"is_watched,omitempty"`
+	IsFavorite      *bool      `json:"is_favorite,omitempty"`
+	LastWatchedAt   *time.Time `json:"last_watched_at,omitempty"`
+	PlaybackState   *string    `json:"playback_state,omitempty"`
+	Revision        uint64     `json:"revision,omitempty"`
 }
 
 // WSHub provides a shim for the original WebSocket hub.

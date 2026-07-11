@@ -482,6 +482,11 @@ export namespace model {
 	    search_text: string;
 	    is_favorite: boolean;
 	    is_watched: boolean;
+	    position: number;
+	    watch_duration: number;
+	    progress_percent: number;
+	    // Go type: time
+	    last_watched_at?: any;
 	
 	    static createFrom(source: any = {}) {
 	        return new Media(source);
@@ -557,6 +562,10 @@ export namespace model {
 	        this.search_text = source["search_text"];
 	        this.is_favorite = source["is_favorite"];
 	        this.is_watched = source["is_watched"];
+	        this.position = source["position"];
+	        this.watch_duration = source["watch_duration"];
+	        this.progress_percent = source["progress_percent"];
+	        this.last_watched_at = this.convertValues(source["last_watched_at"], null);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

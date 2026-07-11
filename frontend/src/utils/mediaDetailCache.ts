@@ -1,5 +1,6 @@
 import { GetMediaDetailBundle } from "../../wailsjs/go/main/App";
 import type { AppMedia } from '../types/wails';
+import { applyMediaStateUpdate, type MediaStateUpdate } from './mediaPlaybackState';
 
 export type MediaDetailCacheEntry = {
     detail: AppMedia;
@@ -67,6 +68,32 @@ const mergeMediaDetail = (currentDetail: AppMedia | null | undefined, nextDetail
     return mergedDetail;
 };
 
+const mergeFetchedMediaDetail = (currentDetail: AppMedia | null | undefined, nextDetail: AppMedia) => {
+    const mergedDetail = mergeMediaDetail(currentDetail, nextDetail);
+    if (!currentDetail || typeof currentDetail.revision !== 'number' || currentDetail.revision <= 0) {
+        return mergedDetail;
+    }
+
+    const playbackFields: Array<keyof MediaStateUpdate> = [
+        'position',
+        'duration',
+        'watch_duration',
+        'progress_percent',
+        'completed',
+        'is_watched',
+        'is_favorite',
+        'last_watched_at',
+        'playback_state',
+        'revision',
+    ];
+    playbackFields.forEach((field) => {
+        if (Object.prototype.hasOwnProperty.call(currentDetail, field)) {
+            (mergedDetail as Record<string, any>)[field] = (currentDetail as Record<string, any>)[field];
+        }
+    });
+    return mergedDetail;
+};
+
 export const getMediaDetailCacheEntry = (mediaID: string) => {
     const normalizedMediaID = typeof mediaID === 'string' ? mediaID.trim() : '';
     if (!normalizedMediaID) {
@@ -116,6 +143,26 @@ export const mergeMediaDetailCacheEntry = (media: AppMedia) => {
     });
 };
 
+export const mergeMediaStateCacheEntry = (update: MediaStateUpdate) => {
+    const mediaID = typeof update?.id === 'string' ? update.id.trim() : '';
+    if (!mediaID) {
+        return;
+    }
+
+    const existingEntry = getMediaDetailCacheEntry(mediaID);
+    const currentDetail = existingEntry?.detail || ({ id: mediaID } as AppMedia);
+    const nextDetail = applyMediaStateUpdate(currentDetail as AppMedia & Record<string, any>, update) as AppMedia;
+    if (nextDetail === currentDetail && existingEntry) {
+        return;
+    }
+    setMediaDetailCacheEntry(mediaID, {
+        detail: nextDetail,
+        files: existingEntry?.files || [],
+        previews: existingEntry?.previews || [],
+        updatedAt: Date.now(),
+    });
+};
+
 export const removeMediaDetailCacheEntry = (mediaID: string) => {
     const normalizedMediaID = typeof mediaID === 'string' ? mediaID.trim() : '';
     if (!normalizedMediaID) {
@@ -142,8 +189,9 @@ export const fetchMediaDetailCacheEntry = async (mediaID: string): Promise<Media
             if (!bundle?.detail) {
                 throw new Error('empty media detail bundle');
             }
+            const existingEntry = getMediaDetailCacheEntry(normalizedMediaID);
             const nextEntry: MediaDetailCacheEntry = {
-                detail: bundle.detail,
+                detail: mergeFetchedMediaDetail(existingEntry?.detail, bundle.detail),
                 files: Array.isArray(bundle?.files) ? bundle.files : [],
                 previews: Array.isArray(bundle?.previews) ? bundle.previews : [],
                 updatedAt: Date.now(),

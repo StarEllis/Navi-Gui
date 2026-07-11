@@ -42,9 +42,16 @@ import {
     removeMediaDetailCacheEntry,
     seedMediaDetailCache,
 } from '../utils/mediaDetailCache';
+import {
+    applyMediaStateUpdate,
+    formatPlaybackTime,
+    getMediaProgressPercent,
+    type MediaStateUpdate,
+} from '../utils/mediaPlaybackState';
 
 interface MediaDetailProps {
     media: AppMedia;
+    mediaStateUpdate?: MediaStateUpdate | null;
     onClose: () => void;
     onSelectMedia: (media: AppMedia) => void;
     onSelectFilter: (filter: MediaFilter) => void;
@@ -311,8 +318,41 @@ const mergeRecommendationItems = (recommendationGroups?: RecommendationGroups | 
 
 const emptyRecommendations: RecommendationGroups = { continue_watching: [], more_like_this: [] };
 
+const applyMediaStateToRecommendations = (
+    groups: RecommendationGroups,
+    update: MediaStateUpdate,
+) => {
+    let changed = false;
+    const applyToGroup = (items: RecommendationItem[]) => items.map((item) => {
+        const nextMedia = applyMediaStateUpdate(item.media as AppMedia & Record<string, any>, update) as AppMedia;
+        if (nextMedia === item.media) {
+            return item;
+        }
+        changed = true;
+        return { ...item, media: nextMedia };
+    });
+    const next = {
+        ...groups,
+        continue_watching: applyToGroup(groups.continue_watching || []),
+        more_like_this: applyToGroup(groups.more_like_this || []),
+    };
+    return changed ? next : groups;
+};
+
+const applyKnownMediaStatesToRecommendations = (
+    groups: RecommendationGroups,
+    updates: Map<string, MediaStateUpdate>,
+) => {
+    let next = groups;
+    updates.forEach((update) => {
+        next = applyMediaStateToRecommendations(next, update);
+    });
+    return next;
+};
+
 const MediaDetail: React.FC<MediaDetailProps> = ({
     media,
+    mediaStateUpdate,
     onClose,
     onSelectMedia,
     onSelectFilter,
@@ -338,6 +378,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     const chipStripRef = useRef<HTMLDivElement | null>(null);
     const previewStripRef = useRef<HTMLDivElement | null>(null);
     const codeCopyTimerRef = useRef<number | null>(null);
+    const mediaStateByIDRef = useRef(new Map<string, MediaStateUpdate>());
 
     const showMsg = (message: string) => {
         setMsg(message);
@@ -352,11 +393,39 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     };
 
     const applyResolvedDetail = (nextDetail: AppMedia) => {
-        setDetail(nextDetail);
-        setCurrFilePath((prev) => (prev || nextDetail.file_path || media.file_path || '').trim());
-        mergeMediaDetailCacheEntry(nextDetail);
-        onMediaChange?.(nextDetail);
+        const knownState = mediaStateByIDRef.current.get(nextDetail.id);
+        const resolvedDetail = knownState
+            ? applyMediaStateUpdate(nextDetail as AppMedia & Record<string, any>, knownState) as AppMedia
+            : nextDetail;
+        setDetail(resolvedDetail);
+        setCurrFilePath((prev) => (prev || resolvedDetail.file_path || media.file_path || '').trim());
+        mergeMediaDetailCacheEntry(resolvedDetail);
+        onMediaChange?.(resolvedDetail);
     };
+
+    useEffect(() => {
+        if (!mediaStateUpdate) {
+            return;
+        }
+        const current = mediaStateByIDRef.current.get(mediaStateUpdate.id) || { id: mediaStateUpdate.id };
+        const next = applyMediaStateUpdate(current, mediaStateUpdate);
+        if (next === current) {
+            return;
+        }
+        mediaStateByIDRef.current.delete(mediaStateUpdate.id);
+        mediaStateByIDRef.current.set(mediaStateUpdate.id, next);
+        while (mediaStateByIDRef.current.size > 64) {
+            const oldestMediaID = mediaStateByIDRef.current.keys().next().value;
+            if (!oldestMediaID) {
+                break;
+            }
+            mediaStateByIDRef.current.delete(oldestMediaID);
+        }
+        setDetail((currentDetail) => (
+            applyMediaStateUpdate(currentDetail as AppMedia & Record<string, any>, mediaStateUpdate) as AppMedia
+        ));
+        setRecommendations((currentGroups) => applyMediaStateToRecommendations(currentGroups, mediaStateUpdate));
+    }, [mediaStateUpdate]);
 
     useEffect(() => {
         let active = true;
@@ -366,9 +435,13 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
             : (typeof media.file_path === 'string' && media.file_path.trim() ? [media.file_path.trim()] : []);
         const fallbackPreviews = cachedEntry?.previews || [];
         const initialDetail = cachedEntry?.detail || media;
+        const knownInitialState = mediaStateByIDRef.current.get(media.id);
+        const resolvedInitialDetail = knownInitialState
+            ? applyMediaStateUpdate(initialDetail as AppMedia & Record<string, any>, knownInitialState) as AppMedia
+            : initialDetail;
 
         seedMediaDetailCache(media);
-        setDetail(initialDetail);
+        setDetail(resolvedInitialDetail);
         setFiles(fallbackFiles);
         setPreviews(fallbackPreviews);
         setCurrFilePath((cachedEntry?.detail?.file_path || fallbackFiles[0] || media.file_path || '').trim());
@@ -382,7 +455,10 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                 if (!active) {
                     return;
                 }
-                setRecommendations(nextRecommendations || emptyRecommendations);
+                setRecommendations(applyKnownMediaStatesToRecommendations(
+                    nextRecommendations || emptyRecommendations,
+                    mediaStateByIDRef.current,
+                ));
             })
             .catch((error) => {
                 console.error(error);
@@ -405,11 +481,15 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                     return;
                 }
 
-                setDetail(nextEntry.detail);
+                const knownState = mediaStateByIDRef.current.get(media.id);
+                const resolvedDetail = knownState
+                    ? applyMediaStateUpdate(nextEntry.detail as AppMedia & Record<string, any>, knownState) as AppMedia
+                    : nextEntry.detail;
+                setDetail(resolvedDetail);
                 setFiles(nextEntry.files);
                 setPreviews(nextEntry.previews);
-                setCurrFilePath((nextEntry.detail?.file_path || nextEntry.files[0] || media.file_path || '').trim());
-                onMediaChange?.(nextEntry.detail);
+                setCurrFilePath((resolvedDetail?.file_path || nextEntry.files[0] || media.file_path || '').trim());
+                onMediaChange?.(resolvedDetail);
             } catch (error) {
                 console.error(error);
                 if (!active) {
@@ -792,6 +872,10 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     const canViewPrevPreview = previewViewerIndex !== null && previewViewerIndex > 0;
     const canViewNextPreview = previewViewerIndex !== null && previewViewerIndex < previews.length - 1;
     const mergedRecommendations = mergeRecommendationItems(recommendations);
+    const playbackProgress = getMediaProgressPercent(detail);
+    const playbackDuration = detail.watch_duration || detail.duration;
+    const showPlaybackProgress = playbackProgress !== null
+        && (playbackProgress > 0 || typeof detail.revision === 'number');
 
     return (
         <>
@@ -873,6 +957,25 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                                 )}
                             </div>
                         </div>
+
+                        {showPlaybackProgress && (
+                            <div className="detail-playback-progress" data-playback-state={detail.playback_state || ''}>
+                                <div className="detail-playback-progress-copy">
+                                    <span>{formatPlaybackTime(detail.position)} / {formatPlaybackTime(playbackDuration)}</span>
+                                    <span>{Math.round(playbackProgress)}%</span>
+                                </div>
+                                <div
+                                    className="playback-progress-track detail-playback-progress-track"
+                                    role="progressbar"
+                                    aria-label="Playback progress"
+                                    aria-valuemin={0}
+                                    aria-valuemax={100}
+                                    aria-valuenow={Math.round(playbackProgress)}
+                                >
+                                    <span className="playback-progress-value" style={{ width: `${playbackProgress}%` }} />
+                                </div>
+                            </div>
+                        )}
 
                         {metadataHint && (
                             <div className={`detail-metadata-hint ${metadataPhase}`}>
