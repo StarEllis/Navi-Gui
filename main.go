@@ -15,13 +15,23 @@ import (
 //go:embed all:frontend/dist
 var assets embed.FS
 
-type LocalFileHandler struct{}
+type LocalFileHandler struct {
+	reserve func(string) (func(), bool)
+}
 
 func (h *LocalFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/local/") {
 		filePath := strings.TrimPrefix(r.URL.Path, "/local/")
 		if unescaped, err := url.PathUnescape(filePath); err == nil {
 			filePath = unescaped
+		}
+		if h.reserve != nil {
+			release, ok := h.reserve(filePath)
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			defer release()
 		}
 		http.ServeFile(w, r, filePath)
 		return
@@ -41,7 +51,7 @@ func main() {
 		Frameless: true,
 		AssetServer: &assetserver.Options{
 			Assets:  assets,
-			Handler: &LocalFileHandler{},
+			Handler: &LocalFileHandler{reserve: app.reserveArtworkPath},
 		},
 		BackgroundColour: &options.RGBA{R: 10, G: 14, B: 23, A: 1},
 		OnStartup:        app.startup,

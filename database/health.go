@@ -23,6 +23,7 @@ type HealthReport struct {
 	SupportedVersion     int                   `json:"supported_version"`
 	QuickCheck           []string              `json:"quick_check"`
 	MissingTables        []string              `json:"missing_tables"`
+	MissingColumns       []string              `json:"missing_columns"`
 	MissingIndexes       []string              `json:"missing_indexes"`
 	ForeignKeyViolations []ForeignKeyViolation `json:"foreign_key_violations"`
 	OrphanCounts         map[string]int64      `json:"orphan_counts"`
@@ -44,6 +45,10 @@ var requiredTables = []string{
 	"favorites",
 	"watch_histories",
 	"scrape_tasks",
+}
+
+var requiredColumns = map[string][]string{
+	"media": {"search_text", "search_pinyin", "search_initials"},
 }
 
 func (m *Manager) HealthCheck(ctx context.Context, readOnly bool) HealthReport {
@@ -85,6 +90,16 @@ func (m *Manager) HealthCheck(ctx context.Context, readOnly bool) HealthReport {
 	for _, table := range requiredTables {
 		if !m.db.Migrator().HasTable(table) {
 			report.MissingTables = append(report.MissingTables, table)
+		}
+	}
+	for table, columns := range requiredColumns {
+		if !m.db.Migrator().HasTable(table) {
+			continue
+		}
+		for _, column := range columns {
+			if !m.db.Migrator().HasColumn(table, column) {
+				report.MissingColumns = append(report.MissingColumns, table+"."+column)
+			}
 		}
 	}
 	for _, index := range requiredIndexDefinitions {
@@ -144,6 +159,7 @@ func finalizeHealth(report HealthReport) HealthReport {
 	switch {
 	case len(report.Errors) > 0,
 		len(report.MissingTables) > 0,
+		len(report.MissingColumns) > 0,
 		len(report.MissingIndexes) > 0,
 		len(report.ForeignKeyViolations) > 0:
 		report.Status = "error"
@@ -157,6 +173,9 @@ func finalizeHealth(report HealthReport) HealthReport {
 	}
 	if len(report.MissingTables) > 0 {
 		report.Recommendations = append(report.Recommendations, "restore a verified migration backup or reinstall a compatible application; do not recreate tables manually")
+	}
+	if len(report.MissingColumns) > 0 {
+		report.Recommendations = append(report.Recommendations, "run the supported database migration path to restore required columns")
 	}
 	if len(report.MissingIndexes) > 0 {
 		report.Recommendations = append(report.Recommendations, "run the supported database migration path to recreate required indexes")

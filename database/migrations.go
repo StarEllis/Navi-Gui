@@ -64,6 +64,11 @@ func DefaultMigrations() []Migration {
 				return MigrationStats{}, nil
 			},
 		},
+		{
+			Version: 5,
+			Name:    "media_search_fields",
+			Apply:   migrateMediaSearchFields,
+		},
 	}
 }
 

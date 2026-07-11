@@ -93,6 +93,10 @@ func (r *MediaPersonRepo) DeleteBySeriesID(seriesID string) error {
 	return r.db.Where("series_id = ?", seriesID).Delete(&model.MediaPerson{}).Error
 }
 
+func (r *MediaPersonRepo) RefreshMediaSearchIndex(mediaID string) error {
+	return RefreshMediaSearchIndex(r.db, mediaID)
+}
+
 func (r *MediaPersonRepo) ListByPersonID(personID string) ([]model.MediaPerson, error) {
 	var mps []model.MediaPerson
 	err := r.db.Where("person_id = ?", personID).Find(&mps).Error

@@ -227,6 +227,9 @@ type ScannerService struct {
 	readDir                   func(string) ([]os.DirEntry, error)
 	readFile                  func(string) ([]byte, error)
 	probeMediaFile            func(string) ([]byte, error)
+	probeMediaFileContext     func(context.Context, string) ([]byte, error)
+	probeGovernor             *processGovernor
+	probeScope                *probeScope
 	scanContext               context.Context
 	scanTaskID                string
 	strictScan                bool
@@ -239,8 +242,30 @@ type ScannerService struct {
 	scanStartAlreadyBroadcast bool
 }
 
+type ProbeDiagnostics struct {
+	ProcessDiagnostics
+	Requests, Shared int64
+}
+
+func (s *ScannerService) ProbeDiagnostics() ProbeDiagnostics {
+	if s == nil {
+		return ProbeDiagnostics{}
+	}
+	d := ProbeDiagnostics{ProcessDiagnostics: s.probeGovernor.diagnostics()}
+	if s.probeScope != nil {
+		d.Requests = s.probeScope.requests.Load()
+		d.Shared = s.probeScope.hits.Load()
+	}
+	return d
+}
+
 func NewScannerService(mediaRepo *repository.MediaRepo, seriesRepo *repository.SeriesRepo, personRepo *repository.PersonRepo, mediaPersonRepo *repository.MediaPersonRepo, cfg *config.Config, logger *zap.SugaredLogger) *ScannerService {
 	workerCtx, workerCancel := context.WithCancel(context.Background())
+	probeLimit := 2
+	if cfg != nil && cfg.App.FFprobeConcurrency > 0 {
+		probeLimit = cfg.App.FFprobeConcurrency
+	}
+	probeGovernor := newProcessGovernor(workerCtx, probeLimit)
 	service := &ScannerService{
 		mediaRepo:            mediaRepo,
 		seriesRepo:           seriesRepo,
@@ -262,6 +287,7 @@ func NewScannerService(mediaRepo *repository.MediaRepo, seriesRepo *repository.S
 		statFile:             os.Stat,
 		readDir:              os.ReadDir,
 		readFile:             os.ReadFile,
+		probeGovernor:        probeGovernor,
 	}
 	service.startMetadataWorkers()
 	return service
@@ -295,6 +321,9 @@ func (s *ScannerService) cloneForScanContext(ctx context.Context, taskID string)
 		readDir:                   s.readDir,
 		readFile:                  s.readFile,
 		probeMediaFile:            s.probeMediaFile,
+		probeMediaFileContext:     s.probeMediaFileContext,
+		probeGovernor:             s.probeGovernor,
+		probeScope:                newProbeScope(ctx),
 		scanContext:               ctx,
 		scanTaskID:                taskID,
 	}
@@ -605,6 +634,7 @@ func (s *ScannerService) ScanLibraryAtomic(db *gorm.DB, library *model.Library, 
 		options.Context = context.Background()
 	}
 	runScanner := s.cloneForScanContext(options.Context, options.TaskID)
+	defer runScanner.probeScope.close()
 	runScanner.broadcastScanEvent(EventScanStarted, &ScanProgressData{
 		TaskID:      options.TaskID,
 		LibraryID:   library.ID,
@@ -725,6 +755,8 @@ func (s *ScannerService) cloneForAtomicScan(repos *repository.Repositories, ctx 
 		readDir:                   prepared.readDir,
 		readFile:                  prepared.readFile,
 		preparedProbes:            prepared.probes,
+		probeGovernor:             s.probeGovernor,
+		probeScope:                s.probeScope,
 		scanContext:               ctx,
 		scanTaskID:                s.scanTaskID,
 		strictScan:                true,
@@ -1669,6 +1701,7 @@ func (s *ScannerService) ScanLibraryWithOptions(library *model.Library, options 
 		options.Context = context.Background()
 	}
 	runScanner := s.cloneForScanContext(options.Context, options.TaskID)
+	defer runScanner.probeScope.close()
 	result, err := runScanner.scanLibraryWithOptionsCore(library, options)
 	if library != nil && !options.SuppressTerminal {
 		runScanner.broadcastScanTerminal(library, options, result, err)
@@ -2090,6 +2123,15 @@ func (s *ScannerService) Shutdown(ctx context.Context) error {
 		s.metadataAccepting = false
 		s.metadataMu.Unlock()
 		s.metadataWorkerCancel()
+		if s.thumbnailService != nil {
+			s.thumbnailService.Shutdown()
+		}
+		if s.probeScope != nil {
+			s.probeScope.close()
+		}
+		if s.probeGovernor != nil {
+			s.probeGovernor.shutdown()
+		}
 	})
 	if ctx == nil {
 		ctx = context.Background()
@@ -2520,6 +2562,12 @@ func (s *ScannerService) syncActorsForMediaWithRepos(media *model.Media, strict 
 			}
 			s.logger.Warnf("persist actor relation failed: media=%s actor=%s err=%v", media.ID, name, err)
 		}
+	}
+	if err := mediaPersonRepo.RefreshMediaSearchIndex(media.ID); err != nil {
+		if strict {
+			return fmt.Errorf("refresh media search index for %s: %w", media.ID, err)
+		}
+		s.logger.Warnf("refresh media search index failed: media=%s err=%v", media.ID, err)
 	}
 	return nil
 }
@@ -2975,6 +3023,27 @@ func newBackgroundCommand(parent context.Context, timeout time.Duration, executa
 	cmd := exec.CommandContext(ctx, executable, args...)
 	configureBackgroundCommand(cmd)
 	return cmd, cancel
+}
+
+func runBackgroundCommand(parent context.Context, timeout time.Duration, combined bool, executable string, args ...string) ([]byte, error) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, executable, args...)
+	configureBackgroundCommand(cmd)
+	var output []byte
+	var err error
+	if combined {
+		output, err = cmd.CombinedOutput()
+	} else {
+		output, err = cmd.Output()
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return output, ctxErr
+	}
+	return output, err
 }
 
 func (s *ScannerService) commandContext() context.Context {
@@ -5155,21 +5224,35 @@ func (s *ScannerService) probeSTRMMedia(media *model.Media, streamURL string) {
 }
 
 func (s *ScannerService) runMediaProbe(mediaPath string) ([]byte, error) {
-	if s.probeMediaFile != nil {
-		return s.probeMediaFile(mediaPath)
+	info, err := s.stat(mediaPath)
+	if err != nil {
+		return nil, err
 	}
-	if s.cfg == nil || strings.TrimSpace(s.cfg.App.FFprobePath) == "" {
-		return nil, fmt.Errorf("ffprobe configuration is unavailable")
+	absPath, err := filepath.Abs(mediaPath)
+	if err != nil {
+		return nil, err
 	}
-	cmd, cancel := newBackgroundCommand(s.commandContext(), mediaProbeTimeout, s.cfg.App.FFprobePath,
-		"-v", "quiet",
-		"-print_format", "json",
-		"-show_format",
-		"-show_streams",
-		mediaPath,
-	)
-	defer cancel()
-	return cmd.Output()
+	key := fmt.Sprintf("%s:%d:%d", nfoPathKey(absPath), info.Size(), info.ModTime().UnixNano())
+	waiter := s.commandContext()
+	run := func(ctx context.Context) ([]byte, error) {
+		return s.probeGovernor.runKeyed(ctx, key, func(processCtx context.Context) ([]byte, error) {
+			if s.probeMediaFileContext != nil {
+				return s.probeMediaFileContext(processCtx, mediaPath)
+			}
+			if s.probeMediaFile != nil {
+				return s.probeMediaFile(mediaPath)
+			}
+			if s.cfg == nil || strings.TrimSpace(s.cfg.App.FFprobePath) == "" {
+				return nil, fmt.Errorf("ffprobe configuration is unavailable")
+			}
+			return runBackgroundCommand(processCtx, mediaProbeTimeout, false, s.cfg.App.FFprobePath,
+				"-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", mediaPath)
+		})
+	}
+	if s.probeScope != nil {
+		return s.probeScope.do(waiter, key, run)
+	}
+	return run(waiter)
 }
 
 // probeMediaInfo 使用FFprobe提取视频元数据（.strm 文件走特殊逻辑）
@@ -5239,15 +5322,10 @@ func (s *ScannerService) applyFFprobeOutput(media *model.Media, output []byte) e
 
 // GetSubtitleTracks 获取媒体文件的内嵌字幕轨道列表
 func (s *ScannerService) GetSubtitleTracks(filePath string) ([]SubtitleTrack, error) {
-	cmd, cancel := newBackgroundCommand(s.commandContext(), mediaProbeTimeout, s.cfg.App.FFprobePath,
-		"-v", "quiet",
-		"-print_format", "json",
-		"-show_streams",
-		"-select_streams", "s", filePath,
-	)
-	defer cancel()
-
-	output, err := cmd.Output()
+	output, err := s.probeGovernor.run(s.commandContext(), func(ctx context.Context) ([]byte, error) {
+		return runBackgroundCommand(ctx, mediaProbeTimeout, false, s.cfg.App.FFprobePath,
+			"-v", "quiet", "-print_format", "json", "-show_streams", "-select_streams", "s", filePath)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("FFprobe获取字幕失败: %w", err)
 	}
@@ -5294,16 +5372,7 @@ func (s *ScannerService) ExtractSubtitle(filePath string, streamIndex int, outpu
 		return outputPath, nil
 	}
 
-	cmd, cancel := newBackgroundCommand(s.commandContext(), mediaTranscodeTimeout, s.cfg.App.FFmpegPath,
-		"-y",
-		"-i", filePath,
-		"-map", fmt.Sprintf("0:%d", streamIndex),
-		"-c:s", s.getSubtitleCodec(outputFormat),
-		outputPath,
-	)
-	defer cancel()
-
-	if err := cmd.Run(); err != nil {
+	if _, err := s.runFFmpegAtomic(outputPath, []string{"-y", "-i", filePath, "-map", fmt.Sprintf("0:%d", streamIndex), "-c:s", s.getSubtitleCodec(outputFormat)}); err != nil {
 		return "", fmt.Errorf("提取字幕失败: %w", err)
 	}
 
@@ -5594,20 +5663,49 @@ func (s *ScannerService) ConvertSubtitleToVTT(subtitlePath string) (string, erro
 	}
 
 	// 使用FFmpeg将字幕转换为WebVTT
-	cmd, cancel := newBackgroundCommand(s.commandContext(), mediaTranscodeTimeout, s.cfg.App.FFmpegPath,
-		"-y",
-		"-i", subtitlePath,
-		"-c:s", "webvtt",
-		outputPath,
-	)
-	defer cancel()
-
-	if output, err := cmd.CombinedOutput(); err != nil {
+	if output, err := s.runFFmpegAtomic(outputPath, []string{"-y", "-i", subtitlePath, "-c:s", "webvtt"}); err != nil {
 		return "", fmt.Errorf("FFmpeg字幕转换失败: %w, 输出: %s", err, string(output))
 	}
 
 	s.logger.Debugf("字幕转换完成: %s -> %s", subtitlePath, outputPath)
 	return outputPath, nil
+}
+
+func (s *ScannerService) runFFmpegAtomic(outputPath string, args []string) ([]byte, error) {
+	if fileExists(outputPath) {
+		return nil, nil
+	}
+	if s.thumbnailService == nil || s.thumbnailService.ffmpegGovernor == nil {
+		return nil, fmt.Errorf("ffmpeg governor is unavailable")
+	}
+	ctx := s.commandContext()
+	return s.thumbnailService.ffmpegGovernor.runKeyed(ctx, "ffmpeg:"+filepath.Clean(outputPath), func(runCtx context.Context) ([]byte, error) {
+		if fileExists(outputPath) {
+			return nil, nil
+		}
+		if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
+			return nil, err
+		}
+		ext := filepath.Ext(outputPath)
+		tempPath := strings.TrimSuffix(outputPath, ext) + ".navi-ffmpeg-" + uuid.NewString() + ".part" + ext
+		defer os.Remove(tempPath)
+		commandArgs := append(append([]string(nil), args...), tempPath)
+		output, err := runBackgroundCommand(runCtx, mediaTranscodeTimeout, true, s.cfg.App.FFmpegPath, commandArgs...)
+		if err != nil {
+			return output, err
+		}
+		if err := os.Rename(tempPath, outputPath); err != nil {
+			return output, err
+		}
+		return output, nil
+	})
+}
+
+func (s *ScannerService) ThumbnailService() *ThumbnailService {
+	if s == nil {
+		return nil
+	}
+	return s.thumbnailService
 }
 
 // GetFileExt 获取文件扩展名（小写）

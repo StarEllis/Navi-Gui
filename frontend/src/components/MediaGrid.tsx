@@ -1,22 +1,21 @@
-import React, { startTransition, useDeferredValue, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { GetMediaList } from "../../wailsjs/go/main/App";
 import MediaCard from './MediaCard';
-import {
-    getCachedMediaListEntry,
-    mergeMediaIntoCachedMediaLists,
-    persistMediaListCache,
-    removeMediaFromCachedMediaLists,
-} from '../utils/persistentCache';
-import {
-    buildMediaPhoneticSearchIndex,
-    buildMediaSearchIndex,
-    hasCJKSearchCharacter,
-    type MediaPhoneticSearchIndex,
-    normalizeSearchField,
-    normalizeSearchTerm,
-    parseMediaSearchQuery,
-} from '../utils/mediaSearch';
 import { prefetchMediaDetailCacheEntry, seedMediaDetailCache } from '../utils/mediaDetailCache';
+import {
+    createLatestRequestGate,
+    finishPageLoading,
+    getMediaAtIndex,
+    getPagesForVisibleRange,
+    getVirtualGridWindow,
+    isPageLoadingForGeneration,
+    markPageLoading,
+    MEDIA_PAGE_SIZE,
+    putMediaPage,
+    requestMediaPage,
+    type MediaPageQuery,
+} from '../utils/mediaPagination';
+import { markComponentRender } from '../utils/performanceDiagnostics';
 
 interface MediaGridProps {
     libraryId: string;
@@ -38,23 +37,6 @@ export type MediaGridMutation =
     | { type: 'merge'; media: any }
     | { type: 'remove'; mediaId: string };
 
-type SearchableMediaItem = {
-    media: any;
-    searchIndex: string;
-    codeIndex: string;
-    titleIndex: string;
-    actorIndex: string;
-    genreIndex: string;
-    metadataIndex: string;
-    pathIndex: string;
-    phoneticIndex?: MediaPhoneticSearchIndex;
-};
-
-type MediaSearchResult = {
-    items: any[];
-    isFallback: boolean;
-};
-
 const MEDIA_CARD_WIDTH = 178;
 const MEDIA_CARD_HEIGHT = 297;
 const MEDIA_GRID_MIN_GAP = 18;
@@ -62,6 +44,7 @@ const MEDIA_GRID_MAX_GAP = 24;
 const MEDIA_GRID_ROW_GAP = 24;
 const MEDIA_GRID_HORIZONTAL_PADDING = 48;
 const VIRTUAL_OVERSCAN_ROWS = 2;
+const SCROLL_NOTIFY_MS = 120;
 
 export const getMediaListCacheKey = (
     libraryId: string,
@@ -70,235 +53,23 @@ export const getMediaListCacheKey = (
     sortOrder: 'asc' | 'desc',
     filterType: string,
     filterValue: string,
-) => JSON.stringify([libraryId, keyword, sortField, sortOrder, filterType, filterValue]);
+) => JSON.stringify([libraryId, keyword.trim(), sortField, sortOrder, filterType, filterValue]);
 
-export const getMediaListBaseCacheKey = (
-    libraryId: string,
-    sortField: string,
-    sortOrder: 'asc' | 'desc',
-    filterType: string,
-    filterValue: string,
-) => JSON.stringify([libraryId, sortField, sortOrder, filterType, filterValue]);
-
-const createSearchableMediaItems = (items: any[]): SearchableMediaItem[] => {
-    if (!Array.isArray(items)) {
-        return [];
+const matchesActiveFilter = (media: any, filterType: string, filterValue: string) => {
+    switch (filterType) {
+        case 'favorite':
+            return Boolean(media?.is_favorite);
+        case 'watched':
+            return Boolean(media?.is_watched);
+        case 'unwatched':
+            return !media?.is_watched;
+        case 'media_type':
+            return media?.media_type === filterValue;
+        case 'series':
+            return media?.series_id === filterValue;
+        default:
+            return true;
     }
-
-    return items
-        .filter((item) => typeof item?.id === 'string' && item.id.trim().length > 0)
-        .map((item) => ({
-            media: item,
-            searchIndex: buildMediaSearchIndex(item),
-            codeIndex: normalizeSearchField(item.code),
-            titleIndex: normalizeSearchTerm([item.title, item.orig_title].filter(Boolean).join('\n')),
-            actorIndex: normalizeSearchField(item.actor),
-            genreIndex: normalizeSearchField(item.genres),
-            metadataIndex: normalizeSearchTerm([
-                item.studio,
-                item.maker,
-                item.label,
-                item.release_date_normalized,
-                typeof item.year === 'number' && item.year > 0 ? String(item.year) : '',
-            ].filter(Boolean).join('\n')),
-            pathIndex: normalizeSearchField(item.file_path),
-        }));
-};
-
-const getMediaItemPhoneticIndex = async (item: SearchableMediaItem) => {
-    if (!item.phoneticIndex) {
-        item.phoneticIndex = await buildMediaPhoneticSearchIndex(item.media);
-    }
-    return item.phoneticIndex;
-};
-
-const getTextTokenPriority = (item: SearchableMediaItem, token: string) => {
-    if (!token || !item.searchIndex.includes(token)) {
-        return null;
-    }
-
-    if (item.codeIndex === token) {
-        return 0;
-    }
-    if (item.codeIndex.startsWith(token)) {
-        return 1;
-    }
-    if (item.codeIndex.includes(token)) {
-        return 2;
-    }
-    if (item.titleIndex.includes(token)) {
-        return 3;
-    }
-    if (item.actorIndex.includes(token)) {
-        return 4;
-    }
-    if (item.genreIndex.includes(token)) {
-        return 5;
-    }
-    if (item.metadataIndex.includes(token)) {
-        return 6;
-    }
-    if (item.pathIndex.includes(token)) {
-        return 7;
-    }
-
-    return 8;
-};
-
-const getPhoneticTokenPriority = async (item: SearchableMediaItem, token: string) => {
-    if (!token || hasCJKSearchCharacter(token) || token.length < 2) {
-        return null;
-    }
-
-    const phoneticIndex = await getMediaItemPhoneticIndex(item);
-    const paddedPinyinIndex = ` ${phoneticIndex.pinyinIndex} `;
-    if (paddedPinyinIndex.includes(` ${token} `)) {
-        return 8;
-    }
-    if (phoneticIndex.pinyinIndex.includes(token)) {
-        return 9;
-    }
-    if (phoneticIndex.compactPinyinIndex.startsWith(token)) {
-        return 10;
-    }
-    if (phoneticIndex.compactPinyinIndex.includes(token)) {
-        return 11;
-    }
-    if (phoneticIndex.initialsIndex.startsWith(token)) {
-        return 12;
-    }
-    if (phoneticIndex.initialsIndex.includes(token)) {
-        return 13;
-    }
-
-    return null;
-};
-
-const getTokenPriority = async (item: SearchableMediaItem, token: string) => {
-    const textPriority = getTextTokenPriority(item, token);
-    if (textPriority !== null) {
-        return textPriority;
-    }
-    return getPhoneticTokenPriority(item, token);
-};
-
-const rankItemsByTokens = async (
-    items: SearchableMediaItem[],
-    tokens: string[],
-    priorityGetter: (item: SearchableMediaItem, token: string) => number | null | Promise<number | null>,
-) => {
-    const rankedItems: { media: any; index: number; priority: number }[] = [];
-
-    for (let index = 0; index < items.length; index += 1) {
-        const item = items[index];
-        let priority = 0;
-
-        for (const token of tokens) {
-            const tokenPriority = await priorityGetter(item, token);
-            if (tokenPriority === null) {
-                priority = -1;
-                break;
-            }
-            priority += tokenPriority;
-        }
-
-        if (priority >= 0) {
-            rankedItems.push({
-                media: item.media,
-                index,
-                priority,
-            });
-        }
-    }
-
-    return rankedItems
-        .sort((left, right) => left.priority - right.priority || left.index - right.index)
-        .map(({ media }) => media);
-};
-
-const FILTER_ONLY_SEARCH_TERMS = new Set([
-    '4k',
-    '8k',
-    '2160p',
-    '1080p',
-    '720p',
-    'hevc',
-    'h265',
-    'h 265',
-    'h264',
-    'h 264',
-    'avc',
-    '字幕',
-    '中文字幕',
-    '破解',
-    '无码',
-    '有码',
-]);
-
-const filterSearchableMediaItems = async (items: SearchableMediaItem[], keyword: string): Promise<MediaSearchResult> => {
-    const query = parseMediaSearchQuery(keyword);
-    if (query.tokens.length === 0) {
-        return {
-            items: items.map(({ media }) => media),
-            isFallback: false,
-        };
-    }
-
-    if (FILTER_ONLY_SEARCH_TERMS.has(query.normalized)) {
-        return {
-            items: items
-                .filter((item) => item.searchIndex.includes(query.normalized))
-                .map(({ media }) => media),
-            isFallback: false,
-        };
-    }
-
-    if (query.tokens.length === 1 && FILTER_ONLY_SEARCH_TERMS.has(query.tokens[0])) {
-        return {
-            items: items
-                .filter((item) => item.searchIndex.includes(query.tokens[0]))
-                .map(({ media }) => media),
-            isFallback: false,
-        };
-    }
-
-    const strictItems = await rankItemsByTokens(items, query.tokens, getTokenPriority);
-    if (strictItems.length > 0 || query.cjkTokens.length === 0) {
-        return {
-            items: strictItems,
-            isFallback: false,
-        };
-    }
-
-    const fallbackItems = await rankItemsByTokens(items, query.cjkTokens, getTextTokenPriority);
-    return {
-        items: fallbackItems,
-        isFallback: fallbackItems.length > 0,
-    };
-};
-
-const mergeSearchableMediaItem = (item: SearchableMediaItem, media: any): SearchableMediaItem => {
-    const mergedMedia = {
-        ...item.media,
-        ...media,
-    };
-
-    return {
-        media: mergedMedia,
-        searchIndex: buildMediaSearchIndex(mergedMedia),
-        codeIndex: normalizeSearchField(mergedMedia.code),
-        titleIndex: normalizeSearchTerm([mergedMedia.title, mergedMedia.orig_title].filter(Boolean).join('\n')),
-        actorIndex: normalizeSearchField(mergedMedia.actor),
-        genreIndex: normalizeSearchField(mergedMedia.genres),
-        metadataIndex: normalizeSearchTerm([
-            mergedMedia.studio,
-            mergedMedia.maker,
-            mergedMedia.label,
-            mergedMedia.release_date_normalized,
-            typeof mergedMedia.year === 'number' && mergedMedia.year > 0 ? String(mergedMedia.year) : '',
-        ].filter(Boolean).join('\n')),
-        pathIndex: normalizeSearchField(mergedMedia.file_path),
-    };
 };
 
 const MediaGrid: React.FC<MediaGridProps> = ({
@@ -316,397 +87,433 @@ const MediaGrid: React.FC<MediaGridProps> = ({
     onScrollPositionChange,
     mutation = null,
 }) => {
+    markComponentRender('MediaGrid');
     const filterType = filter?.type || '';
     const filterValue = filter?.value || '';
-    const deferredKeyword = useDeferredValue(keyword);
-    const baseCacheKey = getMediaListBaseCacheKey(libraryId, sortField, sortOrder, filterType, filterValue);
-    const containerRef = useRef<HTMLDivElement>(null);
-    const latestScrollTopRef = useRef(0);
-    const pendingRestoreRef = useRef<number | null>(initialScrollTop);
-    const requestTokenRef = useRef(0);
-    const scrollFrameRef = useRef<number | null>(null);
-    const scrollNotifyTimerRef = useRef<number | null>(null);
-    const searchTimerRef = useRef<number | null>(null);
-    const searchRunRef = useRef(0);
-    const onScrollPositionChangeRef = useRef(onScrollPositionChange);
     const [layout, setLayout] = useState({ columns: 4, gap: 20, justify: 'start' });
     const [viewportHeight, setViewportHeight] = useState(0);
     const [virtualScrollTop, setVirtualScrollTop] = useState(initialScrollTop);
-    const [baseItems, setBaseItems] = useState<SearchableMediaItem[]>([]);
-    const [mediaItems, setMediaItems] = useState<any[]>([]);
-    const [isFallbackSearch, setIsFallbackSearch] = useState(false);
-    const [isLoading, setIsLoading] = useState(true);
+    const [pages, setPages] = useState<Map<number, any[]>>(() => new Map());
+    const [total, setTotal] = useState(0);
+    const [isInitialLoading, setIsInitialLoading] = useState(true);
+    const [loadingPages, setLoadingPages] = useState<Map<number, number>>(() => new Map());
+    const [error, setError] = useState('');
+    const [showingStaleResults, setShowingStaleResults] = useState(false);
+    const containerRef = useRef<HTMLDivElement>(null);
+    const latestScrollTopRef = useRef(initialScrollTop);
+    const pendingRestoreRef = useRef<number | null>(initialScrollTop);
+    const requestGateRef = useRef(createLatestRequestGate());
+    const queryKeyRef = useRef('');
+    const lastUsableRef = useRef<{ libraryId: string; pages: Map<number, any[]>; total: number } | null>(null);
+    const lastSuccessfulLibraryRef = useRef('');
+    const focusedMediaIDRef = useRef('');
+    const pagesRef = useRef(pages);
+    const totalRef = useRef(total);
+    const loadingPagesRef = useRef(loadingPages);
+    const visiblePagesRef = useRef<number[]>([1]);
+    const scrollFrameRef = useRef<number | null>(null);
+    const scrollNotifyTimerRef = useRef<number | null>(null);
+    const onScrollPositionChangeRef = useRef(onScrollPositionChange);
+    const onCountChangeRef = useRef(onCountChange);
 
     useEffect(() => {
+        pagesRef.current = pages;
+    }, [pages]);
+    useEffect(() => {
+        totalRef.current = total;
+    }, [total]);
+    useEffect(() => {
+        loadingPagesRef.current = loadingPages;
+    }, [loadingPages]);
+    useEffect(() => {
         onScrollPositionChangeRef.current = onScrollPositionChange;
-    }, [onScrollPositionChange]);
+        onCountChangeRef.current = onCountChange;
+    }, [onCountChange, onScrollPositionChange]);
+
+    const normalizedKeyword = keyword.trim();
+    const queryKey = getMediaListCacheKey(libraryId, normalizedKeyword, sortField, sortOrder, filterType, filterValue);
+    const baseQuery = useMemo<Omit<MediaPageQuery, 'page'>>(() => ({
+        libraryId,
+        pageSize: MEDIA_PAGE_SIZE,
+        searchTerm: normalizedKeyword,
+        mediaType: filterType === 'media_type' ? filterValue : '',
+        sortBy: sortField,
+        sortOrder,
+        favorite: filterType === 'favorite' ? true : null,
+        watched: filterType === 'watched' ? true : filterType === 'unwatched' ? false : null,
+        filterType,
+        filterValue,
+    }), [filterType, filterValue, libraryId, normalizedKeyword, sortField, sortOrder]);
+
+    const beginRequestGeneration = useCallback(() => {
+        const generation = requestGateRef.current.next();
+        const empty = new Map<number, number>();
+        loadingPagesRef.current = empty;
+        setLoadingPages(empty);
+        return generation;
+    }, []);
+
+    const loadPage = useCallback((page: number, generation: number, force = false) => {
+        if (!force && (pagesRef.current.has(page) || isPageLoadingForGeneration(loadingPagesRef.current, page, generation))) {
+            return;
+        }
+
+        const startedLoading = markPageLoading(loadingPagesRef.current, page, generation);
+        loadingPagesRef.current = startedLoading;
+        setLoadingPages(startedLoading);
+
+        const query: MediaPageQuery = { ...baseQuery, page };
+        void requestMediaPage(query, async (normalizedQuery) => {
+            const response: any = await GetMediaList(
+                normalizedQuery.libraryId,
+                normalizedQuery.page,
+                normalizedQuery.pageSize,
+                normalizedQuery.sortBy,
+                normalizedQuery.sortOrder,
+                normalizedQuery.searchTerm,
+                normalizedQuery.filterType,
+                normalizedQuery.filterValue,
+            );
+            return {
+                items: Array.isArray(response?.items) ? response.items : [],
+                total: Number.isFinite(Number(response?.total)) ? Math.max(0, Number(response.total)) : 0,
+                page: Number.isFinite(Number(response?.page)) ? Math.max(1, Number(response.page)) : normalizedQuery.page,
+                pageSize: normalizedQuery.pageSize,
+            };
+        }, requestGateRef.current.requestScope(generation)).then((response) => {
+            if (!requestGateRef.current.accepts(generation)) {
+                return;
+            }
+
+            const totalPages = Math.max(1, Math.ceil(response.total / response.pageSize));
+            if (response.page > totalPages && response.total > 0) {
+                loadPage(totalPages, generation, true);
+                return;
+            }
+            if (response.items.length > response.pageSize) {
+                throw new Error('后端返回条数超过分页上限');
+            }
+            if (response.page < totalPages && response.items.length < response.pageSize) {
+                throw new Error('后端返回了不完整的媒体分页结果');
+            }
+
+            setPages((current) => putMediaPage(current, response.page, response.items, visiblePagesRef.current));
+            setTotal(response.total);
+            setError('');
+            setShowingStaleResults(false);
+            setIsInitialLoading(false);
+            lastSuccessfulLibraryRef.current = baseQuery.libraryId;
+            onCountChangeRef.current?.(response.total);
+        }).catch((reason) => {
+            if (!requestGateRef.current.accepts(generation)) {
+                return;
+            }
+            console.error(reason);
+            setError(reason instanceof Error && reason.message ? reason.message : '媒体列表加载失败');
+            const fallback = lastUsableRef.current;
+            if (pagesRef.current.size === 0 && fallback?.libraryId === baseQuery.libraryId) {
+                pagesRef.current = fallback.pages;
+                totalRef.current = fallback.total;
+                setPages(fallback.pages);
+                setTotal(fallback.total);
+                setShowingStaleResults(true);
+            }
+            setIsInitialLoading(false);
+        }).finally(() => {
+            if (!requestGateRef.current.accepts(generation)) {
+                return;
+            }
+            const finishedLoading = finishPageLoading(loadingPagesRef.current, page, generation);
+            if (finishedLoading !== loadingPagesRef.current) {
+                loadingPagesRef.current = finishedLoading;
+                setLoadingPages(finishedLoading);
+            }
+        });
+    }, [baseQuery]);
+
+    useEffect(() => {
+        const queryChanged = queryKeyRef.current !== queryKey;
+        queryKeyRef.current = queryKey;
+        const generation = beginRequestGeneration();
+
+        if (queryChanged) {
+            if (pagesRef.current.size > 0) {
+                lastUsableRef.current = {
+                    libraryId: lastSuccessfulLibraryRef.current,
+                    pages: pagesRef.current,
+                    total: totalRef.current,
+                };
+            }
+            pagesRef.current = new Map();
+            totalRef.current = 0;
+            setPages(new Map());
+            setTotal(0);
+            setError('');
+            setShowingStaleResults(false);
+            setIsInitialLoading(true);
+            pendingRestoreRef.current = initialScrollTop;
+            latestScrollTopRef.current = initialScrollTop;
+            setVirtualScrollTop(initialScrollTop);
+            loadPage(1, generation, true);
+            return;
+        }
+
+        const refreshPages = visiblePagesRef.current.length > 0 ? visiblePagesRef.current : [1];
+        refreshPages.forEach((page) => loadPage(page, generation, true));
+    }, [beginRequestGeneration, initialScrollTop, loadPage, queryKey, refreshVersion]);
 
     useEffect(() => () => {
+        requestGateRef.current.dispose();
         if (scrollFrameRef.current !== null) {
             window.cancelAnimationFrame(scrollFrameRef.current);
         }
         if (scrollNotifyTimerRef.current !== null) {
             window.clearTimeout(scrollNotifyTimerRef.current);
         }
-        if (searchTimerRef.current !== null) {
-            window.clearTimeout(searchTimerRef.current);
-        }
-        searchRunRef.current += 1;
         onScrollPositionChangeRef.current?.(latestScrollTopRef.current);
     }, []);
 
-    const updateLayout = () => {
+    const updateLayout = useCallback(() => {
         if (!containerRef.current) {
             return;
         }
-
         const containerWidth = containerRef.current.clientWidth - MEDIA_GRID_HORIZONTAL_PADDING;
-        let cols = Math.floor((containerWidth + MEDIA_GRID_MIN_GAP) / (MEDIA_CARD_WIDTH + MEDIA_GRID_MIN_GAP));
-        cols = Math.max(1, cols);
-
-        const currentGap = cols > 1 ? (containerWidth - cols * MEDIA_CARD_WIDTH) / (cols - 1) : 0;
-        const gap = Math.min(Math.max(currentGap, MEDIA_GRID_MIN_GAP), MEDIA_GRID_MAX_GAP);
-        const justify = cols > 1 ? 'space-between' : 'start';
-
-        setLayout((prev) => (
-            prev.columns === cols && prev.gap === gap && prev.justify === justify
-                ? prev
-                : { columns: cols, gap, justify }
-        ));
-
-        setViewportHeight((prev) => {
-            const nextViewportHeight = containerRef.current?.clientHeight || 0;
-            return prev === nextViewportHeight ? prev : nextViewportHeight;
-        });
-    };
-
-    useEffect(() => {
-        let frameId = 0;
-        const scheduleLayoutUpdate = () => {
-            window.cancelAnimationFrame(frameId);
-            frameId = window.requestAnimationFrame(() => updateLayout());
-        };
-
-        const observer = new ResizeObserver(() => scheduleLayoutUpdate());
-        if (containerRef.current) {
-            observer.observe(containerRef.current);
-            if (containerRef.current.parentElement) {
-                observer.observe(containerRef.current.parentElement);
-            }
-        }
-
-        window.addEventListener('resize', scheduleLayoutUpdate);
-        scheduleLayoutUpdate();
-
-        return () => {
-            observer.disconnect();
-            window.removeEventListener('resize', scheduleLayoutUpdate);
-            window.cancelAnimationFrame(frameId);
-        };
+        const columns = Math.max(1, Math.floor((containerWidth + MEDIA_GRID_MIN_GAP) / (MEDIA_CARD_WIDTH + MEDIA_GRID_MIN_GAP)));
+        const rawGap = columns > 1 ? (containerWidth - columns * MEDIA_CARD_WIDTH) / (columns - 1) : 0;
+        const gap = Math.min(Math.max(rawGap, MEDIA_GRID_MIN_GAP), MEDIA_GRID_MAX_GAP);
+        const justify = columns > 1 ? 'space-between' : 'start';
+        setLayout((current) => current.columns === columns && current.gap === gap && current.justify === justify
+            ? current
+            : { columns, gap, justify });
+        const nextHeight = containerRef.current.clientHeight || 0;
+        setViewportHeight((current) => current === nextHeight ? current : nextHeight);
     }, []);
 
     useLayoutEffect(() => {
-        let frameId = 0;
-        frameId = window.requestAnimationFrame(() => updateLayout());
-        return () => {
-            window.cancelAnimationFrame(frameId);
+        let frame = 0;
+        const schedule = () => {
+            window.cancelAnimationFrame(frame);
+            frame = window.requestAnimationFrame(updateLayout);
         };
-    }, [layoutVersion]);
-
-    useLayoutEffect(() => {
-        pendingRestoreRef.current = initialScrollTop;
-        latestScrollTopRef.current = initialScrollTop;
-        setVirtualScrollTop(initialScrollTop);
-
+        const observer = new ResizeObserver(schedule);
         if (containerRef.current) {
-            containerRef.current.scrollTop = Math.max(0, initialScrollTop);
+            observer.observe(containerRef.current);
         }
-    }, [initialScrollTop, libraryId, keyword, sortField, sortOrder, filterType, filterValue]);
+        window.addEventListener('resize', schedule);
+        schedule();
+        return () => {
+            observer.disconnect();
+            window.removeEventListener('resize', schedule);
+            window.cancelAnimationFrame(frame);
+        };
+    }, [layoutVersion, updateLayout]);
 
     useLayoutEffect(() => {
-        if (isLoading || pendingRestoreRef.current === null || !containerRef.current) {
+        if (isInitialLoading || pendingRestoreRef.current === null || !containerRef.current) {
             return;
         }
+        const maxScrollTop = Math.max(containerRef.current.scrollHeight - containerRef.current.clientHeight, 0);
+        const restored = Math.min(Math.max(0, pendingRestoreRef.current), maxScrollTop);
+        containerRef.current.scrollTop = restored;
+        latestScrollTopRef.current = restored;
+        setVirtualScrollTop(restored);
+        pendingRestoreRef.current = null;
+        onScrollPositionChangeRef.current?.(restored);
+    }, [isInitialLoading, layout.columns, total]);
 
-        const targetScrollTop = pendingRestoreRef.current;
-        let frameId = 0;
-        let nestedFrameId = 0;
-
-        frameId = window.requestAnimationFrame(() => {
-            nestedFrameId = window.requestAnimationFrame(() => {
-                if (!containerRef.current) {
-                    return;
-                }
-
-                const maxScrollTop = Math.max(containerRef.current.scrollHeight - containerRef.current.clientHeight, 0);
-                const restoredScrollTop = Math.min(targetScrollTop, maxScrollTop);
-                containerRef.current.scrollTop = restoredScrollTop;
-                latestScrollTopRef.current = restoredScrollTop;
-                setVirtualScrollTop(restoredScrollTop);
-                pendingRestoreRef.current = null;
-                onScrollPositionChange?.(restoredScrollTop);
-            });
-        });
-
-        return () => {
-            window.cancelAnimationFrame(frameId);
-            window.cancelAnimationFrame(nestedFrameId);
-        };
-    }, [
-        filterType,
-        filterValue,
-        initialScrollTop,
-        isLoading,
-        keyword,
+    const queryIsChanging = queryKeyRef.current !== queryKey;
+    const effectiveTotal = queryIsChanging ? 0 : total;
+    const rowHeight = MEDIA_CARD_HEIGHT + MEDIA_GRID_ROW_GAP;
+    const effectiveViewportHeight = viewportHeight > 0 ? viewportHeight : rowHeight;
+    const { totalRows, startRow, startIndex, endIndex } = getVirtualGridWindow(
+        effectiveTotal,
         layout.columns,
-        layout.gap,
-        libraryId,
-        mediaItems.length,
-        onScrollPositionChange,
-        sortField,
-        sortOrder,
-    ]);
+        virtualScrollTop,
+        effectiveViewportHeight,
+        rowHeight,
+        VIRTUAL_OVERSCAN_ROWS,
+    );
+    const visiblePages = useMemo(
+        () => getPagesForVisibleRange(startIndex, endIndex, effectiveTotal),
+        [effectiveTotal, endIndex, startIndex],
+    );
+    visiblePagesRef.current = visiblePages;
 
     useEffect(() => {
-        const cachedEntry = getCachedMediaListEntry(baseCacheKey);
-        const requestToken = requestTokenRef.current + 1;
-        requestTokenRef.current = requestToken;
-
-        const applySearchableItems = (searchableItems: SearchableMediaItem[]) => {
-            setBaseItems(searchableItems);
-
-            if (!deferredKeyword.trim()) {
-                const nextItems = searchableItems.map(({ media }) => media);
-                setMediaItems(nextItems);
-                setIsFallbackSearch(false);
-                onCountChange?.(nextItems.length);
-                return;
-            }
-
-            void filterSearchableMediaItems(searchableItems, deferredKeyword).then((searchResult) => {
-                if (requestTokenRef.current !== requestToken) {
-                    return;
-                }
-                setMediaItems(searchResult.items);
-                setIsFallbackSearch(searchResult.isFallback);
-                onCountChange?.(searchResult.items.length);
-            });
-        };
-
-        if (cachedEntry) {
-            const cachedItems = createSearchableMediaItems(cachedEntry.items);
-            applySearchableItems(cachedItems);
-            setIsLoading(false);
-        } else {
-            setBaseItems([]);
-            setMediaItems([]);
-            setIsFallbackSearch(false);
-            setIsLoading(true);
+        if (effectiveTotal <= 0 || showingStaleResults) {
+            return;
         }
-
-        void GetMediaList(libraryId, 1, 0, sortField, sortOrder, '', filterType, filterValue)
-            .then((res: any) => {
-                if (requestTokenRef.current !== requestToken) {
-                    return;
-                }
-
-                const nextItems = Array.isArray(res?.items) ? res.items : [];
-                const nextTotal = Number(res?.total || 0);
-                persistMediaListCache(baseCacheKey, {
-                    items: nextItems,
-                    total: nextTotal,
-                });
-                const searchableItems = createSearchableMediaItems(nextItems);
-                applySearchableItems(searchableItems);
-                setIsLoading(false);
-            })
-            .catch((err) => {
-                console.error(err);
-                if (requestTokenRef.current === requestToken && !cachedEntry) {
-                    setIsLoading(false);
-                }
-            });
-
-        return () => {
-            requestTokenRef.current += 1;
-        };
-    }, [baseCacheKey, filterType, filterValue, libraryId, onCountChange, refreshVersion, sortField, sortOrder]);
-
-    useEffect(() => {
-        if (searchTimerRef.current !== null) {
-            window.clearTimeout(searchTimerRef.current);
-        }
-
-        const searchRunToken = searchRunRef.current + 1;
-        searchRunRef.current = searchRunToken;
-
-        searchTimerRef.current = window.setTimeout(() => {
-            searchTimerRef.current = null;
-            void filterSearchableMediaItems(baseItems, deferredKeyword).then((searchResult) => {
-                if (searchRunRef.current !== searchRunToken) {
-                    return;
-                }
-                startTransition(() => {
-                    setMediaItems(searchResult.items);
-                    setIsFallbackSearch(searchResult.isFallback);
-                });
-                onCountChange?.(searchResult.items.length);
-            });
-        }, deferredKeyword.trim() ? 120 : 0);
-
-        return () => {
-            if (searchTimerRef.current !== null) {
-                window.clearTimeout(searchTimerRef.current);
-                searchTimerRef.current = null;
-            }
-            searchRunRef.current += 1;
-        };
-    }, [baseItems, deferredKeyword, onCountChange]);
+        const generation = requestGateRef.current.current();
+        visiblePages.forEach((page) => loadPage(page, generation));
+    }, [effectiveTotal, loadPage, showingStaleResults, visiblePages]);
 
     useEffect(() => {
         if (!mutation) {
             return;
         }
+        const mediaID = mutation.type === 'merge'
+            ? (typeof mutation.media?.id === 'string' ? mutation.media.id.trim() : '')
+            : (typeof mutation.mediaId === 'string' ? mutation.mediaId.trim() : '');
+        if (!mediaID) {
+            return;
+        }
 
-        if (mutation.type === 'merge') {
-            const normalizedMediaID = typeof mutation.media?.id === 'string' ? mutation.media.id.trim() : '';
-            if (!normalizedMediaID) {
-                return;
-            }
-
-            mergeMediaIntoCachedMediaLists(mutation.media);
-            setBaseItems((prev) => {
-                let changed = false;
-                const nextItems = prev.map((item) => {
-                    if (item.media?.id !== normalizedMediaID) {
-                        return item;
+        setPages((current) => {
+            let found = false;
+            const next = new Map<number, any[]>();
+            current.forEach((items, page) => {
+                const updated = items.flatMap((item) => {
+                    if (item?.id !== mediaID) {
+                        return [item];
                     }
-
-                    changed = true;
-                    return mergeSearchableMediaItem(item, mutation.media);
+                    found = true;
+                    if (mutation.type === 'remove') {
+                        return [];
+                    }
+                    const merged = { ...item, ...mutation.media };
+                    return matchesActiveFilter(merged, filterType, filterValue) ? [merged] : [];
                 });
-                return changed ? nextItems : prev;
+                next.set(page, updated);
             });
-            return;
-        }
-
-        const normalizedMediaID = typeof mutation.mediaId === 'string' ? mutation.mediaId.trim() : '';
-        if (!normalizedMediaID) {
-            return;
-        }
-
-        removeMediaFromCachedMediaLists(normalizedMediaID);
-        setBaseItems((prev) => {
-            const nextItems = prev.filter((item) => item.media?.id !== normalizedMediaID);
-            return nextItems.length === prev.length ? prev : nextItems;
+            if (found && (mutation.type === 'remove' || !matchesActiveFilter(mutation.media, filterType, filterValue))) {
+                setTotal((currentTotal) => Math.max(0, currentTotal - 1));
+            }
+            return found ? next : current;
         });
-    }, [mutation]);
-
-    const handleSelectMedia = (media: any) => {
-        seedMediaDetailCache(media);
-        onScrollPositionChange?.(latestScrollTopRef.current);
-        onSelectMedia(media);
-    };
-
-    const scheduleScrollUpdate = () => {
-        if (scrollFrameRef.current !== null) {
-            return;
+        const membershipOrOrderMayChange = mutation.type === 'remove'
+            || filterType === 'favorite'
+            || filterType === 'watched'
+            || filterType === 'unwatched'
+            || sortField === 'favorite_at'
+            || sortField === 'last_watched'
+            || sortField === 'rating';
+        if (membershipOrOrderMayChange) {
+            const generation = beginRequestGeneration();
+            (visiblePagesRef.current.length > 0 ? visiblePagesRef.current : [1]).forEach((page) => loadPage(page, generation, true));
         }
+    }, [beginRequestGeneration, filterType, filterValue, loadPage, mutation, sortField]);
 
-        scrollFrameRef.current = window.requestAnimationFrame(() => {
-            scrollFrameRef.current = null;
-            setVirtualScrollTop(latestScrollTopRef.current);
-        });
-    };
-
-    const scheduleScrollPositionNotify = () => {
-        if (scrollNotifyTimerRef.current !== null) {
-            window.clearTimeout(scrollNotifyTimerRef.current);
+    const visibleSlots = useMemo(() => Array.from({ length: Math.max(0, endIndex - startIndex) }, (_, offset) => {
+        const index = startIndex + offset;
+        return { index, media: getMediaAtIndex(pages, index) };
+    }), [endIndex, pages, startIndex]);
+    const visibleMediaIDs = useMemo(() => new Set(visibleSlots.flatMap((slot) => slot.media?.id ? [slot.media.id] : [])), [visibleSlots]);
+    useEffect(() => {
+        if (focusedMediaIDRef.current && !visibleMediaIDs.has(focusedMediaIDRef.current)) {
+            focusedMediaIDRef.current = '';
+            containerRef.current?.focus({ preventScroll: true });
         }
-
-        scrollNotifyTimerRef.current = window.setTimeout(() => {
-            scrollNotifyTimerRef.current = null;
-            onScrollPositionChangeRef.current?.(latestScrollTopRef.current);
-        }, 120);
-    };
-
-    const totalRows = Math.ceil(mediaItems.length / layout.columns);
-    const rowHeight = MEDIA_CARD_HEIGHT + MEDIA_GRID_ROW_GAP;
-    const effectiveViewportHeight = viewportHeight > 0 ? viewportHeight : rowHeight;
-    const startRow = Math.max(0, Math.floor(virtualScrollTop / rowHeight) - VIRTUAL_OVERSCAN_ROWS);
-    const endRow = Math.min(
-        totalRows,
-        Math.ceil((virtualScrollTop + effectiveViewportHeight) / rowHeight) + VIRTUAL_OVERSCAN_ROWS,
-    );
-    const startIndex = startRow * layout.columns;
-    const endIndex = Math.min(mediaItems.length, endRow * layout.columns);
-    const visibleItems = mediaItems.slice(startIndex, endIndex);
+    }, [visibleMediaIDs]);
     const topOffset = startRow * rowHeight;
-    const totalContentHeight = totalRows === 0
-        ? 0
-        : totalRows * MEDIA_CARD_HEIGHT + Math.max(0, totalRows - 1) * MEDIA_GRID_ROW_GAP;
+    const totalContentHeight = totalRows === 0 ? 0 : totalRows * MEDIA_CARD_HEIGHT + Math.max(0, totalRows - 1) * MEDIA_GRID_ROW_GAP;
+
+    const handleSelectMedia = useCallback((media: any) => {
+        seedMediaDetailCache(media);
+        onScrollPositionChangeRef.current?.(latestScrollTopRef.current);
+        onSelectMedia(media);
+    }, [onSelectMedia]);
+    const handlePrefetchMedia = useCallback((media: any) => {
+        seedMediaDetailCache(media);
+        prefetchMediaDetailCacheEntry(media.id);
+    }, []);
+    const handleFocusMedia = useCallback((mediaID: string) => {
+        focusedMediaIDRef.current = mediaID;
+    }, []);
+    const retry = () => {
+        setShowingStaleResults(false);
+        const generation = beginRequestGeneration();
+        const retryPages = visiblePagesRef.current.length > 0 ? visiblePagesRef.current : [1];
+        retryPages.forEach((page) => loadPage(page, generation, true));
+    };
 
     return (
         <div
             ref={containerRef}
             className="grid-container"
+            tabIndex={-1}
+            aria-label="媒体列表"
+            aria-busy={isInitialLoading || loadingPages.size > 0}
             onScroll={(event) => {
-                const nextScrollTop = event.currentTarget.scrollTop;
-                latestScrollTopRef.current = nextScrollTop;
-                scheduleScrollUpdate();
-                scheduleScrollPositionNotify();
+                latestScrollTopRef.current = event.currentTarget.scrollTop;
+                if (scrollFrameRef.current === null) {
+                    scrollFrameRef.current = window.requestAnimationFrame(() => {
+                        scrollFrameRef.current = null;
+                        setVirtualScrollTop(latestScrollTopRef.current);
+                    });
+                }
+                if (scrollNotifyTimerRef.current !== null) {
+                    window.clearTimeout(scrollNotifyTimerRef.current);
+                }
+                scrollNotifyTimerRef.current = window.setTimeout(() => {
+                    scrollNotifyTimerRef.current = null;
+                    onScrollPositionChangeRef.current?.(latestScrollTopRef.current);
+                }, SCROLL_NOTIFY_MS);
             }}
         >
-            {!isLoading && mediaItems.length === 0 && (
-                <div className="grid-feedback">
-                    {'\u6ca1\u6709\u627e\u5230\u7b26\u5408\u6761\u4ef6\u7684\u5a92\u4f53\u5185\u5bb9'}
+            {isInitialLoading && pages.size === 0 && (
+                <div className="grid-feedback loading" role="status">正在加载媒体内容...</div>
+            )}
+            {!isInitialLoading && total === 0 && !error && (
+                <div className="grid-feedback" role="status">
+                    {normalizedKeyword || filterType ? '没有符合当前搜索或筛选条件的媒体' : '当前媒体库为空'}
                 </div>
             )}
-
-            {isLoading && baseItems.length === 0 && (
-                <div className="grid-feedback loading">
-                    {'\u6b63\u5728\u52a0\u8f7d\u5a92\u4f53\u5185\u5bb9...'}
+            {error && (
+                <div className="grid-error-panel" role="alert">
+                    <span>{showingStaleResults ? `${error}；当前显示上一次可用结果` : error}</span>
+                    <button type="button" onClick={retry}>重试</button>
                 </div>
             )}
-
-            {!isLoading && mediaItems.length > 0 && isFallbackSearch && (
-                <div className="grid-search-fallback">
-                    没有精确结果，已显示可能匹配
-                </div>
-            )}
-
-            {mediaItems.length > 0 && (
-                <div
-                    className="grid-virtual-spacer"
-                    style={{ height: `${Math.max(totalContentHeight, effectiveViewportHeight)}px` }}
-                >
-                    <div
-                        className="grid-virtual-content"
-                        style={{
-                            transform: `translateY(${topOffset}px)`,
-                            gridTemplateColumns: `repeat(${layout.columns}, ${MEDIA_CARD_WIDTH}px)`,
-                            columnGap: `${layout.gap}px`,
-                            justifyContent: layout.justify,
-                            rowGap: `${MEDIA_GRID_ROW_GAP}px`,
-                        }}
-                    >
-                        {visibleItems.map((item) => (
-                            <MediaCard
-                                key={item.id}
-                                media={item}
-                                onClick={() => handleSelectMedia(item)}
-                                onQuickPlayStatus={onQuickPlayStatus}
-                                onPrefetch={() => {
-                                    seedMediaDetailCache(item);
-                                    prefetchMediaDetailCacheEntry(item.id);
-                                }}
-                            />
-                        ))}
+            {total > 0 && (
+                <>
+                    <div className="grid-page-status" role="status" aria-live="polite">
+                        {loadingPages.size > 0 ? '正在加载当前区域...' : `共 ${total.toLocaleString()} 个项目`}
                     </div>
-                </div>
+                    <div className="grid-virtual-spacer" style={{ height: `${Math.max(totalContentHeight, effectiveViewportHeight)}px` }}>
+                        <div
+                            className="grid-virtual-content"
+                            style={{
+                                transform: `translateY(${topOffset}px)`,
+                                gridTemplateColumns: `repeat(${layout.columns}, ${MEDIA_CARD_WIDTH}px)`,
+                                columnGap: `${layout.gap}px`,
+                                justifyContent: layout.justify,
+                                rowGap: `${MEDIA_GRID_ROW_GAP}px`,
+                            }}
+                        >
+                            {visibleSlots.map(({ index, media }) => media ? (
+                                <MediaCard
+                                    key={media.id}
+                                    media={media}
+                                    onSelectMedia={handleSelectMedia}
+                                    onQuickPlayStatus={onQuickPlayStatus}
+                                    onPrefetchMedia={handlePrefetchMedia}
+                                    onFocusMedia={handleFocusMedia}
+                                />
+                            ) : (
+                                <div key={`placeholder-${index}`} className="media-card media-card-placeholder" aria-hidden="true">
+                                    <div className="media-poster-wrapper" />
+                                    <div className="media-card-placeholder-line" />
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </>
             )}
         </div>
     );
 };
 
-export default MediaGrid;
+export default React.memo(MediaGrid, (prev, next) => (
+    prev.libraryId === next.libraryId
+    && prev.keyword === next.keyword
+    && prev.sortField === next.sortField
+    && prev.sortOrder === next.sortOrder
+    && prev.layoutVersion === next.layoutVersion
+    && prev.refreshVersion === next.refreshVersion
+    && (prev.filter?.type || '') === (next.filter?.type || '')
+    && (prev.filter?.value || '') === (next.filter?.value || '')
+    && prev.onSelectMedia === next.onSelectMedia
+    && prev.onCountChange === next.onCountChange
+    && prev.onQuickPlayStatus === next.onQuickPlayStatus
+    && prev.mutation === next.mutation
+));

@@ -113,7 +113,7 @@ func TestJellyfinSeriesStatsAndMissingAssociations(t *testing.T) {
 	if err := app.db.Model(&model.Media{}).Where("id = ?", "episode-0000-0002").Update("season_num", 2).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := app.db.Model(&model.Series{}).Where("id = ?", "series-0000").Updates(map[string]interface{}{"episode_count": 99, "season_count": 99}).Error; err != nil {
+	if err := app.db.Model(&model.Series{}).Where("id = ?", "series-0000").Updates(map[string]interface{}{"episode_count": 0, "season_count": 0}).Error; err != nil {
 		t.Fatal(err)
 	}
 	items, total, _, err := app.queryJellyfinItems(httptest.NewRequest("GET", "/Items?recursive=true&includeItemTypes=Series&limit=10", nil))
@@ -137,27 +137,109 @@ func TestJellyfinSeriesStatsAndMissingAssociations(t *testing.T) {
 	}
 }
 
+func TestJellyfinSeriesVisibilityUsesLiveMediaInsteadOfStoredCount(t *testing.T) {
+	app := newTestApp(t)
+	library := seedJellyfinSeries(t, app, 1, 1)
+	if err := app.db.Model(&model.Series{}).Where("id = ?", "series-0000").Update("episode_count", 0).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	empty := model.Series{ID: "series-empty", LibraryID: library.ID, Title: "Empty", FolderPath: "C:/tv/empty", EpisodeCount: 99}
+	softOnly := model.Series{ID: "series-soft", LibraryID: library.ID, Title: "Soft", FolderPath: "C:/tv/soft", EpisodeCount: 99}
+	normal := model.Series{ID: "series-normal", LibraryID: library.ID, Title: "Normal", FolderPath: "C:/tv/normal", EpisodeCount: 1}
+	for _, series := range []*model.Series{&empty, &softOnly, &normal} {
+		if err := app.repos.Series.Create(series); err != nil {
+			t.Fatal(err)
+		}
+	}
+	softMedia := model.Media{ID: "episode-soft", LibraryID: library.ID, SeriesID: softOnly.ID, Title: "Deleted", FilePath: "C:/tv/soft/deleted.mkv", MediaType: "episode"}
+	normalMedia := model.Media{ID: "episode-normal", LibraryID: library.ID, SeriesID: normal.ID, Title: "Live", FilePath: "C:/tv/normal/live.mkv", MediaType: "episode"}
+	if err := app.db.Create(&softMedia).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.Create(&normalMedia).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.Delete(&softMedia).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	items, total, _, err := app.queryJellyfinItems(httptest.NewRequest("GET", "/Items?recursive=true&includeItemTypes=Series&sortBy=SortName&limit=20", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, item := range items {
+		if item != nil && item.Series != nil {
+			ids = append(ids, item.Series.ID)
+		}
+	}
+	if got := strings.Join(ids, ","); total != 2 || got != "series-normal,series-0000" {
+		t.Fatalf("series total=%d ids=%s, want live count-zero and normal only", total, got)
+	}
+	libraries, _, _, err := app.queryJellyfinItems(httptest.NewRequest("GET", "/Items?limit=20", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(libraries) != 1 || libraries[0].Library == nil || libraries[0].Library.MediaCount != 2 {
+		t.Fatalf("library series count did not use live media: %+v", libraries)
+	}
+}
+
 func TestJellyfinResumeAndLatestUseBoundedSQLQueries(t *testing.T) {
 	app := newTestApp(t)
-	seedJellyfinMovies(t, app, 5)
+	library := seedJellyfinMovies(t, app, 5)
 	now := time.Now().UTC().Truncate(time.Second)
+	otherLibrary := model.Library{ID: "library-other", Name: "Other", Path: "C:/other", Type: "movie"}
+	if err := app.repos.Library.Create(&otherLibrary); err != nil {
+		t.Fatal(err)
+	}
+	otherMedia := model.Media{ID: "media-other", LibraryID: otherLibrary.ID, Title: "Other Movie", FilePath: "C:/other/movie.mkv", MediaType: "movie", CreatedAt: time.Unix(1, 0).UTC()}
+	if err := app.db.Create(&otherMedia).Error; err != nil {
+		t.Fatal(err)
+	}
 	histories := []model.WatchHistory{
 		{ID: "resume-old", UserID: desktopUserID, MediaID: "media-000000", Position: 10, Duration: 100, UpdatedAt: now.Add(-time.Hour)},
 		{ID: "resume-new", UserID: desktopUserID, MediaID: "media-000001", Position: 20, Duration: 100, UpdatedAt: now},
 		{ID: "resume-complete", UserID: desktopUserID, MediaID: "media-000002", Completed: true, UpdatedAt: now.Add(time.Hour)},
 		{ID: "resume-other", UserID: "other-user", MediaID: "media-000003", Position: 30, Duration: 100, UpdatedAt: now.Add(2 * time.Hour)},
+		{ID: "resume-zero", UserID: desktopUserID, MediaID: "media-000004", Position: 0, Duration: 100, UpdatedAt: now.Add(3 * time.Hour)},
+		{ID: "resume-other-library", UserID: desktopUserID, MediaID: otherMedia.ID, Position: 40, Duration: 100, UpdatedAt: now.Add(-2 * time.Hour)},
 	}
 	if err := app.db.Create(&histories).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.Create(&model.Favorite{ID: "resume-favorite", UserID: desktopUserID, MediaID: "media-000001"}).Error; err != nil {
 		t.Fatal(err)
 	}
 	counter := attachQueryCounter(app)
 	counter.Reset()
 	resume, total, start, err := app.queryJellyfinResumeItems(httptest.NewRequest("GET", "/Users/desktop/Items/Resume?startIndex=0&limit=10", nil))
-	if err != nil || total != 2 || start != 0 || strings.Join(mediaIDs(resume), ",") != "media-000001,media-000000" {
+	if err != nil || total != 3 || start != 0 || strings.Join(mediaIDs(resume), ",") != "media-000001,media-000000,media-other" {
 		t.Fatalf("resume total=%d rows=%v err=%v", total, mediaIDs(resume), err)
 	}
 	if got := len(counter.Snapshot()); got != 4 {
 		t.Fatalf("resume queries=%d", got)
+	}
+
+	filteredCases := []struct {
+		name  string
+		query string
+		want  string
+	}{
+		{"parent", "parentId=library:" + library.ID, "media-000001,media-000000"},
+		{"type", "includeItemTypes=Episode", ""},
+		{"favorite", "isFavorite=true", "media-000001"},
+		{"search", "searchTerm=Movie+000000", "media-000000"},
+		{"played", "isPlayed=true", ""},
+	}
+	for _, test := range filteredCases {
+		t.Run(test.name, func(t *testing.T) {
+			items, _, _, err := app.queryJellyfinResumeItems(httptest.NewRequest("GET", "/Users/desktop/Items/Resume?"+test.query+"&limit=10", nil))
+			if err != nil || strings.Join(mediaIDs(items), ",") != test.want {
+				t.Fatalf("items=%v err=%v want=%s", mediaIDs(items), err, test.want)
+			}
+		})
 	}
 
 	counter.Reset()

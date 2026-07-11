@@ -4,13 +4,16 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
 // AppConfig defines the application configuration.
 type AppConfig struct {
-	FFprobePath string
-	FFmpegPath  string
+	FFprobePath        string
+	FFmpegPath         string
+	FFprobeConcurrency int
+	FFmpegConcurrency  int
 }
 
 // CacheConfig defines the cache directory.
@@ -28,13 +31,27 @@ type Config struct {
 func NewConfig() *Config {
 	return &Config{
 		App: AppConfig{
-			FFprobePath: resolveBinaryPath("NAVI_FFPROBE_PATH", "ffprobe_path", `C:\ffmpeg\bin\ffprobe.exe`, "ffprobe"),
-			FFmpegPath:  resolveBinaryPath("NAVI_FFMPEG_PATH", "ffmpeg_path", `C:\ffmpeg\bin\ffmpeg.exe`, "ffmpeg"),
+			FFprobePath:        resolveBinaryPath("NAVI_FFPROBE_PATH", "ffprobe_path", `C:\ffmpeg\bin\ffprobe.exe`, "ffprobe"),
+			FFmpegPath:         resolveBinaryPath("NAVI_FFMPEG_PATH", "ffmpeg_path", `C:\ffmpeg\bin\ffmpeg.exe`, "ffmpeg"),
+			FFprobeConcurrency: resolvePositiveInt("NAVI_FFPROBE_CONCURRENCY", "ffprobe_concurrency", 2),
+			FFmpegConcurrency:  resolvePositiveInt("NAVI_FFMPEG_CONCURRENCY", "ffmpeg_concurrency", 1),
 		},
 		Cache: CacheConfig{
 			CacheDir: "cache",
 		},
 	}
+}
+
+func resolvePositiveInt(envKey, yamlKey string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(envKey))
+	if value == "" {
+		value = strings.TrimSpace(readSimpleYAMLValue(filepath.Join("config", "app.yaml"), yamlKey))
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 1 {
+		return fallback
+	}
+	return parsed
 }
 
 func resolveBinaryPath(envKey string, yamlKey string, fallbackPath string, fallbackName string) string {

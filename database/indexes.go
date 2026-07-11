@@ -27,6 +27,7 @@ var requiredIndexDefinitions = []requiredIndexDefinition{
 	{Name: "idx_watch_user_completed_updated", Table: "watch_histories", Columns: []string{"user_id", "completed", "updated_at"}, Collations: []string{"BINARY", "BINARY", "BINARY"}},
 	{Name: "idx_media_deleted_created", Table: "media", Columns: []string{"deleted_at", "created_at"}, Collations: []string{"BINARY", "BINARY"}},
 	{Name: "idx_media_library_type_deleted_created", Table: "media", Columns: []string{"library_id", "media_type", "deleted_at", "created_at"}, Collations: []string{"BINARY", "BINARY", "BINARY", "BINARY"}},
+	{Name: "idx_media_series_deleted", Table: "media", Columns: []string{"series_id", "deleted_at"}, Collations: []string{"BINARY", "BINARY"}},
 }
 
 type sqliteIndexListRow struct {

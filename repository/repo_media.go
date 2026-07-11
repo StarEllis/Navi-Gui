@@ -225,15 +225,18 @@ func (r *MediaRepo) Create(media *model.Media) error {
 		DoNothing: true,
 	}).Create(media)
 	result = retryLegacyCreateWithoutPartialIndex(r.db, result, media)
-	if result.Error != nil || result.RowsAffected > 0 {
+	if result.Error != nil {
 		return result.Error
+	}
+	if result.RowsAffected > 0 {
+		return RefreshMediaSearchIndex(r.db, media.ID)
 	}
 	var existing model.Media
 	if err := r.db.Where("library_id = ? AND path_key = ?", media.LibraryID, media.PathKey).First(&existing).Error; err != nil {
 		return err
 	}
 	media.ID = existing.ID
-	return nil
+	return RefreshMediaSearchIndex(r.db, media.ID)
 }
 
 func (r *MediaRepo) FindByID(id string) (*model.Media, error) {
@@ -398,13 +401,19 @@ func (r *MediaRepo) CleanOrphanedByLibraryIDs(validLibraryIDs []string) (int64, 
 
 func (r *MediaRepo) Update(media *model.Media) error {
 	if media.SeriesID != "" {
-		return r.db.Save(media).Error
+		if err := r.db.Save(media).Error; err != nil {
+			return err
+		}
+		return RefreshMediaSearchIndex(r.db, media.ID)
 	}
 	return r.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Omit("SeriesID").Save(media).Error; err != nil {
 			return err
 		}
-		return tx.Model(&model.Media{}).Where("id = ?", media.ID).UpdateColumn("series_id", nil).Error
+		if err := tx.Model(&model.Media{}).Where("id = ?", media.ID).UpdateColumn("series_id", nil).Error; err != nil {
+			return err
+		}
+		return RefreshMediaSearchIndex(tx, media.ID)
 	})
 }
 
@@ -777,7 +786,13 @@ func (r *MediaRepo) BatchCreate(mediaList []*model.Media) error {
 
 // UpdateFields 仅更新指定字段（减少写锁争用，提高 SQLite 并发性能）
 func (r *MediaRepo) UpdateFields(id string, fields map[string]interface{}) error {
-	return r.db.Model(&model.Media{}).Where("id = ?", id).Updates(fields).Error
+	if err := r.db.Model(&model.Media{}).Where("id = ?", id).Updates(fields).Error; err != nil {
+		return err
+	}
+	if mediaSearchFieldsChanged(fields) {
+		return RefreshMediaSearchIndex(r.db, id)
+	}
+	return nil
 }
 
 // DeleteByIDs 批量删除指定 ID 的媒体记录（用于清理已删除文件）

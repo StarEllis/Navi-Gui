@@ -60,12 +60,17 @@ type ThumbnailService struct {
 	logger             *zap.SugaredLogger
 	artworkCache       *ArtworkCache
 	captureFrameRunner func(context.Context, string, string, float64, int) error
+	ffmpegGovernor     *processGovernor
 }
 
 func NewThumbnailService(cfg *config.Config, logger *zap.SugaredLogger) *ThumbnailService {
+	limit := 1
+	if cfg != nil && cfg.App.FFmpegConcurrency > 0 {
+		limit = cfg.App.FFmpegConcurrency
+	}
+	governor := newProcessGovernor(context.Background(), limit)
 	return &ThumbnailService{
-		cfg:    cfg,
-		logger: logger,
+		cfg: cfg, logger: logger, ffmpegGovernor: governor,
 	}
 }
 
@@ -452,6 +457,33 @@ func (t *ThumbnailService) captureFrame(mediaPath string, seekSeconds float64, o
 }
 
 func (t *ThumbnailService) captureFrameContext(ctx context.Context, mediaPath string, seekSeconds float64, outputPath string, outputHeight int) error {
+	if t == nil {
+		return fmt.Errorf("thumbnail service is unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if t.artworkCache != nil && t.artworkCache.IsCachedPath(outputPath) {
+		producerCtx, done, err := t.artworkCache.beginProducer(ctx)
+		if err != nil {
+			return err
+		}
+		defer done()
+		ctx = producerCtx
+	}
+	select {
+	case <-t.ffmpegGovernor.ctx.Done():
+		return ErrProcessGovernorStopped
+	default:
+	}
+	key := filepath.Clean(outputPath)
+	_, err := t.ffmpegGovernor.runKeyed(ctx, key, func(processCtx context.Context) ([]byte, error) {
+		return nil, t.captureFrameUnshared(processCtx, mediaPath, seekSeconds, outputPath, outputHeight)
+	})
+	return err
+}
+
+func (t *ThumbnailService) captureFrameUnshared(ctx context.Context, mediaPath string, seekSeconds float64, outputPath string, outputHeight int) error {
 	if strings.TrimSpace(mediaPath) == "" || strings.TrimSpace(outputPath) == "" {
 		return fmt.Errorf("empty media or output path")
 	}
@@ -485,7 +517,7 @@ func (t *ThumbnailService) captureFrameContext(ctx context.Context, mediaPath st
 			return err
 		}
 	} else {
-		cmd, cancel := newBackgroundCommand(ctx, mediaTranscodeTimeout, t.cfg.App.FFmpegPath,
+		output, err := runBackgroundCommand(ctx, mediaTranscodeTimeout, true, t.cfg.App.FFmpegPath,
 			"-y",
 			"-ss", strconv.FormatFloat(maxFloat(seekSeconds, 0), 'f', 3, 64),
 			"-i", mediaPath,
@@ -494,8 +526,7 @@ func (t *ThumbnailService) captureFrameContext(ctx context.Context, mediaPath st
 			"-q:v", "2",
 			tempPath,
 		)
-		defer cancel()
-		if output, err := cmd.CombinedOutput(); err != nil {
+		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return ctxErr
 			}
@@ -505,10 +536,38 @@ func (t *ThumbnailService) captureFrameContext(ctx context.Context, mediaPath st
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if t.artworkCache != nil && t.artworkCache.IsCachedPath(outputPath) {
+		if err := t.artworkCache.prepareFileCommit(ctx); err != nil {
+			return err
+		}
+		defer t.artworkCache.completeFileCommit()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
 	if err := os.Rename(tempPath, outputPath); err != nil {
 		return err
 	}
+	if t.artworkCache != nil && t.artworkCache.IsCachedPath(outputPath) {
+		t.artworkCache.recordFile(outputPath)
+	}
 	return nil
+}
+
+func (t *ThumbnailService) Shutdown() {
+	if t == nil {
+		return
+	}
+	if t.ffmpegGovernor != nil {
+		t.ffmpegGovernor.shutdown()
+	}
+}
+
+func (t *ThumbnailService) FFmpegDiagnostics() ProcessDiagnostics {
+	if t == nil {
+		return ProcessDiagnostics{}
+	}
+	return t.ffmpegGovernor.diagnostics()
 }
 
 func mediaDurationSeconds(media *model.Media) float64 {

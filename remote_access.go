@@ -100,8 +100,14 @@ func (a *App) shutdown(_ context.Context) {
 		}
 		a.scanMu.Unlock()
 
-		if a.eventHub != nil {
-			a.eventHub.Close()
+		shutdownTimeout := a.shutdownTimeout
+		if shutdownTimeout <= 0 {
+			shutdownTimeout = 8 * time.Second
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if a.artworkCache != nil {
+			a.artworkCache.BeginShutdown()
 		}
 		if a.appCancel != nil {
 			a.appCancel()
@@ -112,13 +118,14 @@ func (a *App) shutdown(_ context.Context) {
 		if a.thumbnailWorker != nil {
 			a.thumbnailWorker.Stop()
 		}
-
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-		defer cancel()
-		waiters := 1
-		results := make(chan error, 3)
+		waiters := 2
+		results := make(chan error, 5)
 		go func() {
 			a.scanWG.Wait()
+			results <- nil
+		}()
+		go func() {
+			a.maintenanceWG.Wait()
 			results <- nil
 		}()
 		if a.thumbnailWorker != nil {
@@ -129,6 +136,10 @@ func (a *App) shutdown(_ context.Context) {
 			waiters++
 			go func() { results <- a.scanner.Shutdown(shutdownCtx) }()
 		}
+		if a.artworkCache != nil {
+			waiters++
+			go func() { results <- a.artworkCache.ShutdownContext(shutdownCtx) }()
+		}
 
 		for completed := 0; completed < waiters; completed++ {
 			select {
@@ -138,12 +149,15 @@ func (a *App) shutdown(_ context.Context) {
 				}
 			case <-shutdownCtx.Done():
 				if a.logger != nil {
-					a.logger.Warnf("background shutdown timed out after 8s; continuing application exit")
+					a.logger.Warnf("background shutdown timed out after %s; continuing application exit", shutdownTimeout)
 				}
 				completed = waiters
 			}
 		}
 
+		if a.eventHub != nil {
+			a.eventHub.Close()
+		}
 		a.shutdownDesktopIntegration()
 		a.shutdownRemoteServices()
 		if a.dbManager != nil {
@@ -766,6 +780,12 @@ func (a *App) handleJellyfinImage(_ *DesktopSettings) http.HandlerFunc {
 			http.NotFound(w, r)
 			return
 		}
+		release, ok := a.reserveArtworkPath(imagePath)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		defer release()
 		http.ServeFile(w, r, imagePath)
 	}
 }

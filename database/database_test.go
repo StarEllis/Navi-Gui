@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -69,14 +70,14 @@ func TestNewDatabaseMigratesSequentiallyAndReopenIsIdempotent(t *testing.T) {
 		t.Fatalf("Open(new) error = %v", err)
 	}
 	version, err := manager.SchemaVersion()
-	if err != nil || version != 4 {
-		t.Fatalf("SchemaVersion() = %d, %v; want 4", version, err)
+	if err != nil || version != 5 {
+		t.Fatalf("SchemaVersion() = %d, %v; want 5", version, err)
 	}
 	var versions []int
 	if err := manager.DB().Model(&SchemaMigration{}).Order("version").Pluck("version", &versions).Error; err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(versions) != "[1 2 3 4]" {
+	if fmt.Sprint(versions) != "[1 2 3 4 5]" {
 		t.Fatalf("migration versions = %v", versions)
 	}
 	before, err := os.ReadDir(manager.BackupDir())
@@ -98,6 +99,74 @@ func TestNewDatabaseMigratesSequentiallyAndReopenIsIdempotent(t *testing.T) {
 	}
 	if len(after) != len(before) {
 		t.Fatalf("idempotent reopen created another backup: before=%d after=%d", len(before), len(after))
+	}
+}
+
+func TestMediaSearchMigrationBackfillsHistoryAndIsIdempotent(t *testing.T) {
+	manager := openTestManager(t, DefaultOptions())
+	db := manager.DB()
+	user, library, media := createCoreRows(t, db, "search-backfill")
+	_ = user
+	if err := db.Model(&model.Media{}).Where("id = ?", media.ID).UpdateColumns(map[string]interface{}{
+		"title":           "中国电影",
+		"code":            "ABP-123",
+		"maker":           "星空制作",
+		"label":           "经典标签",
+		"year":            2024,
+		"search_text":     "",
+		"search_pinyin":   "",
+		"search_initials": "",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	person := model.Person{ID: "search-person", Name: "演员甲"}
+	if err := db.Create(&person).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.MediaPerson{ID: "search-cast", MediaID: media.ID, PersonID: person.ID, Role: "actor"}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	for run := 0; run < 2; run++ {
+		stats, err := migrateMediaSearchFields(db)
+		if err != nil {
+			t.Fatalf("migration run %d: %v", run, err)
+		}
+		if stats["media_search_rows_backfilled"] != 1 {
+			t.Fatalf("migration run %d stats=%v", run, stats)
+		}
+	}
+	var migrated model.Media
+	if err := db.First(&migrated, "id = ?", media.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"text": migrated.SearchText, "pinyin": migrated.SearchPinyin, "initials": migrated.SearchInitials,
+	} {
+		if strings.TrimSpace(value) == "" {
+			t.Fatalf("%s search field was not backfilled: %#v", name, migrated)
+		}
+	}
+	if !strings.Contains(migrated.SearchText, "abp 123") || !strings.Contains(migrated.SearchText, "演员甲") {
+		t.Fatalf("search text=%q", migrated.SearchText)
+	}
+	if !strings.Contains(migrated.SearchPinyin, "zhongguo") || !strings.Contains(migrated.SearchInitials, "zgdy") {
+		t.Fatalf("pinyin=%q initials=%q", migrated.SearchPinyin, migrated.SearchInitials)
+	}
+	if report := manager.HealthCheck(context.Background(), true); len(report.MissingColumns) != 0 {
+		t.Fatalf("healthy migrated database reports missing columns: %#v", report)
+	}
+	_ = library
+}
+
+func TestHealthCheckReportsMissingMediaSearchColumn(t *testing.T) {
+	manager := openTestManager(t, DefaultOptions())
+	if err := manager.DB().Migrator().DropColumn(&model.Media{}, "SearchInitials"); err != nil {
+		t.Fatal(err)
+	}
+	report := manager.HealthCheck(context.Background(), true)
+	if fmt.Sprint(report.MissingColumns) != "[media.search_initials]" || report.Healthy {
+		t.Fatalf("missing search column report=%#v", report)
 	}
 }
 
@@ -145,7 +214,7 @@ func TestHigherDatabaseVersionRejectsWriteOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.DB().Create(&SchemaMigration{Version: 5, Name: "future", AppliedAt: time.Now()}).Error; err != nil {
+	if err := manager.DB().Create(&SchemaMigration{Version: 6, Name: "future", AppliedAt: time.Now()}).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.Close(); err != nil {
@@ -795,7 +864,7 @@ func TestRestoreRejectsNewerNaviDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := candidate.DB().Create(&SchemaMigration{Version: 5, Name: "future", AppliedAt: time.Now().UTC()}).Error; err != nil {
+	if err := candidate.DB().Create(&SchemaMigration{Version: 6, Name: "future", AppliedAt: time.Now().UTC()}).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := candidate.Close(); err != nil {
@@ -871,6 +940,10 @@ func TestJellyfinPerformanceIndexesAreHealthyAndUsed(t *testing.T) {
 	assertPlanUses(
 		"SELECT * FROM media WHERE deleted_at IS NULL AND library_id = ? AND media_type = ? AND id <> ? ORDER BY created_at DESC LIMIT 32",
 		"idx_media_library_type_deleted_created", library.ID, media.MediaType, "missing",
+	)
+	assertPlanUses(
+		"SELECT 1 FROM media WHERE series_id = ? AND deleted_at IS NULL LIMIT 1",
+		"idx_media_series_deleted", "series-index-check",
 	)
 	assertPlanUses(
 		"SELECT * FROM media WHERE deleted_at IS NULL AND (series_id = '' OR series_id IS NULL) AND library_id != '' ORDER BY created_at DESC LIMIT 100",

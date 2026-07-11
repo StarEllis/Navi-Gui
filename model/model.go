@@ -336,13 +336,15 @@ type Media struct {
 	UpdatedAt time.Time      `json:"updated_at"`
 	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
 
-	Library    Library      `json:"-" gorm:"foreignKey:LibraryID"`
-	Series     *Series      `json:"series,omitempty" gorm:"foreignKey:SeriesID"`
-	Actor      string       `json:"actor" gorm:"-"`
-	Actors     []MediaActor `json:"actors,omitempty" gorm:"-"`
-	SearchText string       `json:"search_text" gorm:"-"`
-	IsFavorite bool         `json:"is_favorite" gorm:"-"`
-	IsWatched  bool         `json:"is_watched" gorm:"-"`
+	Library        Library      `json:"-" gorm:"foreignKey:LibraryID"`
+	Series         *Series      `json:"series,omitempty" gorm:"foreignKey:SeriesID"`
+	Actor          string       `json:"actor" gorm:"-"`
+	Actors         []MediaActor `json:"actors,omitempty" gorm:"-"`
+	SearchText     string       `json:"search_text" gorm:"type:text"`
+	SearchPinyin   string       `json:"-" gorm:"type:text"`
+	SearchInitials string       `json:"-" gorm:"type:text"`
+	IsFavorite     bool         `json:"is_favorite" gorm:"-"`
+	IsWatched      bool         `json:"is_watched" gorm:"-"`
 }
 
 // Person 演职人员
@@ -452,6 +454,7 @@ func (s *Series) BeforeSave(tx *gorm.DB) error {
 
 func (m *Media) BeforeSave(tx *gorm.DB) error {
 	m.PathKey = NormalizePathKey(m.FilePath)
+	m.RefreshSearchFields("")
 	return nil
 }
 

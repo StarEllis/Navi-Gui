@@ -1,13 +1,16 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { Play } from 'lucide-react';
 import { PlayFile } from "../../wailsjs/go/main/App";
 import { toLocalAssetUrl } from '../utils/media';
+import { areMediaCardMediaPropsEqual, shouldOpenMediaFromCardKey } from '../utils/mediaCardState';
+import { markComponentRender } from '../utils/performanceDiagnostics';
 
 interface MediaCardProps {
     media: any;
-    onClick: () => void;
+    onSelectMedia: (media: any) => void;
     onQuickPlayStatus?: (message: string) => void;
-    onPrefetch?: () => void;
+    onPrefetchMedia?: (media: any) => void;
+    onFocusMedia?: (mediaId: string) => void;
 }
 
 const formatError = (error: unknown) => {
@@ -20,16 +23,17 @@ const formatError = (error: unknown) => {
     return '未知错误';
 };
 
-const MediaCard: React.FC<MediaCardProps> = ({ media, onClick, onQuickPlayStatus, onPrefetch }) => {
-    const coverUrl = media.poster_path
-        ? toLocalAssetUrl(media.poster_path)
-        : media.backdrop_path
-            ? toLocalAssetUrl(media.backdrop_path)
-            : '';
-
+const MediaCard: React.FC<MediaCardProps> = ({ media, onSelectMedia, onQuickPlayStatus, onPrefetchMedia, onFocusMedia }) => {
+    markComponentRender('MediaCard');
+    const coverUrl = useMemo(() => (
+        media.poster_path
+            ? toLocalAssetUrl(media.poster_path)
+            : media.backdrop_path
+                ? toLocalAssetUrl(media.backdrop_path)
+                : ''
+    ), [media.backdrop_path, media.poster_path]);
     const handleQuickPlay = async (event: React.MouseEvent<HTMLButtonElement>) => {
         event.stopPropagation();
-
         const targetPath = typeof media?.file_path === 'string' ? media.file_path.trim() : '';
         if (!targetPath) {
             onQuickPlayStatus?.('播放失败：当前卡片没有可播放文件');
@@ -45,28 +49,45 @@ const MediaCard: React.FC<MediaCardProps> = ({ media, onClick, onQuickPlayStatus
         }
     };
 
+    const openMedia = () => onSelectMedia(media);
+
     return (
         <div
             className="media-card"
-            onClick={onClick}
-            onPointerEnter={onPrefetch}
-            onFocus={onPrefetch}
+            role="button"
+            tabIndex={0}
+            aria-label={`打开 ${media.title || '当前媒体'} 详情`}
+            onClick={openMedia}
+            onKeyDown={(event) => {
+                if (shouldOpenMediaFromCardKey(event.key, event.target === event.currentTarget)) {
+                    event.preventDefault();
+                    openMedia();
+                }
+            }}
+            onPointerEnter={() => onPrefetchMedia?.(media)}
+            onFocus={() => {
+                onFocusMedia?.(media.id);
+                onPrefetchMedia?.(media);
+            }}
         >
             <div className="media-poster-wrapper">
-                {coverUrl ? (
+                <div className="media-poster-empty" role="img" aria-label={`${media.title || '当前媒体'} 暂无海报`}>
+                    No Image
+                </div>
+                {coverUrl && (
                     <img
+                        key={coverUrl}
                         src={coverUrl}
                         className="media-poster-image"
-                        alt={media.title}
+                        alt={media.title || '媒体海报'}
                         loading="lazy"
+                        decoding="async"
+                        width={178}
+                        height={255}
                         onError={(event) => {
-                            (event.target as HTMLImageElement).src = 'https://via.placeholder.com/178x255?text=No+Poster';
+                            event.currentTarget.hidden = true;
                         }}
                     />
-                ) : (
-                    <div className="media-poster-empty">
-                        No Image
-                    </div>
                 )}
 
                 <div className="media-card-play-overlay">
@@ -94,6 +115,9 @@ const MediaCard: React.FC<MediaCardProps> = ({ media, onClick, onQuickPlayStatus
 };
 
 export default React.memo(MediaCard, (prev, next) => (
-    prev.media === next.media
+    areMediaCardMediaPropsEqual(prev.media, next.media)
+    && prev.onSelectMedia === next.onSelectMedia
     && prev.onQuickPlayStatus === next.onQuickPlayStatus
+    && prev.onPrefetchMedia === next.onPrefetchMedia
+    && prev.onFocusMedia === next.onFocusMedia
 ));

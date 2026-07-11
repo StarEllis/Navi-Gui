@@ -10,8 +10,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"navi-desktop/database"
 	"navi-desktop/model"
 	"navi-desktop/repository"
 
@@ -20,10 +23,34 @@ import (
 	"gorm.io/gorm"
 )
 
+var testAppDatabaseSequence atomic.Uint64
+
+func TestShutdownTimeoutStillClosesDatabase(t *testing.T) {
+	manager, err := database.Open(filepath.Join(t.TempDir(), "shutdown.db"), database.DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	app := &App{
+		ctx: ctx, appCancel: cancel, db: manager.DB(), dbManager: manager,
+		remote: newRemoteAccessState(), logger: zap.NewNop().Sugar(), shutdownTimeout: 25 * time.Millisecond,
+	}
+	app.maintenanceWG.Add(1)
+	started := time.Now()
+	app.shutdown(context.Background())
+	app.maintenanceWG.Done()
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("shutdown exceeded bound: %s", elapsed)
+	}
+	if manager.DB() != nil {
+		t.Fatal("database remained open after background shutdown timeout")
+	}
+}
+
 func newTestApp(t testing.TB) *App {
 	t.Helper()
 
-	dbName := strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
+	dbName := fmt.Sprintf("%s_%d", strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()), testAppDatabaseSequence.Add(1))
 	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", dbName)), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("open sqlite failed: %v", err)
@@ -38,6 +65,7 @@ func newTestApp(t testing.TB) *App {
 		"CREATE INDEX idx_watch_user_completed_updated ON watch_histories(user_id, completed, updated_at)",
 		"CREATE INDEX idx_media_deleted_created ON media(deleted_at, created_at)",
 		"CREATE INDEX idx_media_library_type_deleted_created ON media(library_id, media_type, deleted_at, created_at)",
+		"CREATE INDEX idx_media_series_deleted ON media(series_id, deleted_at)",
 	} {
 		if err := db.Exec(statement).Error; err != nil {
 			t.Fatalf("create sqlite index failed: %v", err)

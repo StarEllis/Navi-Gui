@@ -138,6 +138,30 @@ func TestFFprobeCommandContextCancellationTerminatesProcess(t *testing.T) {
 	}
 }
 
+func TestBackgroundCommandDistinguishesTimeoutAndActiveCancellation(t *testing.T) {
+	if os.Getenv("NAVI_TEST_TIMEOUT_HELPER") == "1" {
+		for {
+			time.Sleep(time.Second)
+		}
+	}
+	t.Setenv("NAVI_TEST_TIMEOUT_HELPER", "1")
+	_, err := runBackgroundCommand(context.Background(), 30*time.Millisecond, false, os.Args[0], "-test.run=TestBackgroundCommandDistinguishesTimeoutAndActiveCancellation")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("timeout error=%v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := runBackgroundCommand(ctx, time.Second, false, os.Args[0], "-test.run=TestBackgroundCommandDistinguishesTimeoutAndActiveCancellation")
+		done <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("active cancellation error=%v", err)
+	}
+}
+
 func TestSuccessfulScanEventsCarryOneTaskID(t *testing.T) {
 	fixture := newOverwriteSafetyFixture(t, "movie", true)
 	recorder := &recordingScanBroadcaster{}

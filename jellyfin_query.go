@@ -11,20 +11,73 @@ import (
 )
 
 func (a *App) queryJellyfinResumeItems(r *http.Request) ([]*jellyfinResolvedItem, int, int, error) {
-	startIndex := parsePositiveInt(r.URL.Query().Get("startIndex"))
-	limit := parsePositiveInt(r.URL.Query().Get("limit"))
+	query := r.URL.Query()
+	startIndex := parsePositiveInt(query.Get("startIndex"))
+	limit := parsePositiveInt(query.Get("limit"))
 	if limit <= 0 || limit > jellyfinMaxItems {
 		limit = jellyfinMaxItems
 	}
 	baseSQL := `FROM watch_histories
 		JOIN media ON media.id = watch_histories.media_id AND media.deleted_at IS NULL
-		WHERE watch_histories.user_id = ? AND watch_histories.completed = 0`
+		JOIN libraries ON libraries.id = media.library_id AND libraries.deleted_at IS NULL`
+	conditions := []string{"watch_histories.user_id = ?", "watch_histories.completed = 0", "watch_histories.position > 0"}
+	args := []interface{}{desktopUserID}
+
+	if parentID := strings.TrimSpace(query.Get("parentId")); parentID != "" {
+		parent, err := a.resolveJellyfinItem(parentID)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		switch parent.Kind {
+		case "library":
+			conditions = append(conditions, "media.library_id = ?")
+			args = append(args, parent.Library.ID)
+		case "series":
+			conditions = append(conditions, "media.series_id = ?")
+			args = append(args, parent.Series.ID)
+		default:
+			return []*jellyfinResolvedItem{}, 0, startIndex, nil
+		}
+	}
+	if includeTypes := splitCSV(query.Get("includeItemTypes")); len(includeTypes) > 0 {
+		typeConditions := make([]string, 0, len(includeTypes))
+		for _, itemType := range includeTypes {
+			switch strings.ToLower(strings.TrimSpace(itemType)) {
+			case "movie":
+				typeConditions = append(typeConditions, "media.series_id IS NULL OR media.series_id = ''")
+			case "episode":
+				typeConditions = append(typeConditions, "media.series_id IS NOT NULL AND media.series_id <> ''")
+			}
+		}
+		if len(typeConditions) == 0 {
+			conditions = append(conditions, "1 = 0")
+		} else {
+			conditions = append(conditions, "("+strings.Join(typeConditions, ") OR (")+")")
+		}
+	}
+	if searchTerm := strings.TrimSpace(query.Get("searchTerm")); searchTerm != "" {
+		conditions = append(conditions, "LOWER(CASE WHEN media.episode_title <> '' THEN media.episode_title ELSE media.title END) LIKE LOWER(?)")
+		args = append(args, "%"+searchTerm+"%")
+	}
+	if value := strings.TrimSpace(query.Get("isFavorite")); value != "" {
+		comparison := "NOT EXISTS"
+		if parseBool(value) {
+			comparison = "EXISTS"
+		}
+		conditions = append(conditions, comparison+" (SELECT 1 FROM favorites WHERE favorites.user_id = ? AND favorites.media_id = media.id)")
+		args = append(args, desktopUserID)
+	}
+	if value := strings.TrimSpace(query.Get("isPlayed")); value != "" && parseBool(value) {
+		conditions = append(conditions, "1 = 0")
+	}
+	baseSQL += " WHERE " + strings.Join(conditions, " AND ")
 	var total int64
-	if err := a.db.Raw("SELECT COUNT(*) "+baseSQL, desktopUserID).Scan(&total).Error; err != nil {
+	if err := a.db.Raw("SELECT COUNT(*) "+baseSQL, args...).Scan(&total).Error; err != nil {
 		return nil, 0, 0, err
 	}
 	var refs []jellyfinItemRef
-	if err := a.db.Raw("SELECT 'media' AS kind, media.id AS id "+baseSQL+" ORDER BY watch_histories.updated_at DESC, watch_histories.id ASC LIMIT ? OFFSET ?", desktopUserID, limit, startIndex).Scan(&refs).Error; err != nil {
+	pageArgs := append(append([]interface{}{}, args...), limit, startIndex)
+	if err := a.db.Raw("SELECT 'media' AS kind, media.id AS id "+baseSQL+" ORDER BY watch_histories.updated_at DESC, watch_histories.id ASC LIMIT ? OFFSET ?", pageArgs...).Scan(&refs).Error; err != nil {
 		return nil, 0, 0, err
 	}
 	items, err := a.loadJellyfinItemRefs(refs)
@@ -184,7 +237,7 @@ func (a *App) jellyfinQuerySources(parentID string, recursive bool) ([]jellyfinQ
 		return jellyfinQuerySource{SQL: "SELECT 'library' AS kind, 'CollectionFolder' AS item_type, id, name, created_at, 0 AS year FROM libraries WHERE deleted_at IS NULL" + where, Args: args}
 	}
 	seriesSource := func(where string, args ...interface{}) jellyfinQuerySource {
-		return jellyfinQuerySource{SQL: "SELECT 'series' AS kind, 'Series' AS item_type, series.id, series.title AS name, series.created_at, series.year FROM series JOIN libraries ON libraries.id = series.library_id AND libraries.deleted_at IS NULL WHERE series.deleted_at IS NULL AND series.episode_count > 0" + where, Args: args}
+		return jellyfinQuerySource{SQL: "SELECT 'series' AS kind, 'Series' AS item_type, series.id, series.title AS name, series.created_at, series.year FROM series JOIN libraries ON libraries.id = series.library_id AND libraries.deleted_at IS NULL WHERE series.deleted_at IS NULL AND EXISTS (SELECT 1 FROM media AS series_media WHERE series_media.series_id = series.id AND series_media.deleted_at IS NULL)" + where, Args: args}
 	}
 	mediaSource := func(where string, args ...interface{}) jellyfinQuerySource {
 		return jellyfinQuerySource{SQL: "SELECT 'media' AS kind, CASE WHEN media.series_id IS NOT NULL AND media.series_id <> '' THEN 'Episode' ELSE 'Movie' END AS item_type, media.id, CASE WHEN media.episode_title <> '' THEN media.episode_title ELSE media.title END AS name, media.created_at, media.year FROM media JOIN libraries ON libraries.id = media.library_id AND libraries.deleted_at IS NULL WHERE media.deleted_at IS NULL" + where, Args: args}
@@ -439,7 +492,9 @@ func (a *App) hydrateJellyfinItems(items []*jellyfinResolvedItem) error {
 		for start := 0; start < len(libraryIDs); start += jellyfinQueryBatch {
 			end := minInt(start+jellyfinQueryBatch, len(libraryIDs))
 			var seriesRows []libraryCountRow
-			if err := a.db.Model(&model.Series{}).Select("library_id, COUNT(*) AS count").Where("library_id IN ? AND episode_count > 0", libraryIDs[start:end]).Group("library_id").Scan(&seriesRows).Error; err != nil {
+			if err := a.db.Model(&model.Series{}).Select("library_id, COUNT(*) AS count").
+				Where("library_id IN ? AND EXISTS (SELECT 1 FROM media AS series_media WHERE series_media.series_id = series.id AND series_media.deleted_at IS NULL)", libraryIDs[start:end]).
+				Group("library_id").Scan(&seriesRows).Error; err != nil {
 				return err
 			}
 			for _, row := range seriesRows {

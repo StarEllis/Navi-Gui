@@ -20,12 +20,14 @@ import LibraryEditModal from './components/LibraryEditModal';
 import MediaDetail from './components/MediaDetail';
 import {
     loadInitialLibraryState,
-    mergeMediaIntoCachedMediaLists,
     persistCurrentLibraryID,
     persistLibraries,
-    removeMediaFromCachedMediaLists,
 } from './utils/persistentCache';
 import { seedMediaDetailCache } from './utils/mediaDetailCache';
+import { markComponentRender } from './utils/performanceDiagnostics';
+import { putBoundedScrollState } from './utils/listViewState';
+import ScanTaskPanel from './components/ScanTaskPanel';
+import { scanProgressStore } from './utils/scanProgressStore';
 import {
 	activateScanTaskFromEvent,
 	activateScanTaskFromResponse,
@@ -42,6 +44,7 @@ type ViewName = 'libs' | 'settings' | 'actor' | 'genre' | 'watched' | 'favorite'
 type SortOrder = 'asc' | 'desc';
 type SortField = 'created_at' | 'release_date' | 'video_codec' | 'last_watched' | 'favorite_at' | 'rating';
 type SortViewName = 'libs' | 'watched' | 'favorite';
+
 type SortConfig = { field: SortField; order: SortOrder };
 type SortOption = { field: SortField; label: string };
 type FilterState = { type: string; value: string; label: string; showHeaderLabel?: boolean } | null;
@@ -51,17 +54,6 @@ type FilterReturnContext = {
     searchKeyword: string;
     filter: FilterState;
 } | null;
-type ScanProgressState = {
-    taskId: string;
-    libraryId: string;
-    libraryName: string;
-    mode: string;
-    phase: string;
-    current: number;
-    total: number;
-    message: string;
-};
-
 const APP_TITLE = 'Navi';
 
 const VIEW_LABELS: Record<Exclude<ViewName, 'libs'>, string> = {
@@ -146,6 +138,7 @@ const getMediaGridScrollKey = (
 };
 
 function App() {
+    markComponentRender('App');
     const initialLibraryStateRef = useRef<ReturnType<typeof loadInitialLibraryState> | null>(null);
     if (!initialLibraryStateRef.current) {
         initialLibraryStateRef.current = loadInitialLibraryState();
@@ -157,11 +150,11 @@ function App() {
     const [libraries, setLibraries] = useState<any[]>(() => initialLibraryState.libraries);
     const [currentLib, setCurrentLib] = useState<any>(() => initialLibraryState.currentLibrary);
     const [searchKeyword, setSearchKeyword] = useState('');
+    const [debouncedMediaSearch, setDebouncedMediaSearch] = useState('');
     const [showLibModal, setShowLibModal] = useState(false);
     const [editingLib, setEditingLib] = useState<any>(null);
     const [selectedMedia, setSelectedMedia] = useState<any>(null);
     const [statusMsg, setStatusMsg] = useState('');
-    const [scanProgress, setScanProgress] = useState<ScanProgressState | null>(null);
     const [mediaCount, setMediaCount] = useState(() => {
         const initialCount = initialLibraryState.currentLibrary?.media_count;
         return typeof initialCount === 'number' ? initialCount : 0;
@@ -176,6 +169,7 @@ function App() {
     const scanTaskLifecycleRef = useRef(createScanTaskLifecycle());
     const resetTitleTimerRef = useRef<number | null>(null);
     const metadataRefreshTimerRef = useRef<number | null>(null);
+    const statusTimerRef = useRef<number | null>(null);
     const currentLibRef = useRef<any>(null);
 
     const setAppTitle = (title: string) => {
@@ -189,10 +183,11 @@ function App() {
         : currentSortView === 'favorite'
             ? FAVORITE_SORT_OPTIONS
             : LIBRARY_SORT_OPTIONS;
+    const mediaSearchKeyword = searchKeyword.trim() ? debouncedMediaSearch : '';
     const currentGridScrollKey = getMediaGridScrollKey(
         currentLib?.id,
         view,
-        searchKeyword,
+        mediaSearchKeyword,
         sortField,
         sortOrder,
         activeFilter,
@@ -210,12 +205,14 @@ function App() {
                 return prev;
             }
 
-            return {
-                ...prev,
-                [currentGridScrollKey]: normalizedScrollTop,
-            };
+            return putBoundedScrollState(prev, currentGridScrollKey, normalizedScrollTop);
         });
     }, [currentGridScrollKey]);
+
+    useEffect(() => {
+        const timer = window.setTimeout(() => setDebouncedMediaSearch(searchKeyword.trim()), searchKeyword.trim() ? 250 : 0);
+        return () => window.clearTimeout(timer);
+    }, [searchKeyword]);
 
     const scheduleTitleReset = (delay = 3500) => {
         if (resetTitleTimerRef.current) {
@@ -240,14 +237,16 @@ function App() {
         setAppTitle(`${APP_TITLE} - ${fallbackPrefix}${ratioText}${detail}${suffix}`);
     };
 
-    const showStatus = (msg: string) => {
+    const showStatus = useCallback((msg: string) => {
         setStatusMsg(msg);
-        window.setTimeout(() => setStatusMsg(''), 5000);
-    };
-
-    const clearScanProgress = () => {
-        setScanProgress(null);
-    };
+        if (statusTimerRef.current !== null) {
+            window.clearTimeout(statusTimerRef.current);
+        }
+        statusTimerRef.current = window.setTimeout(() => {
+            setStatusMsg('');
+            statusTimerRef.current = null;
+        }, 5000);
+    }, []);
 
     const startScanForLibrary = async (libraryId: string, mode: string) => {
         scanModeRef.current = mode;
@@ -328,8 +327,7 @@ function App() {
             if (!libraryId || !taskId || !activateScanTaskFromEvent(scanTaskLifecycleRef.current, data)) {
                 return;
             }
-            scanStartedAtRef.current = Date.now();
-            setScanProgress({
+            scanProgressStore.set({
                 taskId,
                 libraryId: typeof data?.library_id === 'string' ? data.library_id : '',
                 libraryName: typeof data?.library_name === 'string' ? data.library_name : '',
@@ -341,6 +339,10 @@ function App() {
                 total: typeof data?.total === 'number' ? data.total : 0,
                 message: typeof data?.message === 'string' ? data.message : '',
             });
+            if (currentLibRef.current?.id !== libraryId) {
+                return;
+            }
+            scanStartedAtRef.current = Date.now();
             updateScanTitle(data, '扫描 ');
         };
 
@@ -349,7 +351,7 @@ function App() {
             if (!isCurrentScanEvent(scanTaskLifecycleRef.current.activeTaskIDs.get(libraryId), data)) {
                 return;
             }
-            setScanProgress((prev) => ({
+            scanProgressStore.update(libraryId, (prev) => ({
                 taskId: typeof data?.task_id === 'string' ? data.task_id : (prev?.taskId || ''),
                 libraryId: typeof data?.library_id === 'string' ? data.library_id : (prev?.libraryId || ''),
                 libraryName: typeof data?.library_name === 'string' ? data.library_name : (prev?.libraryName || ''),
@@ -361,16 +363,37 @@ function App() {
                 total: typeof data?.total === 'number' ? data.total : (prev?.total || 0),
                 message: typeof data?.message === 'string' ? data.message : (prev?.message || ''),
             }));
+            if (currentLibRef.current?.id !== libraryId) {
+                return;
+            }
             updateScanTitle(data, '扫描 ');
         };
 
-        const acceptTerminal = (data: any): boolean => {
-			const { taskId } = scanEventIdentity(data);
-			return taskId !== '' && completeScanTask(scanTaskLifecycleRef.current, data);
+        const acceptTerminal = (data: any, fallbackPhase: string): boolean => {
+			const { libraryId, taskId } = scanEventIdentity(data);
+			if (!libraryId || !taskId || !completeScanTask(scanTaskLifecycleRef.current, data)) {
+				return false;
+			}
+			const previous = scanProgressStore.getLibraryState(libraryId).active;
+			scanProgressStore.complete({
+				taskId,
+				libraryId,
+				libraryName: typeof data?.library_name === 'string' ? data.library_name : (previous?.libraryName || ''),
+				mode: typeof data?.mode === 'string' ? data.mode : (previous?.mode || ''),
+				phase: typeof data?.phase === 'string' ? data.phase : fallbackPhase,
+				current: typeof data?.current === 'number' ? data.current : (previous?.current || 0),
+				total: typeof data?.total === 'number' ? data.total : (previous?.total || 0),
+				message: typeof data?.message === 'string' ? data.message : (previous?.message || ''),
+			});
+			return true;
         };
 
         const onScanComplete = (data: any) => {
-            if (!acceptTerminal(data)) {
+            if (!acceptTerminal(data, 'completed')) {
+                return;
+            }
+            loadLibraries();
+            if (currentLibRef.current?.id !== scanEventIdentity(data).libraryId) {
                 return;
             }
             showStatus(`扫描完成：${data?.library_name || ''}`);
@@ -378,8 +401,6 @@ function App() {
             scanStartedAtRef.current = null;
             scanModeRef.current = '';
             scheduleTitleReset();
-            clearScanProgress();
-            loadLibraries();
             setContentRefreshVersion((prev) => prev + 1);
         };
 
@@ -400,7 +421,10 @@ function App() {
         });
 
         const onScanFail = (data: any) => {
-            if (!acceptTerminal(data)) {
+            if (!acceptTerminal(data, 'failed')) {
+                return;
+            }
+            if (currentLibRef.current?.id !== scanEventIdentity(data).libraryId) {
                 return;
             }
             showStatus(`扫描失败：${data?.message || '未知错误'}`);
@@ -408,11 +432,13 @@ function App() {
             scanStartedAtRef.current = null;
             scanModeRef.current = '';
             scheduleTitleReset();
-            clearScanProgress();
         };
 
         const onScanIncomplete = (data: any) => {
-            if (!acceptTerminal(data)) {
+            if (!acceptTerminal(data, 'incomplete')) {
+                return;
+            }
+            if (currentLibRef.current?.id !== scanEventIdentity(data).libraryId) {
                 return;
             }
             showStatus(`扫描未完成：${data?.message || '目录无法完整访问'}`);
@@ -420,11 +446,13 @@ function App() {
             scanStartedAtRef.current = null;
             scanModeRef.current = '';
             scheduleTitleReset();
-            clearScanProgress();
         };
 
         const onScanCanceled = (data: any) => {
-            if (!acceptTerminal(data)) {
+            if (!acceptTerminal(data, 'canceled')) {
+                return;
+            }
+            if (currentLibRef.current?.id !== scanEventIdentity(data).libraryId) {
                 return;
             }
             showStatus('扫描已取消');
@@ -432,7 +460,6 @@ function App() {
             scanStartedAtRef.current = null;
             scanModeRef.current = '';
             scheduleTitleReset();
-            clearScanProgress();
         };
 
         const unsubscribeScanEvents = registerScanEventListeners(
@@ -456,7 +483,11 @@ function App() {
             if (metadataRefreshTimerRef.current !== null) {
                 window.clearTimeout(metadataRefreshTimerRef.current);
             }
+            if (statusTimerRef.current !== null) {
+                window.clearTimeout(statusTimerRef.current);
+            }
             scanModeRef.current = '';
+			scanProgressStore.clear();
 			clearScanTaskLifecycle(scanTaskLifecycleRef.current);
             setAppTitle(APP_TITLE);
         };
@@ -515,14 +546,13 @@ function App() {
         }, false);
     };
 
-    const handleSelectMedia = (media: any) => {
+    const handleSelectMedia = useCallback((media: any) => {
         seedMediaDetailCache(media);
         setSelectedMedia(media);
-    };
+    }, []);
 
-    const handleDetailMediaChange = (media: any) => {
+    const handleDetailMediaChange = useCallback((media: any) => {
         seedMediaDetailCache(media);
-        mergeMediaIntoCachedMediaLists(media);
         setListMutation({ type: 'merge', media });
         setSelectedMedia((prev: any) => {
             if (!prev || prev.id !== media.id) {
@@ -530,17 +560,15 @@ function App() {
             }
             return { ...prev, ...media };
         });
-    };
+    }, []);
 
-    const handleDetailDelete = (mediaID: string) => {
-        removeMediaFromCachedMediaLists(mediaID);
+    const handleDetailDelete = useCallback((mediaID: string) => {
         setListMutation({ type: 'remove', mediaId: mediaID });
         setSelectedMedia((prev: any) => (prev?.id === mediaID ? null : prev));
-    };
+    }, []);
 
     const resetWorkspaceState = () => {
         setSelectedMedia(null);
-        setGridScrollTops({});
         setActiveFilter(null);
         setFilterReturnContext(null);
         setSearchKeyword('');
@@ -658,10 +686,6 @@ function App() {
             ? '\u641c\u7d22\u6807\u7b7e'
             : '\u641c\u7d22\u5a92\u4f53\u3001\u6f14\u5458\u3001\u6807\u7b7e';
     const isDetailOpen = Boolean(selectedMedia);
-    const showScanProgressPanel = Boolean(scanProgress && !statusMsg);
-    const scanProgressText = scanProgress
-        ? `\u6b63\u5728\u626b\u63cf: ${scanProgress.current}/${scanProgress.total > 0 ? scanProgress.total : '...'}`
-        : '';
 
     const renderWorkspaceContent = () => {
         if (!currentLib && view !== 'settings') {
@@ -684,7 +708,7 @@ function App() {
                 return (
                     <MediaGrid
                         libraryId={currentLib.id}
-                        keyword={searchKeyword}
+                        keyword={mediaSearchKeyword}
                         sortField={sortField}
                         sortOrder={sortOrder}
                         layoutVersion={layoutVersion}
@@ -702,7 +726,7 @@ function App() {
                 return (
                     <MediaGrid
                         libraryId={currentLib.id}
-                        keyword={searchKeyword}
+                        keyword={mediaSearchKeyword}
                         sortField={sortField}
                         sortOrder={sortOrder}
                         layoutVersion={layoutVersion}
@@ -721,7 +745,7 @@ function App() {
                     <CategoryGrid
                         type="actor"
                         libraryId={currentLib.id}
-                        keyword={searchKeyword}
+                        keyword={mediaSearchKeyword}
                         refreshVersion={contentRefreshVersion}
                         fetchFn={GetActorStats}
                         onSelect={(value, label) => applyFilterFromView('actor', { type: 'actor', value, label })}
@@ -837,14 +861,7 @@ function App() {
                 <div className="status-toast">{statusMsg}</div>
             )}
 
-            {showScanProgressPanel && scanProgress && (
-                <div className="scan-progress-panel">
-                    <div className="scan-progress-title">{scanProgressText}</div>
-                    {scanProgress.message && (
-                        <div className="scan-progress-message">{scanProgress.message}</div>
-                    )}
-                </div>
-            )}
+            <ScanTaskPanel hidden={Boolean(statusMsg)} libraryId={currentLib?.id || ''} />
         </div>
     );
 }

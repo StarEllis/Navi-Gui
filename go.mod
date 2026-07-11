@@ -5,6 +5,7 @@ go 1.23.0
 require (
 	github.com/glebarez/sqlite v1.11.0
 	github.com/google/uuid v1.6.0
+	github.com/mozillazg/go-pinyin v0.21.0
 	github.com/wailsapp/wails/v2 v2.12.0
 	go.uber.org/zap v1.27.1
 	golang.org/x/sys v0.30.0

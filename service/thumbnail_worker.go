@@ -139,6 +139,9 @@ func (w *ThumbnailWorker) Shutdown(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
+		if w.thumbSvc != nil {
+			w.thumbSvc.Shutdown()
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()

@@ -52,8 +52,14 @@ type App struct {
 	lastScanTasks    map[string]ScanTaskInfo
 	lastScanFailures map[string]ScanTaskInfo
 	scanWG           sync.WaitGroup
+	maintenanceWG    sync.WaitGroup
+	postStartupOnce  sync.Once
+	postStartupDelay time.Duration
+	migrationHook    func()
+	maintenanceHook  func(context.Context) error
 	shuttingDown     bool
 	shutdownOnce     sync.Once
+	shutdownTimeout  time.Duration
 }
 
 const (
@@ -97,6 +103,13 @@ func NewApp() *App {
 	}
 	app.desktop = newDesktopIntegration(app)
 	return app
+}
+
+func (a *App) reserveArtworkPath(path string) (func(), bool) {
+	if a == nil || a.artworkCache == nil || !a.artworkCache.IsCachedPath(path) {
+		return func() {}, true
+	}
+	return a.artworkCache.Reserve(path)
 }
 
 func (a *App) tryBeginLibraryScan(libraryID string) bool {
@@ -188,7 +201,7 @@ func (a *App) startup(ctx context.Context) {
 	a.scanner.SetThumbnailSettingsProvider(thumbnailSettingsProvider)
 	a.scanner.SetArtworkCache(a.artworkCache)
 	a.scanner.SetGfriendsAvatarService(a.avatarService, gfriendsAvatarEnabled)
-	thumbSvc := service.NewThumbnailService(cfg, a.logger)
+	thumbSvc := a.scanner.ThumbnailService()
 	thumbSvc.SetArtworkCache(a.artworkCache)
 	a.thumbnailWorker = service.NewThumbnailWorker(a.repos.Media, thumbSvc, thumbnailSettingsProvider, a.logger, wsHub)
 	// a.scanner.SetMatchRuleRepo(a.repos.MatchRule)
@@ -199,41 +212,70 @@ func (a *App) startup(ctx context.Context) {
 }
 
 func (a *App) startPostStartupServices(thumbSvc *service.ThumbnailService, thumbnailSettingsProvider func() service.ThumbnailSettings) {
-	go func() {
-		defer func() {
-			if r := recover(); r != nil && a.logger != nil {
-				a.logger.Warnf("post-startup services failed: %v", r)
+	a.postStartupOnce.Do(func() {
+		a.maintenanceWG.Add(1)
+		go func() {
+			defer a.maintenanceWG.Done()
+			defer func() {
+				if r := recover(); r != nil && a.logger != nil {
+					a.logger.Warnf("post-startup services failed: %v", r)
+				}
+			}()
+
+			// Let Wails finish creating and painting the WebView before maintenance work starts.
+			delay := 500 * time.Millisecond
+			if a.postStartupDelay != 0 {
+				delay = a.postStartupDelay
+			}
+			if delay < 0 {
+				delay = 0
+			}
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-a.ctx.Done():
+				return
+			case <-timer.C:
+			}
+
+			if a.migrationHook != nil {
+				a.migrationHook()
+			} else {
+				a.migrateThumbnailTasksV2(thumbSvc, thumbnailSettingsProvider())
+			}
+			if a.ctx.Err() != nil {
+				return
+			}
+			maintenanceStart := time.Now()
+			if a.maintenanceHook != nil {
+				if err := a.maintenanceHook(a.ctx); err != nil && !errors.Is(err, context.Canceled) {
+					a.logger.Warnf("post-startup maintenance failed: %v", err)
+				}
+			} else if a.artworkCache != nil {
+				if _, err := a.artworkCache.Maintain(a.ctx); err != nil && !errors.Is(err, context.Canceled) {
+					a.logger.Warnf("artwork cache maintenance failed: %v", err)
+				}
+				if err := a.artworkCache.CleanupOldTempsIfDue(a.ctx, 24*time.Hour, 24*time.Hour, 200); err != nil && !errors.Is(err, context.Canceled) {
+					a.logger.Warnf("old cache temp cleanup failed: %v", err)
+				}
+				a.logger.Debugf("delayed cache maintenance completed in %s", time.Since(maintenanceStart))
+			}
+			if a.thumbnailWorker != nil {
+				a.thumbnailWorker.Start()
+			}
+
+			if settings, err := a.GetDesktopSettings(); err == nil {
+				if err := a.syncDesktopIntegration(settings); err != nil {
+					a.logger.Warnf("sync desktop integration failed: %v", err)
+				}
+				if err := a.syncRemoteServices(settings); err != nil {
+					a.logger.Warnf("start remote services failed: %v", err)
+				}
+			} else {
+				a.logger.Warnf("load desktop settings for remote services failed: %v", err)
 			}
 		}()
-
-		// Let Wails finish creating and painting the WebView before maintenance work starts.
-		timer := time.NewTimer(500 * time.Millisecond)
-		defer timer.Stop()
-		select {
-		case <-a.ctx.Done():
-			return
-		case <-timer.C:
-		}
-
-		a.migrateThumbnailTasksV2(thumbSvc, thumbnailSettingsProvider())
-		if a.ctx.Err() != nil {
-			return
-		}
-		if a.thumbnailWorker != nil {
-			a.thumbnailWorker.Start()
-		}
-
-		if settings, err := a.GetDesktopSettings(); err == nil {
-			if err := a.syncDesktopIntegration(settings); err != nil {
-				a.logger.Warnf("sync desktop integration failed: %v", err)
-			}
-			if err := a.syncRemoteServices(settings); err != nil {
-				a.logger.Warnf("start remote services failed: %v", err)
-			}
-		} else {
-			a.logger.Warnf("load desktop settings for remote services failed: %v", err)
-		}
-	}()
+	})
 }
 
 func (a *App) migrateThumbnailTasksV2(thumbSvc *service.ThumbnailService, settings service.ThumbnailSettings) {
@@ -867,21 +909,21 @@ func (a *App) GetMediaList(libraryID string, page, size int, sortBy, sortOrder, 
 			Group("media_id")
 		query = query.Joins("LEFT JOIN (?) AS last_watch ON last_watch.media_id = media.id", lastWatchSubQuery)
 	}
+	if sortBy == "favorite_at" {
+		favoriteSubQuery := a.db.Table("favorites").
+			Select("media_id, MAX(created_at) as favorite_at").
+			Where("user_id = ?", desktopUserID).
+			Group("media_id")
+		query = query.Joins("LEFT JOIN (?) AS favorite_sort ON favorite_sort.media_id = media.id", favoriteSubQuery)
+	}
 	if libraryID != "" {
 		query = query.Where("library_id = ?", libraryID)
 	}
-	if keyword != "" {
-		keywordLike := "%" + keyword + "%"
-		actorKeywordMatch := a.db.Table("media_people").
-			Select("media_people.media_id").
-			Joins("JOIN people ON people.id = media_people.person_id").
-			Where("media_people.role = ?", "actor").
-			Where("people.name LIKE ? OR people.orig_name LIKE ?", keywordLike, keywordLike)
+	for _, token := range model.TokenizeMediaSearchQuery(keyword) {
+		keywordLike := "%" + token + "%"
 		query = query.Where(
-			a.db.Where(
-				"media.title LIKE ? OR media.orig_title LIKE ? OR media.file_path LIKE ? OR media.genres LIKE ? OR media.studio LIKE ? OR media.release_date_normalized LIKE ?",
-				keywordLike, keywordLike, keywordLike, keywordLike, keywordLike, keywordLike,
-			).Or("media.id IN (?)", actorKeywordMatch),
+			"(media.search_text LIKE ? OR media.search_pinyin LIKE ? OR media.search_initials LIKE ?)",
+			keywordLike, keywordLike, keywordLike,
 		)
 	}
 
@@ -895,23 +937,51 @@ func (a *App) GetMediaList(libraryID string, page, size int, sortBy, sortOrder, 
 			Joins("JOIN people ON people.id = media_people.person_id").
 			Where("media_people.person_id = ? OR people.name = ?", filterValue, filterValue)
 		query = query.Where("id IN (?)", actorMatch)
-	case "genre":
+	case "genre", "tag":
 		query = query.Where("genres LIKE ?", "%"+filterValue+"%")
 	case "series":
 		query = query.Where("series_id = ?", filterValue)
+	case "media_type":
+		query = query.Where("media_type = ?", filterValue)
 	case "watched":
 		// 使用 watch_histories 表关联：desktop_user 且 completed 为真
 		query = query.Joins("JOIN watch_histories ON watch_histories.media_id = media.id").
 			Where("watch_histories.user_id = ? AND watch_histories.completed = ?", desktopUserID, true)
+	case "unwatched":
+		watchedMatch := a.db.Table("watch_histories").
+			Select("media_id").
+			Where("user_id = ? AND completed = ?", desktopUserID, true)
+		query = query.Where("media.id NOT IN (?)", watchedMatch)
 	case "favorite":
-		// 使用 favorites 表关联
-		query = query.Joins("JOIN favorites ON favorites.media_id = media.id").
-			Where("favorites.user_id = ?", desktopUserID)
+		favoriteMatch := a.db.Table("favorites").
+			Select("media_id").
+			Where("user_id = ?", desktopUserID)
+		if strings.EqualFold(filterValue, "false") {
+			query = query.Where("media.id NOT IN (?)", favoriteMatch)
+		} else {
+			query = query.Where("media.id IN (?)", favoriteMatch)
+		}
+	}
+
+	if size <= 0 {
+		size = 120
+	}
+	if size > 200 {
+		size = 200
+	}
+	if page < 1 {
+		page = 1
 	}
 
 	var total int64
-	if size > 0 {
-		query.Count(&total)
+	if err := query.Count(&total).Error; err != nil {
+		return nil, err
+	}
+	if total > 0 {
+		lastPage := int((total + int64(size) - 1) / int64(size))
+		if page > lastPage {
+			page = lastPage
+		}
 	}
 
 	var media []model.Media
@@ -929,6 +999,10 @@ func (a *App) GetMediaList(libraryID string, page, size int, sortBy, sortOrder, 
 		sortField = "LOWER(media.video_codec)"
 	case "last_watched":
 		sortField = "COALESCE(last_watch.last_watched_at, '')"
+	case "favorite_at":
+		sortField = "COALESCE(favorite_sort.favorite_at, '')"
+	case "rating":
+		sortField = "media.rating"
 	case "created_at", "added_at", "":
 		sortField = "COALESCE(media.nfo_mod_time, media.file_created_at, media.file_mod_time, media.created_at)"
 	default:
@@ -941,26 +1015,18 @@ func (a *App) GetMediaList(libraryID string, page, size int, sortBy, sortOrder, 
 	}
 	sortStr := sortField + " " + dir
 
-	if page < 1 {
-		page = 1
-	}
-
-	orderedQuery := query.Order(sortStr)
-	if size > 0 {
-		orderedQuery = orderedQuery.Offset((page - 1) * size).Limit(size)
-	}
+	orderedQuery := query.Order(sortStr).Order("media.id ASC").Offset((page - 1) * size).Limit(size)
 
 	err := orderedQuery.Find(&media).Error
 	if err == nil {
-		if size <= 0 {
-			total = int64(len(media))
-		}
 		a.hydrateMediaSliceStates(media)
 		a.hydrateMediaSliceSearchText(media)
 	}
 	return map[string]interface{}{
-		"items": media,
-		"total": total,
+		"items":     media,
+		"total":     total,
+		"page":      page,
+		"page_size": size,
 	}, err
 }
 
@@ -1981,6 +2047,9 @@ func (a *App) syncMediaFromNFO(mediaID string, nfoPath string) error {
 			if err := a.scanner.SyncActorsForMediaStrictWithDB(&updated, tx); err != nil {
 				return fmt.Errorf("sync actors after NFO save: %w", err)
 			}
+		}
+		if err := repository.RefreshMediaSearchIndex(tx, mediaID); err != nil {
+			return fmt.Errorf("refresh media search index after NFO save: %w", err)
 		}
 		return nil
 	}); err != nil {
