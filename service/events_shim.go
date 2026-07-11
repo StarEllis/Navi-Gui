@@ -21,6 +21,7 @@ const (
 	EventThumbnailFailed      = "thumbnail:failed"
 	EventThumbnailCanceled    = "thumbnail:canceled"
 	EventMediaMetadataUpdated = "media:metadata-updated"
+	EventMediaStateUpdated    = "media:state-updated"
 )
 
 // ScanProgressData holds the payload for a scan progress event.
@@ -57,6 +58,12 @@ type MediaMetadataEventData struct {
 	LibraryID     string `json:"library_id"`
 	MetadataPhase string `json:"metadata_phase"`
 	Message       string `json:"message"`
+}
+
+type MediaStateEventData struct {
+	MediaID    string `json:"media_id"`
+	IsWatched  *bool  `json:"is_watched,omitempty"`
+	IsFavorite *bool  `json:"is_favorite,omitempty"`
 }
 
 // WSHub provides a shim for the original WebSocket hub.

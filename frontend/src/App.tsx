@@ -23,7 +23,7 @@ import {
     persistCurrentLibraryID,
     persistLibraries,
 } from './utils/persistentCache';
-import { seedMediaDetailCache } from './utils/mediaDetailCache';
+import { mergeMediaDetailCacheEntry, seedMediaDetailCache } from './utils/mediaDetailCache';
 import { markComponentRender } from './utils/performanceDiagnostics';
 import { putBoundedScrollState } from './utils/listViewState';
 import ScanTaskPanel from './components/ScanTaskPanel';
@@ -439,6 +439,23 @@ function App() {
             }, 250);
         });
 
+        const unsubMediaState = EventsOn("media:state-updated", (data: any) => {
+            const mediaID = typeof data?.media_id === 'string' ? data.media_id.trim() : '';
+            if (!mediaID) {
+                return;
+            }
+            const patch: any = { id: mediaID };
+            if (typeof data?.is_watched === 'boolean') {
+                patch.is_watched = data.is_watched;
+            }
+            if (typeof data?.is_favorite === 'boolean') {
+                patch.is_favorite = data.is_favorite;
+            }
+            mergeMediaDetailCacheEntry(patch);
+            setListMutation({ type: 'merge', media: patch });
+            setSelectedMedia((prev: any) => (prev?.id === mediaID ? { ...prev, ...patch } : prev));
+        });
+
         const onScanFail = (data: any) => {
             if (!acceptTerminal(data, 'failed')) {
                 return;
@@ -496,6 +513,7 @@ function App() {
         return () => {
             unsubscribeScanEvents();
             unsubMetadata();
+            unsubMediaState();
             if (resetTitleTimerRef.current) {
                 window.clearTimeout(resetTitleTimerRef.current);
             }

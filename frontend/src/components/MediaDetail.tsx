@@ -5,7 +5,7 @@ import {
     GetMediaDetail,
     GetNFOEditorData,
     OpenMediaFolder,
-    PlayFile,
+    PlayMedia,
     SaveNFOEditorData,
     ToggleFavorite,
     ToggleWatched,
@@ -590,7 +590,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
 
         try {
             showMsg(`正在启动播放器：${targetPath.split(/[\\/]/).pop()}`);
-            await PlayFile(targetPath);
+            await PlayMedia(detail.id, targetPath);
             await refreshDetail();
         } catch (error) {
             console.error(error);

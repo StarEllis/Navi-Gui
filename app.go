@@ -173,6 +173,9 @@ func (a *App) startup(ctx context.Context) {
 
 	// 3. 构建 Repositories 单例
 	a.repos = repository.NewRepositories(a.db)
+	if err := a.ensureDesktopUser(); err != nil {
+		a.logger.Fatalf("初始化桌面用户失败: %v", err)
+	}
 
 	// 4. 注入之前写好的最小化 Shim 层
 	cfg := config.NewConfig()
@@ -606,7 +609,7 @@ func (a *App) finishScanTask(lib *model.Library, task *scanTask, options service
 	status := ScanTaskCompleted
 	if errors.Is(scanErr, context.Canceled) {
 		status = ScanTaskCanceled
-	} else if service.IsScanIncomplete(scanErr) {
+	} else if service.IsScanIncomplete(scanErr) || service.IsScanPartial(scanErr) {
 		status = ScanTaskIncomplete
 	} else if scanErr != nil {
 		status = ScanTaskFailed
@@ -673,6 +676,9 @@ func scanTaskFailureStage(err error) string {
 	if service.IsScanIncomplete(err) {
 		return "enumeration"
 	}
+	if service.IsScanPartial(err) {
+		return "database"
+	}
 	message := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(message, "ffprobe"), strings.Contains(message, "probe media"):
@@ -728,6 +734,31 @@ type StatsItem struct {
 }
 
 const desktopUserID = "desktop_user"
+
+func (a *App) ensureDesktopUser() error {
+	if a == nil || a.db == nil {
+		return fmt.Errorf("database is not initialized")
+	}
+
+	var user model.User
+	err := a.db.Unscoped().Where("id = ?", desktopUserID).First(&user).Error
+	if err == nil {
+		if user.DeletedAt.Valid {
+			return a.db.Unscoped().Model(&user).Update("deleted_at", nil).Error
+		}
+		return nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+
+	return a.db.Create(&model.User{
+		ID:       desktopUserID,
+		Username: desktopUserID,
+		Password: "!",
+		Role:     "user",
+	}).Error
+}
 
 var genreTechnicalPattern = regexp.MustCompile(`^(?i)(\d{3,4}P|4K|8K|UHD|FHD|HD|SD|H264|H265|HEVC|AV1|HDR|60FPS|FPS)$`)
 var genreCodePattern = regexp.MustCompile(`^[A-Za-z0-9._-]{2,12}$`)
@@ -1866,11 +1897,17 @@ func (a *App) ensureWatched(mediaID string) error {
 	var wh model.WatchHistory
 	err := a.db.Where("media_id = ? AND user_id = ?", mediaID, desktopUserID).First(&wh).Error
 	if err == nil {
+		var updateErr error
 		if wh.Completed {
-			return a.db.Model(&wh).Update("updated_at", time.Now()).Error
+			updateErr = a.db.Model(&wh).Update("updated_at", time.Now()).Error
+		} else {
+			wh.Completed = true
+			updateErr = a.db.Save(&wh).Error
 		}
-		wh.Completed = true
-		return a.db.Save(&wh).Error
+		if updateErr == nil {
+			a.broadcastMediaState(mediaID, boolPtr(true), nil)
+		}
+		return updateErr
 	}
 	if err != gorm.ErrRecordNotFound {
 		return err
@@ -1881,22 +1918,39 @@ func (a *App) ensureWatched(mediaID string) error {
 		MediaID:   mediaID,
 		Completed: true,
 	}
-	return a.db.Create(&newWh).Error
+	if err := a.db.Create(&newWh).Error; err != nil {
+		return err
+	}
+	a.broadcastMediaState(mediaID, boolPtr(true), nil)
+	return nil
 }
 
-func (a *App) markWatchedByFilePath(filePath string) {
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+func (a *App) broadcastMediaState(mediaID string, watched *bool, favorite *bool) {
+	if a == nil || a.eventHub == nil || strings.TrimSpace(mediaID) == "" {
+		return
+	}
+	a.eventHub.BroadcastEvent(service.EventMediaStateUpdated, service.MediaStateEventData{
+		MediaID:    mediaID,
+		IsWatched:  watched,
+		IsFavorite: favorite,
+	})
+}
+
+func (a *App) markWatchedByFilePath(filePath string) error {
 	filePath = strings.TrimSpace(filePath)
 	if filePath == "" {
-		return
+		return fmt.Errorf("empty file path")
 	}
 
-	var media model.Media
-	if err := a.db.Where("file_path = ?", filePath).First(&media).Error; err != nil {
-		return
+	media, err := a.repos.Media.FindByFilePath(filePath)
+	if err != nil {
+		return err
 	}
-	if err := a.ensureWatched(media.ID); err != nil {
-		a.logger.Warnf("mark watched by file path failed: %v", err)
-	}
+	return a.ensureWatched(media.ID)
 }
 
 // PlayWithExternalPlayer 调用系统原生的外部播放器或配置播放器打开媒体
@@ -1910,7 +1964,7 @@ func (a *App) PlayWithExternalPlayer(mediaID string) error {
 		return err
 	}
 	if err := a.ensureWatched(media.ID); err != nil {
-		a.logger.Warnf("mark watched after external play failed: %v", err)
+		a.logger.Errorf("mark watched after external play failed: media=%s err=%v", media.ID, err)
 	}
 	return nil
 }
@@ -1939,13 +1993,24 @@ func (a *App) ToggleFavorite(mediaID string) error {
 	var fav model.Favorite
 	err := a.db.Where("media_id = ? AND user_id = ?", mediaID, desktopUserID).First(&fav).Error
 	if err == nil {
-		return a.db.Delete(&fav).Error
+		if err := a.db.Delete(&fav).Error; err != nil {
+			return err
+		}
+		a.broadcastMediaState(mediaID, nil, boolPtr(false))
+		return nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
 	}
 	newFav := model.Favorite{
 		UserID:  desktopUserID,
 		MediaID: mediaID,
 	}
-	return a.db.Create(&newFav).Error
+	if err := a.db.Create(&newFav).Error; err != nil {
+		return err
+	}
+	a.broadcastMediaState(mediaID, nil, boolPtr(true))
+	return nil
 }
 
 // ToggleWatched 切换已看状态
@@ -1954,14 +2019,25 @@ func (a *App) ToggleWatched(mediaID string) error {
 	err := a.db.Where("media_id = ? AND user_id = ?", mediaID, desktopUserID).First(&wh).Error
 	if err == nil {
 		wh.Completed = !wh.Completed
-		return a.db.Save(&wh).Error
+		if err := a.db.Save(&wh).Error; err != nil {
+			return err
+		}
+		a.broadcastMediaState(mediaID, boolPtr(wh.Completed), nil)
+		return nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
 	}
 	newWh := model.WatchHistory{
 		UserID:    desktopUserID,
 		MediaID:   mediaID,
 		Completed: true,
 	}
-	return a.db.Create(&newWh).Error
+	if err := a.db.Create(&newWh).Error; err != nil {
+		return err
+	}
+	a.broadcastMediaState(mediaID, boolPtr(true), nil)
+	return nil
 }
 
 // DeleteMedia 只从数据库删除记录，不移动文件
@@ -2481,10 +2557,29 @@ func (a *App) GetMediaPreviews(mediaID string) ([]string, error) {
 	return a.getMediaPreviews(media), nil
 }
 
-// PlayFile 播放指定绝对路径的文件
-func (a *App) PlayFile(filePath string) error {
-	totalStart := time.Now()
+// PlayMedia starts playback and records the watched state against the stable media ID.
+func (a *App) PlayMedia(mediaID string, filePath string) error {
+	mediaID = strings.TrimSpace(mediaID)
+	if mediaID == "" {
+		return fmt.Errorf("empty media ID")
+	}
+	media, err := a.repos.Media.FindByID(mediaID)
+	if err != nil {
+		return err
+	}
 	targetPath := strings.TrimSpace(filePath)
+	if targetPath == "" {
+		targetPath = strings.TrimSpace(media.FilePath)
+	}
+	return a.playFileAndMark(targetPath, media.ID)
+}
+
+func (a *App) PlayFile(filePath string) error {
+	return a.playFileAndMark(strings.TrimSpace(filePath), "")
+}
+
+func (a *App) playFileAndMark(targetPath string, mediaID string) error {
+	totalStart := time.Now()
 	if targetPath == "" {
 		return fmt.Errorf("empty file path")
 	}
@@ -2506,11 +2601,24 @@ func (a *App) PlayFile(filePath string) error {
 	}
 
 	watchedStart := time.Now()
-	a.markWatchedByFilePath(targetPath)
+	var watchedErr error
+	if strings.TrimSpace(mediaID) != "" {
+		watchedErr = a.ensureWatched(mediaID)
+	} else {
+		watchedErr = a.markWatchedByFilePath(targetPath)
+	}
 	watchedCost := time.Since(watchedStart)
+	if watchedErr != nil {
+		if a.logger != nil {
+			a.logger.Errorf("mark watched after play failed: media=%s path=%s err=%v", mediaID, targetPath, watchedErr)
+		}
+		appendPlayLatencyLog("OK_WATCH_FAILED path=%q media=%q player=%q settings=%s start=%s mark_watched=%s total=%s err=%v",
+			targetPath, mediaID, playerPath, settingsCost, startCost, watchedCost, time.Since(totalStart), watchedErr)
+		return nil
+	}
 
-	appendPlayLatencyLog("OK path=%q player=%q settings=%s start=%s mark_watched=%s total=%s",
-		targetPath, playerPath, settingsCost, startCost, watchedCost, time.Since(totalStart))
+	appendPlayLatencyLog("OK path=%q media=%q player=%q settings=%s start=%s mark_watched=%s total=%s",
+		targetPath, mediaID, playerPath, settingsCost, startCost, watchedCost, time.Since(totalStart))
 
 	return nil
 }
@@ -2540,7 +2648,7 @@ func (a *App) PlayRandomLibraryMedia(libraryID string) (string, error) {
 		return "", err
 	}
 
-	if err := a.PlayFile(media.FilePath); err != nil {
+	if err := a.PlayMedia(media.ID, media.FilePath); err != nil {
 		return "", err
 	}
 

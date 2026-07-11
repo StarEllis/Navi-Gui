@@ -233,6 +233,9 @@ type ScannerService struct {
 	scanContext               context.Context
 	scanTaskID                string
 	strictScan                bool
+	scanFailureMu             sync.Mutex
+	scanFailureCount          int
+	scanFirstFailure          error
 	deferMetadata             bool
 	deferredMetadataTasks     []metadataCompletionTask
 	deferMediaEvents          bool
@@ -815,6 +818,30 @@ func IsScanIncomplete(err error) bool {
 	return errors.As(err, &incomplete)
 }
 
+type ScanPartialError struct {
+	Failed int
+	Err    error
+}
+
+func (e *ScanPartialError) Error() string {
+	if e == nil {
+		return "scan partially failed"
+	}
+	return fmt.Sprintf("scan partially failed: %d item(s) still failed after 3 retries: %v", e.Failed, e.Err)
+}
+
+func (e *ScanPartialError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func IsScanPartial(err error) bool {
+	var partial *ScanPartialError
+	return errors.As(err, &partial)
+}
+
 type scanRootSnapshot struct {
 	roots     []string
 	filePaths map[string]bool
@@ -932,6 +959,8 @@ const (
 	scanProgressBroadcastMinStep     = 20
 	scanProgressLogStep              = 250
 	scanCreateBatchSize              = 100
+	scanWriteRetryCount              = 3
+	scanWriteRetryBaseDelay          = 25 * time.Millisecond
 	metadataQueueBufferSize          = 16384
 )
 
@@ -1807,6 +1836,9 @@ func (s *ScannerService) scanLibraryWithOptionsCore(library *model.Library, opti
 		}
 	}
 	totalTargets = len(snapshot.filePaths)
+	if scanErr == nil {
+		scanErr = s.checkScanCanceled()
+	}
 	if scanErr == nil && options.Mode == "overwrite" && s.strictScan {
 		scanErr = s.forceRefreshSnapshotMetadata(library, snapshot)
 	}
@@ -1818,6 +1850,9 @@ func (s *ScannerService) scanLibraryWithOptionsCore(library *model.Library, opti
 		} else {
 			cleaned, scanErr = s.syncDeletedRecords(library, snapshot)
 		}
+	}
+	if scanErr == nil {
+		scanErr = s.partialScanError()
 	}
 
 	result := scanRunResult{
@@ -1842,7 +1877,7 @@ func (s *ScannerService) broadcastScanTerminal(library *model.Library, options S
 		message = scanErr.Error()
 		if errors.Is(scanErr, context.Canceled) {
 			phase = "canceled"
-		} else if IsScanIncomplete(scanErr) {
+		} else if IsScanIncomplete(scanErr) || IsScanPartial(scanErr) {
 			phase = "incomplete"
 		}
 	}
@@ -1872,7 +1907,7 @@ func scanTerminalEvent(err error) string {
 	if errors.Is(err, context.Canceled) {
 		return EventScanCanceled
 	}
-	if IsScanIncomplete(err) {
+	if IsScanIncomplete(err) || IsScanPartial(err) {
 		return EventScanIncomplete
 	}
 	return EventScanFailed
@@ -1887,6 +1922,9 @@ func scanFailureStage(err error) string {
 	}
 	if IsScanIncomplete(err) {
 		return "enumeration"
+	}
+	if IsScanPartial(err) {
+		return "database"
 	}
 	message := strings.ToLower(err.Error())
 	switch {
@@ -2404,11 +2442,81 @@ func (s *ScannerService) persistQuickMedia(media *model.Media) error {
 	if media == nil {
 		return fmt.Errorf("media is nil")
 	}
-	if err := s.mediaRepo.Create(media); err != nil {
-		return err
+	err := s.retryScanWrite(fmt.Sprintf("save media %s", media.FilePath), func() error {
+		return s.mediaRepo.Create(media)
+	})
+	if err == nil {
+		s.enqueueMetadataCompletion(media.ID, media.LibraryID, metadataTaskPriorityNormal)
+		return nil
 	}
-	s.enqueueMetadataCompletion(media.ID, media.LibraryID, metadataTaskPriorityNormal)
-	return nil
+	return err
+}
+
+func (s *ScannerService) retryScanWrite(label string, operation func() error) error {
+	err := s.retryScanOperation(label, operation)
+	if err != nil && !s.strictScan && !errors.Is(err, context.Canceled) {
+		s.recordScanFailure(err)
+	}
+	return err
+}
+
+func (s *ScannerService) retryScanOperation(label string, operation func() error) error {
+	var err error
+	for attempt := 0; attempt <= scanWriteRetryCount; attempt++ {
+		err = operation()
+		if err == nil {
+			return nil
+		}
+		if attempt == scanWriteRetryCount {
+			break
+		}
+		if s.logger != nil {
+			s.logger.Warnf("scan operation failed, retrying: operation=%s attempt=%d/%d err=%v", label, attempt+1, scanWriteRetryCount, err)
+		}
+		if waitErr := s.waitForScanRetry(time.Duration(attempt+1) * scanWriteRetryBaseDelay); waitErr != nil {
+			return waitErr
+		}
+	}
+	return fmt.Errorf("%s failed after %d retries: %w", label, scanWriteRetryCount, err)
+}
+
+func (s *ScannerService) waitForScanRetry(delay time.Duration) error {
+	ctx := s.scanContext
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (s *ScannerService) recordScanFailure(err error) {
+	if s == nil || err == nil {
+		return
+	}
+	s.scanFailureMu.Lock()
+	defer s.scanFailureMu.Unlock()
+	s.scanFailureCount++
+	if s.scanFirstFailure == nil {
+		s.scanFirstFailure = err
+	}
+}
+
+func (s *ScannerService) partialScanError() error {
+	if s == nil {
+		return nil
+	}
+	s.scanFailureMu.Lock()
+	defer s.scanFailureMu.Unlock()
+	if s.scanFailureCount == 0 {
+		return nil
+	}
+	return &ScanPartialError{Failed: s.scanFailureCount, Err: s.scanFirstFailure}
 }
 
 func (s *ScannerService) requestMetadataCompletionIfNeeded(media *model.Media) bool {
@@ -2863,7 +2971,12 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 					continue
 				}
 
-				updated, refreshErr := s.refreshExistingMovieMedia(library, existing, mediaPath, info, sidecars, refreshVideo)
+				var updated bool
+				refreshErr := s.retryScanWrite(fmt.Sprintf("refresh existing movie %s", mediaPath), func() error {
+					var err error
+					updated, err = s.refreshExistingMovieMedia(library, existing, mediaPath, info, sidecars, refreshVideo)
+					return err
+				})
 				if refreshErr != nil {
 					if s.strictScan {
 						return count, result, fmt.Errorf("refresh existing movie %s: %w", mediaPath, refreshErr)
@@ -2882,7 +2995,12 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 			existing, findErr := s.mediaRepo.FindByFilePathInLibrary(library.ID, mediaPath)
 			if findErr == nil && existing != nil {
 				sidecars := getSidecars(mediaPath)
-				updated, refreshErr := s.refreshExistingMovieMedia(library, existing, mediaPath, info, sidecars, true)
+				var updated bool
+				refreshErr := s.retryScanWrite(fmt.Sprintf("refresh existing movie %s", mediaPath), func() error {
+					var err error
+					updated, err = s.refreshExistingMovieMedia(library, existing, mediaPath, info, sidecars, true)
+					return err
+				})
 				if refreshErr != nil {
 					if s.strictScan {
 						return count, result, fmt.Errorf("refresh existing movie %s: %w", mediaPath, refreshErr)
@@ -2965,12 +3083,11 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 				}
 				s.logger.Warnf("batch save media failed, fallback to single insert: batch=%d err=%v", len(batch), err)
 				for _, item := range batch {
-					if singleErr := s.mediaRepo.Create(item.media); singleErr != nil {
+					if singleErr := s.persistQuickMedia(item.media); singleErr != nil {
 						s.logger.Warnf("save media failed: %s, err=%v", item.path, singleErr)
 						s.advanceScanProgress(library, item.message)
 						continue
 					}
-					s.enqueueMetadataCompletion(item.media.ID, item.media.LibraryID, metadataTaskPriorityNormal)
 					count++
 					s.advanceScanProgress(library, item.message)
 				}
@@ -3717,6 +3834,7 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, *scanRo
 					if s.strictScan {
 						return totalNewEpisodes, result, fmt.Errorf("save loose episode %s: %w", filePath, err)
 					}
+					continue
 				}
 				totalNewEpisodes++
 			}
@@ -3748,6 +3866,7 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, *scanRo
 					if s.strictScan {
 						return totalNewEpisodes, result, fmt.Errorf("save ungrouped episode %s: %w", filePath, err)
 					}
+					continue
 				}
 				totalNewEpisodes++
 			}
@@ -3765,7 +3884,9 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, *scanRo
 				Title:      actualSeriesName,
 				FolderPath: virtualFolderPath,
 			}
-			if err := s.seriesRepo.Create(series); err != nil {
+			if err := s.retryScanWrite(fmt.Sprintf("create loose series %s", actualSeriesName), func() error {
+				return s.seriesRepo.Create(series)
+			}); err != nil {
 				s.logger.Warnf("创建散落剧集合集失败: %s, 错误: %v", actualSeriesName, err)
 				if s.strictScan {
 					return totalNewEpisodes, result, fmt.Errorf("create loose series %s: %w", actualSeriesName, err)
@@ -3830,8 +3951,12 @@ func (s *ScannerService) scanTVShowLibrary(library *model.Library) (int, *scanRo
 		}
 		series.EpisodeCount = len(allEpisodes)
 		series.SeasonCount = len(seasonSet)
-		if updateErr := s.seriesRepo.Update(series); updateErr != nil && s.strictScan {
-			return totalNewEpisodes, result, fmt.Errorf("update loose series: %w", updateErr)
+		if updateErr := s.retryScanWrite("update loose series", func() error {
+			return s.seriesRepo.Update(series)
+		}); updateErr != nil {
+			if s.strictScan {
+				return totalNewEpisodes, result, fmt.Errorf("update loose series: %w", updateErr)
+			}
 		}
 
 		s.logger.Infof("散落剧集归类完成: %s, 新增 %d 集, 共 %d 季 %d 集",
@@ -3941,7 +4066,9 @@ func (s *ScannerService) scanMultiSeasonSeries(library *model.Library, seriesTit
 			Title:      seriesTitle,
 			FolderPath: virtualPath,
 		}
-		if err := s.seriesRepo.Create(series); err != nil {
+		if err := s.retryScanWrite(fmt.Sprintf("create multi-season series %s", seriesTitle), func() error {
+			return s.seriesRepo.Create(series)
+		}); err != nil {
 			return 0, fmt.Errorf("创建多季合集失败: %w", err)
 		}
 		s.logger.Infof("创建多季合集: %s (ID=%s, %d 个季目录)", seriesTitle, series.ID, len(folders))
@@ -3980,8 +4107,12 @@ func (s *ScannerService) scanMultiSeasonSeries(library *model.Library, seriesTit
 	}
 
 	// 保存NFO和图片更新
-	if err := s.seriesRepo.Update(series); err != nil && s.strictScan {
-		return 0, fmt.Errorf("update multi-season series metadata: %w", err)
+	if err := s.retryScanWrite("update multi-season series metadata", func() error {
+		return s.seriesRepo.Update(series)
+	}); err != nil {
+		if s.strictScan {
+			return 0, fmt.Errorf("update multi-season series metadata: %w", err)
+		}
 	}
 
 	var totalNewCount int
@@ -4086,8 +4217,13 @@ func (s *ScannerService) scanMultiSeasonSeries(library *model.Library, seriesTit
 			epAdjusted.SeasonNum = seasonNum
 			if existing, err := s.mediaRepo.FindByFilePathInLibrary(library.ID, ep.FilePath); err == nil {
 				seasonSet[seasonNum] = true
-				if _, updateErr := s.updateExistingEpisodeRecord(existing, series.ID, seriesTitle, epAdjusted); updateErr != nil && s.strictScan {
-					return totalNewCount, fmt.Errorf("update existing episode %s: %w", ep.FilePath, updateErr)
+				if updateErr := s.retryScanWrite(fmt.Sprintf("update existing episode %s", ep.FilePath), func() error {
+					_, err := s.updateExistingEpisodeRecord(existing, series.ID, seriesTitle, epAdjusted)
+					return err
+				}); updateErr != nil {
+					if s.strictScan {
+						return totalNewCount, fmt.Errorf("update existing episode %s: %w", ep.FilePath, updateErr)
+					}
 				}
 				continue
 			} else if s.strictScan && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -4139,8 +4275,12 @@ func (s *ScannerService) scanMultiSeasonSeries(library *model.Library, seriesTit
 	}
 	series.EpisodeCount = len(allEpisodes)
 	series.SeasonCount = len(seasonSet)
-	if updateErr := s.seriesRepo.Update(series); updateErr != nil && s.strictScan {
-		return totalNewCount, fmt.Errorf("update multi-season statistics: %w", updateErr)
+	if updateErr := s.retryScanWrite("update multi-season statistics", func() error {
+		return s.seriesRepo.Update(series)
+	}); updateErr != nil {
+		if s.strictScan {
+			return totalNewCount, fmt.Errorf("update multi-season statistics: %w", updateErr)
+		}
 	}
 
 	if totalNewCount > 0 {
@@ -4164,7 +4304,9 @@ func (s *ScannerService) scanSeriesFolder(library *model.Library, folderPath, se
 			Title:      seriesTitle,
 			FolderPath: folderPath,
 		}
-		if err := s.seriesRepo.Create(series); err != nil {
+		if err := s.retryScanWrite(fmt.Sprintf("create series %s", seriesTitle), func() error {
+			return s.seriesRepo.Create(series)
+		}); err != nil {
 			return 0, fmt.Errorf("创建剧集合集失败: %w", err)
 		}
 		s.logger.Infof("创建剧集合集: %s (ID=%s)", seriesTitle, series.ID)
@@ -4199,8 +4341,12 @@ func (s *ScannerService) scanSeriesFolder(library *model.Library, folderPath, se
 	}
 
 	// 保存NFO和图片更新
-	if err := s.seriesRepo.Update(series); err != nil && s.strictScan {
-		return 0, fmt.Errorf("update series metadata: %w", err)
+	if err := s.retryScanWrite("update series metadata", func() error {
+		return s.seriesRepo.Update(series)
+	}); err != nil {
+		if s.strictScan {
+			return 0, fmt.Errorf("update series metadata: %w", err)
+		}
 	}
 
 	// 收集所有剧集文件
@@ -4236,8 +4382,13 @@ func (s *ScannerService) scanSeriesFolder(library *model.Library, folderPath, se
 		// 检查是否已存在，如果存在则修正可能的脏数据
 		if existing, err := s.mediaRepo.FindByFilePathInLibrary(library.ID, ep.FilePath); err == nil {
 			seasonSet[ep.SeasonNum] = true
-			if _, updateErr := s.updateExistingEpisodeRecord(existing, series.ID, seriesTitle, ep); updateErr != nil && s.strictScan {
-				return newCount, fmt.Errorf("update existing episode %s: %w", ep.FilePath, updateErr)
+			if updateErr := s.retryScanWrite(fmt.Sprintf("update existing episode %s", ep.FilePath), func() error {
+				_, err := s.updateExistingEpisodeRecord(existing, series.ID, seriesTitle, ep)
+				return err
+			}); updateErr != nil {
+				if s.strictScan {
+					return newCount, fmt.Errorf("update existing episode %s: %w", ep.FilePath, updateErr)
+				}
 			}
 			continue
 		} else if s.strictScan && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -4287,8 +4438,12 @@ func (s *ScannerService) scanSeriesFolder(library *model.Library, folderPath, se
 	}
 	series.EpisodeCount = len(allEpisodes)
 	series.SeasonCount = len(seasonSet)
-	if updateErr := s.seriesRepo.Update(series); updateErr != nil && s.strictScan {
-		return newCount, fmt.Errorf("update series statistics: %w", updateErr)
+	if updateErr := s.retryScanWrite("update series statistics", func() error {
+		return s.seriesRepo.Update(series)
+	}); updateErr != nil {
+		if s.strictScan {
+			return newCount, fmt.Errorf("update series statistics: %w", updateErr)
+		}
 	}
 
 	s.logger.Infof("剧集扫描完成: %s, 新增 %d 集, 共 %d 季 %d 集",

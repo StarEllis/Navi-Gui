@@ -1,6 +1,6 @@
 import React, { useMemo } from 'react';
 import { Play } from 'lucide-react';
-import { PlayFile } from "../../wailsjs/go/main/App";
+import { PlayMedia } from "../../wailsjs/go/main/App";
 import { toLocalAssetUrl } from '../utils/media';
 import { areMediaCardMediaPropsEqual, shouldOpenMediaFromCardKey } from '../utils/mediaCardState';
 import { markComponentRender } from '../utils/performanceDiagnostics';
@@ -42,7 +42,7 @@ const MediaCard: React.FC<MediaCardProps> = ({ media, onSelectMedia, onQuickPlay
 
         try {
             onQuickPlayStatus?.(`正在启动播放器：${targetPath.split(/[\\/]/).pop()}`);
-            await PlayFile(targetPath);
+            await PlayMedia(media.id, targetPath);
         } catch (error) {
             console.error(error);
             onQuickPlayStatus?.(`播放失败：${formatError(error)}`);

@@ -1,6 +1,6 @@
 import React from 'react';
 import { Play } from 'lucide-react';
-import { PlayFile } from "../../wailsjs/go/main/App";
+import { PlayMedia } from "../../wailsjs/go/main/App";
 import { formatError, toLocalAssetUrl } from '../utils/media';
 import type { AppMedia, RecommendationItem } from '../types/wails';
 
@@ -30,7 +30,7 @@ const RecommendationCard: React.FC<RecommendationCardProps> = ({ item, onSelectM
 
         try {
             onStatus?.(`正在启动播放器：${targetPath.split(/[\\/]/).pop()}`);
-            await PlayFile(targetPath);
+            await PlayMedia(media.id, targetPath);
         } catch (error) {
             console.error(error);
             onStatus?.(`播放失败：${formatError(error)}`);

@@ -102,6 +102,10 @@ export function PlayFile(arg1) {
   return window['go']['main']['App']['PlayFile'](arg1);
 }
 
+export function PlayMedia(arg1, arg2) {
+  return window['go']['main']['App']['PlayMedia'](arg1, arg2);
+}
+
 export function PlayRandomLibraryMedia(arg1) {
   return window['go']['main']['App']['PlayRandomLibraryMedia'](arg1);
 }
