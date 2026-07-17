@@ -13,6 +13,9 @@ const loadPinyin = () => {
 const cjkVariantMap: Record<string, string> = {
     '沢': '泽',
     '澤': '泽',
+    '鈴': '铃',
+    '瀨': '濑',
+    '瀬': '濑',
 };
 
 const cjkVariantPattern = new RegExp(`[${Object.keys(cjkVariantMap).join('')}]`, 'g');
@@ -43,6 +46,12 @@ export const normalizeSearchTerm = (value: string) => collapseWhitespace(
         .replace(/[\u0000-\u001f]+/g, ' ')
         .replace(/[_\-./\\[\](){}#+]+/g, ' '),
 );
+
+export const shouldReplaceActorFilterOnSearchChange = (
+    filterType: string | undefined,
+    currentValue: string,
+    nextValue: string,
+) => filterType === 'actor' && nextValue !== currentValue;
 
 export const hasCJKSearchCharacter = (value: string) => cjkCharacterPattern.test(value);
 

@@ -408,6 +408,75 @@ func TestArtworkCacheReservationAndEvictingAreAtomic(t *testing.T) {
 	}
 }
 
+func TestArtworkCacheRemoveMediaDefersReservedPathDeletion(t *testing.T) {
+	cache := NewArtworkCache(filepath.Join(t.TempDir(), "cache"), nil)
+	t.Cleanup(cache.Shutdown)
+	mediaID := "reserved-delete"
+	path := filepath.Join(cache.mediaRoleDir("poster", mediaID), "generated.jpg")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("generated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cache.recordFile(path)
+
+	release, ok := cache.Reserve(path)
+	if !ok {
+		t.Fatal("reserve generated artwork")
+	}
+	if err := cache.RemoveMedia(mediaID); err != nil {
+		t.Fatalf("remove media: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("reserved file was removed before release: %v", err)
+	}
+	if releaseAgain, ok := cache.Reserve(path); ok {
+		releaseAgain()
+		t.Fatal("media artwork pending deletion accepted a new reservation")
+	}
+	release()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("released media artwork remains: %v", err)
+	}
+}
+
+func TestArtworkCacheRemoveMediaDeletesInflightGeneration(t *testing.T) {
+	cache := NewArtworkCache(filepath.Join(t.TempDir(), "cache"), nil)
+	t.Cleanup(cache.Shutdown)
+	mediaID := "inflight-delete"
+	path := filepath.Join(cache.mediaRoleDir("poster", mediaID), "generated.jpg")
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	done := make(chan error, 1)
+
+	go func() {
+		done <- cache.generateOnce(path, func(context.Context) error {
+			close(started)
+			<-finish
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return err
+			}
+			if err := os.WriteFile(path, []byte("generated"), 0o600); err != nil {
+				return err
+			}
+			cache.recordFile(path)
+			return nil
+		})
+	}()
+	<-started
+	if err := cache.RemoveMedia(mediaID); err != nil {
+		t.Fatalf("remove media: %v", err)
+	}
+	close(finish)
+	if err := <-done; err != nil {
+		t.Fatalf("finish generation: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("in-flight generated artwork remains after media removal: %v", err)
+	}
+}
+
 func TestArtworkIndexDebouncesRecordsAndRetriesFailure(t *testing.T) {
 	cache := NewArtworkCache(filepath.Join(t.TempDir(), "cache"), nil)
 	t.Cleanup(cache.Shutdown)

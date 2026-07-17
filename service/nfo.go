@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -215,6 +216,30 @@ type NFOActorMetadata struct {
 	Actors        []NFOActor
 	Directors     []string
 	ActorsPresent bool
+}
+
+var nfoActorFragmentPattern = regexp.MustCompile(`(?is)<actor(?:\s[^>]*)?>.*?</actor\s*>`)
+
+func extractNFOActorFragments(data []byte) []NFOActor {
+	fragments := nfoActorFragmentPattern.FindAll(data, -1)
+	actors := make([]NFOActor, 0, len(fragments))
+	for _, fragment := range fragments {
+		if sanitized, changed := sanitizeMalformedNFOXML(fragment); changed {
+			fragment = sanitized
+		}
+		var actor NFOActor
+		if err := xml.Unmarshal(fragment, &actor); err != nil {
+			continue
+		}
+		actor.Name = strings.TrimSpace(actor.Name)
+		if actor.Name == "" {
+			continue
+		}
+		actor.Role = strings.TrimSpace(actor.Role)
+		actor.Thumb = strings.TrimSpace(actor.Thumb)
+		actors = append(actors, actor)
+	}
+	return actors
 }
 
 // NFOExtraFields 存储到 Media.NfoExtraFields 的 JSON 结构
@@ -819,6 +844,9 @@ func (s *NFOService) GetActorsFromNFO(nfoPath string) ([]NFOActor, []string, err
 		if prepared.tvShowErr == nil && prepared.tvShow != nil && prepared.tvShow.Title != "" {
 			return prepared.tvShow.Actors, prepared.tvShow.Directors, nil
 		}
+		if actors := extractNFOActorFragments(prepared.data); len(actors) > 0 {
+			return actors, nil, nil
+		}
 		return nil, nil, fmt.Errorf("无法解析NFO文件")
 	}
 
@@ -835,6 +863,13 @@ func (s *NFOService) GetActorsFromNFO(nfoPath string) ([]NFOActor, []string, err
 	var tvshow NFOTVShow
 	if err := s.unmarshalScanNFOXML(data, &tvshow, nfoPath); err == nil && tvshow.Title != "" {
 		return tvshow.Actors, tvshow.Directors, nil
+	}
+
+	if actors := extractNFOActorFragments(data); len(actors) > 0 {
+		if s.logger != nil {
+			s.logger.Debugf("parsed actors from malformed NFO fragments: %s", nfoPath)
+		}
+		return actors, nil, nil
 	}
 
 	return nil, nil, fmt.Errorf("无法解析NFO文件")

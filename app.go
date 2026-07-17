@@ -70,12 +70,13 @@ type App struct {
 }
 
 const (
-	ScanTaskPending    = "pending"
-	ScanTaskRunning    = "running"
-	ScanTaskCompleted  = "completed"
-	ScanTaskIncomplete = "incomplete"
-	ScanTaskFailed     = "failed"
-	ScanTaskCanceled   = "canceled"
+	ScanTaskPending            = "pending"
+	ScanTaskRunning            = "running"
+	ScanTaskCompleted          = "completed"
+	ScanTaskIncomplete         = "incomplete"
+	ScanTaskFailed             = "failed"
+	ScanTaskCanceled           = "canceled"
+	actorRelationRepairSetting = "maintenance.actor_relations.v3"
 )
 
 type ScanTaskInfo struct {
@@ -301,6 +302,18 @@ func (a *App) startPostStartupServices(thumbSvc *service.ThumbnailService, thumb
 				a.migrationHook()
 			} else {
 				a.migrateThumbnailTasksV2(thumbSvc, thumbnailSettingsProvider())
+				a.repairMissingActorRelations()
+			}
+			if a.ctx.Err() != nil {
+				return
+			}
+			if a.scanner != nil {
+				resumed, err := a.scanner.ResumeInterruptedMetadataCompletion(a.ctx)
+				if err != nil && !errors.Is(err, context.Canceled) {
+					a.logger.Warnf("resume interrupted metadata completion failed: %v", err)
+				} else if resumed > 0 {
+					a.logger.Infof("resumed interrupted metadata completion: queued=%d", resumed)
+				}
 			}
 			if a.ctx.Err() != nil {
 				return
@@ -335,6 +348,53 @@ func (a *App) startPostStartupServices(thumbSvc *service.ThumbnailService, thumb
 			}
 		}()
 	})
+}
+
+func (a *App) repairMissingActorRelations() {
+	if a == nil || a.scanner == nil || a.repos == nil || a.repos.SystemSetting == nil {
+		return
+	}
+	value, err := a.repos.SystemSetting.Get(actorRelationRepairSetting)
+	if err == nil && strings.HasPrefix(value, "completed:") {
+		return
+	}
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) && a.logger != nil {
+		a.logger.Warnf("load actor relation repair state failed: %v", err)
+	}
+
+	mergeStats, mergeErr := a.repos.Person.MergeEquivalentPeople()
+	if mergeErr != nil {
+		if a.logger != nil {
+			a.logger.Warnf("merge equivalent people failed: %v", mergeErr)
+		}
+		return
+	}
+
+	stats, repairErr := a.scanner.RepairMissingActorRelations(a.ctx)
+	if repairErr != nil {
+		if !errors.Is(repairErr, context.Canceled) && a.logger != nil {
+			a.logger.Warnf("repair missing actor relations failed: %v", repairErr)
+		}
+		return
+	}
+	if a.logger != nil {
+		a.logger.Infof("actor relation repair completed: merged_people=%d moved_relations=%d candidates=%d synced=%d skipped=%d failed=%d unavailable=%d",
+			mergeStats.PeopleMerged, mergeStats.RelationsMoved, stats.Candidates, stats.Synced, stats.Skipped, stats.Failed, stats.Unavailable)
+	}
+	if stats.Failed == 0 && stats.Unavailable == 0 {
+		state := fmt.Sprintf("completed:%d:%d:%d", mergeStats.PeopleMerged, stats.Candidates, stats.Synced)
+		if err := a.repos.SystemSetting.Set(actorRelationRepairSetting, state); err != nil {
+			if a.logger != nil {
+				a.logger.Warnf("persist actor relation repair state failed: %v", err)
+			}
+		}
+	}
+	if (mergeStats.PeopleMerged > 0 || stats.Synced > 0) && a.eventHub != nil {
+		a.eventHub.BroadcastEvent(service.EventMediaMetadataUpdated, &service.MediaMetadataEventData{
+			MetadataPhase: service.MetadataPhaseFull,
+			Message:       "actor relations repaired",
+		})
+	}
 }
 
 func (a *App) migrateThumbnailTasksV2(thumbSvc *service.ThumbnailService, settings service.ThumbnailSettings) {
@@ -1120,12 +1180,23 @@ func (a *App) GetMediaList(libraryID string, page, size int, sortBy, sortOrder, 
 	if libraryID != "" {
 		query = query.Where("library_id = ?", libraryID)
 	}
-	for _, token := range model.TokenizeMediaSearchQuery(keyword) {
-		keywordLike := "%" + token + "%"
-		query = query.Where(
-			"(media.search_text LIKE ? OR media.search_pinyin LIKE ? OR media.search_initials LIKE ?)",
-			keywordLike, keywordLike, keywordLike,
-		)
+	applyKeyword := true
+	if filterType == "actor" && strings.TrimSpace(keyword) != "" {
+		actorName := filterValue
+		var person model.Person
+		if err := a.db.First(&person, "id = ?", filterValue).Error; err == nil {
+			actorName = person.Name
+		}
+		applyKeyword = model.NormalizeMediaSearchText(keyword) != model.NormalizeMediaSearchText(actorName)
+	}
+	if applyKeyword {
+		for _, token := range model.TokenizeMediaSearchQuery(keyword) {
+			keywordLike := "%" + token + "%"
+			query = query.Where(
+				"(media.search_text LIKE ? OR media.search_pinyin LIKE ? OR media.search_initials LIKE ?)",
+				keywordLike, keywordLike, keywordLike,
+			)
+		}
 	}
 
 	// 处理 4 种统计过滤
@@ -1133,10 +1204,11 @@ func (a *App) GetMediaList(libraryID string, page, size int, sortBy, sortOrder, 
 	case "directory":
 		query = query.Where("file_path LIKE ?", filterValue+"%")
 	case "actor":
+		actorNames := model.EquivalentPersonNames(filterValue)
 		actorMatch := a.db.Table("media_people").
 			Select("media_id").
 			Joins("JOIN people ON people.id = media_people.person_id").
-			Where("media_people.person_id = ? OR people.name = ?", filterValue, filterValue)
+			Where("media_people.person_id = ? OR people.name IN ?", filterValue, actorNames)
 		query = query.Where("id IN (?)", actorMatch)
 	case "genre", "tag":
 		query = query.Where("genres LIKE ?", "%"+filterValue+"%")
@@ -1518,10 +1590,7 @@ func shouldAutoCompleteDetailMetadata(media *model.Media) bool {
 	if media == nil || service.NormalizeMetadataPhase(media.MetadataPhase) != service.MetadataPhaseQuick {
 		return false
 	}
-	if strings.TrimSpace(media.FilePath) == "" {
-		return false
-	}
-	return media.Duration <= 0 && media.Runtime <= 0
+	return strings.TrimSpace(media.FilePath) != ""
 }
 
 func sameAppPath(left string, right string) bool {
@@ -2134,9 +2203,29 @@ func (a *App) ToggleWatched(mediaID string) error {
 
 // DeleteMedia 只从数据库删除记录，不移动文件
 func (a *App) DeleteMedia(mediaID string) error {
+	resumeThumbnailGeneration := func() {}
+	if a.thumbnailWorker != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		resume, err := a.thumbnailWorker.QuiesceMediaGeneration(ctx, mediaID)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("stop thumbnail generation before deleting media: %w", err)
+		}
+		resumeThumbnailGeneration = resume
+	}
+	defer resumeThumbnailGeneration()
+	media, err := a.repos.Media.FindByID(mediaID)
+	if err != nil {
+		return err
+	}
+	if _, err := service.RemoveLegacyGeneratedThumbnailFiles(media); err != nil {
+		return fmt.Errorf("remove generated thumbnails before deleting media: %w", err)
+	}
 	if a.artworkCache != nil {
 		if err := a.artworkCache.RemoveMedia(mediaID); err != nil {
-			a.logger.Warnf("remove media artwork cache failed: media=%s err=%v", mediaID, err)
+			if a.logger != nil {
+				a.logger.Warnf("remove media artwork cache failed: media=%s err=%v", mediaID, err)
+			}
 		}
 	}
 	return a.repos.Media.DeleteByID(mediaID)
@@ -2334,7 +2423,6 @@ type resolvedActor struct {
 
 func (a *App) resolveMediaActors(media *model.Media) ([]model.MediaActor, string) {
 	resolved := make(map[string]*resolvedActor)
-	linkByPersonID := make(map[string]bool)
 	orderCounter := 0
 
 	register := func(name, personID string, sortOrder, sourcePriority int) {
@@ -2350,10 +2438,6 @@ func (a *App) resolveMediaActors(media *model.Media) ([]model.MediaActor, string
 
 		if sortOrder < 0 {
 			sortOrder = 9999
-		}
-
-		if personID != "" {
-			linkByPersonID[personID] = true
 		}
 
 		existing, ok := resolved[key]
@@ -2386,11 +2470,6 @@ func (a *App) resolveMediaActors(media *model.Media) ([]model.MediaActor, string
 	var mediaPeople []model.MediaPerson
 	if rows, err := a.repos.MediaPerson.ListByMediaID(media.ID); err == nil {
 		mediaPeople = rows
-		for _, mediaPerson := range mediaPeople {
-			if strings.EqualFold(mediaPerson.Role, "actor") && mediaPerson.PersonID != "" {
-				linkByPersonID[mediaPerson.PersonID] = true
-			}
-		}
 	}
 
 	nfoService := service.NewNFOService(a.logger)
@@ -2436,18 +2515,9 @@ func (a *App) resolveMediaActors(media *model.Media) ([]model.MediaActor, string
 	items := make([]*resolvedActor, 0, len(resolved))
 	for _, item := range resolved {
 		if item.actor.ID == "" {
-			person, err := a.repos.Person.FindOrCreate(item.actor.Name, 0)
+			person, err := a.repos.Person.FindByName(item.actor.Name)
 			if err == nil && person != nil {
 				item.actor.ID = person.ID
-				if !linkByPersonID[person.ID] {
-					_ = a.repos.MediaPerson.Create(&model.MediaPerson{
-						MediaID:   media.ID,
-						PersonID:  person.ID,
-						Role:      "actor",
-						SortOrder: item.sortOrder,
-					})
-					linkByPersonID[person.ID] = true
-				}
 			}
 		}
 		items = append(items, item)

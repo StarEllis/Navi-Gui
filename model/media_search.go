@@ -7,13 +7,12 @@ import (
 	"unicode"
 
 	"github.com/mozillazg/go-pinyin"
-	"golang.org/x/text/unicode/norm"
 )
 
 var mediaSearchSeparators = regexp.MustCompile(`[\s_\-./\\\[\](){}#+:;,|]+`)
 
 func NormalizeMediaSearchText(value string) string {
-	value = strings.ToLower(norm.NFKC.String(strings.TrimSpace(value)))
+	value = strings.ToLower(NormalizeChineseVariants(strings.TrimSpace(value)))
 	value = mediaSearchSeparators.ReplaceAllString(value, " ")
 	return strings.Join(strings.Fields(value), " ")
 }

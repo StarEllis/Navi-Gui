@@ -972,6 +972,14 @@ type metadataCompletionTask struct {
 	LibraryID string
 }
 
+type ActorRelationRepairStats struct {
+	Candidates  int
+	Synced      int
+	Skipped     int
+	Failed      int
+	Unavailable int
+}
+
 type subtitleFileCandidate struct {
 	stem string
 	path string
@@ -2082,6 +2090,32 @@ func (s *ScannerService) EnqueueMetadataCompletion(mediaID string, highPriority 
 	return s.enqueueMetadataCompletion(mediaID, "", priority)
 }
 
+func (s *ScannerService) ResumeInterruptedMetadataCompletion(ctx context.Context) (int, error) {
+	if s == nil || s.mediaRepo == nil {
+		return 0, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	mediaIDs, err := s.mediaRepo.ListQuickMetadataIDs()
+	if err != nil {
+		return 0, err
+	}
+
+	resumed := 0
+	for _, mediaID := range mediaIDs {
+		select {
+		case <-ctx.Done():
+			return resumed, ctx.Err()
+		default:
+		}
+		if s.EnqueueMetadataCompletion(mediaID, false) {
+			resumed++
+		}
+	}
+	return resumed, nil
+}
+
 func (s *ScannerService) enqueueMetadataCompletion(mediaID string, libraryID string, priority metadataTaskPriority) bool {
 	mediaID = strings.TrimSpace(mediaID)
 	if mediaID == "" {
@@ -2248,7 +2282,10 @@ func (s *ScannerService) completeMediaMetadataByIDWithMode(mediaID string, force
 		sidecars = s.buildDirectorySidecarFiles(filepath.Dir(media.FilePath))
 		s.scanExternalSubtitlesWithSidecars(media, sidecars)
 		if err := s.applyLocalSidecarsWithMode(media, media.FilePath, sidecars, true); err != nil {
-			return fmt.Errorf("parse local metadata for %s: %w", media.FilePath, err)
+			if force {
+				return fmt.Errorf("parse local metadata for %s: %w", media.FilePath, err)
+			}
+			s.logger.Warnf("local metadata parse failed during background completion: path=%s err=%v", media.FilePath, err)
 		}
 	} else {
 		s.scanExternalSubtitles(media)
@@ -2446,6 +2483,9 @@ func (s *ScannerService) persistQuickMedia(media *model.Media) error {
 		return s.mediaRepo.Create(media)
 	})
 	if err == nil {
+		if actorErr := s.syncQuickMediaActors(media); actorErr != nil {
+			return actorErr
+		}
 		s.enqueueMetadataCompletion(media.ID, media.LibraryID, metadataTaskPriorityNormal)
 		return nil
 	}
@@ -2606,6 +2646,20 @@ func (s *ScannerService) syncActorsForMedia(media *model.Media, strict bool) err
 }
 
 func (s *ScannerService) syncActorsForMediaWithRepos(media *model.Media, strict bool, personRepo *repository.PersonRepo, mediaPersonRepo *repository.MediaPersonRepo) error {
+	return s.syncActorsForMediaWithOptions(media, strict, personRepo, mediaPersonRepo, true)
+}
+
+func (s *ScannerService) syncQuickMediaActors(media *model.Media) error {
+	return s.syncActorsForMediaWithOptions(media, s.strictScan, s.personRepo, s.mediaPersonRepo, false)
+}
+
+func (s *ScannerService) syncActorsForMediaWithOptions(
+	media *model.Media,
+	strict bool,
+	personRepo *repository.PersonRepo,
+	mediaPersonRepo *repository.MediaPersonRepo,
+	fetchAvatars bool,
+) error {
 	if media == nil || media.ID == "" || media.FilePath == "" || personRepo == nil || mediaPersonRepo == nil {
 		return nil
 	}
@@ -2633,13 +2687,26 @@ func (s *ScannerService) syncActorsForMediaWithRepos(media *model.Media, strict 
 		}
 	}
 
-	if err := mediaPersonRepo.DeleteByMediaID(media.ID); err != nil {
+	_, err := s.replaceActorRelations(media, actors, strict, personRepo, mediaPersonRepo, fetchAvatars)
+	return err
+}
+
+func (s *ScannerService) replaceActorRelations(
+	media *model.Media,
+	actors []NFOActor,
+	strict bool,
+	personRepo *repository.PersonRepo,
+	mediaPersonRepo *repository.MediaPersonRepo,
+	fetchAvatars bool,
+) (int, error) {
+	if err := mediaPersonRepo.DeleteByMediaIDAndRole(media.ID, "actor"); err != nil {
 		if strict {
-			return fmt.Errorf("delete old actor relations for %s: %w", media.ID, err)
+			return 0, fmt.Errorf("delete old actor relations for %s: %w", media.ID, err)
 		}
-		return nil
+		return 0, nil
 	}
 	seen := make(map[string]bool)
+	persisted := 0
 	for index, actor := range actors {
 		name := strings.TrimSpace(actor.Name)
 		if name == "" || seen[name] {
@@ -2650,11 +2717,11 @@ func (s *ScannerService) syncActorsForMediaWithRepos(media *model.Media, strict 
 		person, err := personRepo.FindOrCreate(name, 0)
 		if err != nil || person == nil {
 			if strict && err != nil {
-				return fmt.Errorf("find or create actor %s: %w", name, err)
+				return persisted, fmt.Errorf("find or create actor %s: %w", name, err)
 			}
 			continue
 		}
-		if s.shouldFetchGfriendsAvatars() && (strings.TrimSpace(person.ProfileURL) == "" || !fileExists(person.ProfileURL)) {
+		if fetchAvatars && s.shouldFetchGfriendsAvatars() && (strings.TrimSpace(person.ProfileURL) == "" || !fileExists(person.ProfileURL)) {
 			changed, avatarErr := s.gfriendsAvatarService.EnsureActorAvatar(person)
 			if avatarErr != nil {
 				s.logger.Debugf("ensure actor avatar failed: actor=%s err=%v", name, avatarErr)
@@ -2677,18 +2744,77 @@ func (s *ScannerService) syncActorsForMediaWithRepos(media *model.Media, strict 
 			SortOrder: sortOrder,
 		}); err != nil {
 			if strict {
-				return fmt.Errorf("persist actor relation for %s: %w", media.ID, err)
+				return persisted, fmt.Errorf("persist actor relation for %s: %w", media.ID, err)
 			}
 			s.logger.Warnf("persist actor relation failed: media=%s actor=%s err=%v", media.ID, name, err)
+			continue
 		}
+		persisted++
 	}
 	if err := mediaPersonRepo.RefreshMediaSearchIndex(media.ID); err != nil {
 		if strict {
-			return fmt.Errorf("refresh media search index for %s: %w", media.ID, err)
+			return persisted, fmt.Errorf("refresh media search index for %s: %w", media.ID, err)
 		}
 		s.logger.Warnf("refresh media search index failed: media=%s err=%v", media.ID, err)
 	}
-	return nil
+	return persisted, nil
+}
+
+func (s *ScannerService) RepairMissingActorRelations(ctx context.Context) (ActorRelationRepairStats, error) {
+	var stats ActorRelationRepairStats
+	if s == nil || s.mediaRepo == nil || s.personRepo == nil || s.mediaPersonRepo == nil || s.nfoService == nil {
+		return stats, fmt.Errorf("actor relation repair is unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	mediaItems, err := s.mediaRepo.ListMoviesMissingActorRelations()
+	if err != nil {
+		return stats, fmt.Errorf("load media missing actor relations: %w", err)
+	}
+	stats.Candidates = len(mediaItems)
+	for i := range mediaItems {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
+		media := &mediaItems[i]
+		if _, err := s.stat(media.FilePath); err != nil {
+			stats.Unavailable++
+			continue
+		}
+		nfoPath := s.nfoService.FindNFOForMedia(media.FilePath)
+		if nfoPath == "" {
+			stats.Skipped++
+			continue
+		}
+		actors, _, parseErr := s.nfoService.GetActorsFromNFO(nfoPath)
+		if parseErr != nil {
+			stats.Failed++
+			if s.logger != nil {
+				s.logger.Warnf("repair actor relations failed: media=%s path=%s err=parse actors from %s: %v", media.ID, media.FilePath, nfoPath, parseErr)
+			}
+			continue
+		}
+		if len(actors) == 0 {
+			stats.Skipped++
+			continue
+		}
+		persisted, persistErr := s.replaceActorRelations(media, actors, true, s.personRepo, s.mediaPersonRepo, false)
+		if persistErr != nil {
+			stats.Failed++
+			if s.logger != nil {
+				s.logger.Warnf("repair actor relations failed: media=%s path=%s err=%v", media.ID, media.FilePath, persistErr)
+			}
+			continue
+		}
+		if persisted == 0 {
+			stats.Skipped++
+			continue
+		}
+		stats.Synced++
+	}
+	return stats, nil
 }
 
 // ScanLibrary 扫描媒体库目录
@@ -3095,6 +3221,9 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 			}
 
 			for _, item := range batch {
+				if actorErr := s.syncQuickMediaActors(item.media); actorErr != nil {
+					return fmt.Errorf("sync quick media actors %s: %w", item.path, actorErr)
+				}
 				s.enqueueMetadataCompletion(item.media.ID, item.media.LibraryID, metadataTaskPriorityNormal)
 				count++
 				s.advanceScanProgress(library, item.message)

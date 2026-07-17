@@ -27,6 +27,8 @@ type thumbnailWorkerFixture struct {
 	root   string
 }
 
+var thumbnailWorkerDatabaseSequence atomic.Uint64
+
 type thumbnailEventRecorder struct {
 	mu     sync.Mutex
 	events map[string][]ThumbnailTaskEventData
@@ -58,7 +60,10 @@ func (r *thumbnailEventRecorder) terminalCount(taskID string) int {
 
 func newThumbnailWorkerFixture(t *testing.T) *thumbnailWorkerFixture {
 	t.Helper()
-	dbName := "thumbnail_" + strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())
+	dbName := fmt.Sprintf("thumbnail_%s_%d",
+		strings.NewReplacer("/", "_", " ", "_").Replace(t.Name()),
+		thumbnailWorkerDatabaseSequence.Add(1),
+	)
 	db, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:%s?mode=memory&cache=shared", dbName)), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
@@ -254,6 +259,58 @@ func TestThumbnailDeletedMediaTaskIsSkipped(t *testing.T) {
 	fixture.worker.mu.Unlock()
 	if running != 0 {
 		t.Fatalf("deleted media left a dedupe marker: %d", running)
+	}
+}
+
+func TestThumbnailQuiesceMediaGenerationWaitsForRunningTask(t *testing.T) {
+	fixture := newThumbnailWorkerFixture(t)
+	media := fixture.addMedia(t, "delete-running", ThumbnailStatusPending)
+	started := make(chan struct{})
+	fixture.worker.executeGenerationFunc = func(ctx context.Context, _ *model.Media, _ *directorySidecarFiles, _ ThumbnailSettings) (string, string) {
+		close(started)
+		<-ctx.Done()
+		return ThumbnailStatusCanceled, ctx.Err().Error()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		fixture.worker.processTask(context.Background(), media)
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("thumbnail generation did not start")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	resume, err := fixture.worker.QuiesceMediaGeneration(ctx, media.ID)
+	if err != nil {
+		t.Fatalf("cancel media generation: %v", err)
+	}
+	defer resume()
+	select {
+	case <-done:
+	default:
+		t.Fatal("cancel returned before the running task stopped")
+	}
+
+	reloaded, err := fixture.repo.FindByID(media.ID)
+	if err != nil {
+		t.Fatalf("reload canceled media: %v", err)
+	}
+	if reloaded.ThumbnailStatus != ThumbnailStatusCanceled {
+		t.Fatalf("thumbnail status after media cancellation = %q", reloaded.ThumbnailStatus)
+	}
+	var restarted atomic.Int32
+	fixture.worker.executeGenerationFunc = func(context.Context, *model.Media, *directorySidecarFiles, ThumbnailSettings) (string, string) {
+		restarted.Add(1)
+		return ThumbnailStatusGenerated, ""
+	}
+	fixture.worker.processTask(context.Background(), media)
+	if restarted.Load() != 0 {
+		t.Fatal("quiesced media accepted a new thumbnail task")
 	}
 }
 

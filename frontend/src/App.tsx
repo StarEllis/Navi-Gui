@@ -33,6 +33,16 @@ import {
 } from './utils/mediaPlaybackState';
 import { markComponentRender } from './utils/performanceDiagnostics';
 import { putBoundedScrollState } from './utils/listViewState';
+import { getTopBarBackLabel } from './utils/filterNavigation';
+import { shouldReplaceActorFilterOnSearchChange } from './utils/mediaSearch';
+import {
+    loadSortPreferences,
+    persistSortPreferences,
+    type SortConfig,
+    type SortField,
+    type SortOrder,
+    type SortViewName,
+} from './utils/sortPreferences';
 import ScanTaskPanel from './components/ScanTaskPanel';
 import { scanProgressStore } from './utils/scanProgressStore';
 import {
@@ -48,11 +58,6 @@ import {
 } from './utils/scanTaskEvents';
 
 type ViewName = 'libs' | 'settings' | 'actor' | 'genre' | 'watched' | 'favorite';
-type SortOrder = 'asc' | 'desc';
-type SortField = 'created_at' | 'release_date' | 'video_codec' | 'last_watched' | 'favorite_at' | 'rating';
-type SortViewName = 'libs' | 'watched' | 'favorite';
-
-type SortConfig = { field: SortField; order: SortOrder };
 type SortOption = { field: SortField; label: string };
 type FilterState = { type: string; value: string; label: string; showHeaderLabel?: boolean } | null;
 type FilterReturnContext = {
@@ -92,12 +97,6 @@ const FAVORITE_SORT_OPTIONS: SortOption[] = [
     { field: 'created_at', label: '加入日期' },
     { field: 'rating', label: '评分' },
 ];
-
-const DEFAULT_SORTS: Record<SortViewName, SortConfig> = {
-    libs: { field: 'created_at', order: 'desc' },
-    watched: { field: 'last_watched', order: 'desc' },
-    favorite: { field: 'favorite_at', order: 'desc' },
-};
 
 const formatError = (error: unknown) => {
     if (error instanceof Error && error.message) {
@@ -174,7 +173,7 @@ function App() {
     });
     const [activeFilter, setActiveFilter] = useState<FilterState>(null);
     const [filterReturnContext, setFilterReturnContext] = useState<FilterReturnContext>(null);
-    const [sortStateByView, setSortStateByView] = useState<Record<SortViewName, SortConfig>>(DEFAULT_SORTS);
+    const [sortStateByView, setSortStateByView] = useState<Record<SortViewName, SortConfig>>(() => loadSortPreferences());
     const [gridScrollTops, setGridScrollTops] = useState<Record<string, number>>({});
     const [listMutation, setListMutation] = useState<MediaGridMutation | null>(null);
     const [latestMediaStateUpdate, setLatestMediaStateUpdate] = useState<MediaStateUpdate | null>(null);
@@ -321,6 +320,10 @@ function App() {
     useEffect(() => {
         persistCurrentLibraryID(currentLib?.id || '');
     }, [currentLib]);
+
+    useEffect(() => {
+        persistSortPreferences(sortStateByView);
+    }, [sortStateByView]);
 
     useEffect(() => {
         let frameId = 0;
@@ -559,26 +562,35 @@ function App() {
         };
     }, []);
 
-    const clearFilter = () => {
-        const hasFilterContext = Boolean(activeFilter || filterReturnContext);
-
-        if (hasFilterContext) {
-            if (filterReturnContext) {
-                setActiveFilter(filterReturnContext.filter);
-                setSearchKeyword(filterReturnContext.searchKeyword);
-                setView(filterReturnContext.view);
-                setSelectedMedia(filterReturnContext.media);
-            } else {
-                setActiveFilter(null);
-                setSearchKeyword('');
-                setView('libs');
-                setSelectedMedia(null);
-            }
-        } else {
+    const handleSearchChange = (keyword: string) => {
+        if (shouldReplaceActorFilterOnSearchChange(activeFilter?.type, searchKeyword, keyword)) {
             setActiveFilter(null);
-            setSearchKeyword('');
+            setFilterReturnContext(null);
+            setSelectedMedia(null);
+            setView('libs');
         }
+        setSearchKeyword(keyword);
+    };
 
+    const clearFilter = () => {
+        const hadActiveFilter = Boolean(activeFilter);
+        setActiveFilter(null);
+        setSearchKeyword('');
+        setFilterReturnContext(null);
+        setSelectedMedia(null);
+        if (hadActiveFilter) {
+            setView('libs');
+        }
+    };
+
+    const returnToFilterSource = () => {
+        if (!filterReturnContext) {
+            return;
+        }
+        setActiveFilter(filterReturnContext.filter);
+        setSearchKeyword(filterReturnContext.searchKeyword);
+        setView(filterReturnContext.view);
+        setSelectedMedia(filterReturnContext.media);
         setFilterReturnContext(null);
     };
 
@@ -752,6 +764,12 @@ function App() {
     const currentLibraryName = currentLib?.name || '未选择媒体库';
     const baseCount = typeof currentLib?.media_count === 'number' ? currentLib.media_count : mediaCount;
     const headerCount = (view === 'libs' || view === 'watched' || view === 'favorite') ? mediaCount : baseCount;
+    const topBarBackLabel = getTopBarBackLabel(filterReturnContext, view);
+    const topBarBackAction = filterReturnContext
+        ? returnToFilterSource
+        : topBarBackLabel
+            ? handleNavigateHome
+            : undefined;
     const searchEnabled = Boolean(currentLib && SEARCH_INPUT_VIEWS.has(view));
     const showLibraryActions = Boolean(currentLib && view === 'libs');
     const showListActions = Boolean(currentLib && MEDIA_ACTION_VIEWS.has(view));
@@ -885,18 +903,18 @@ function App() {
                             filterLabel={activeFilter?.showHeaderLabel === false ? undefined : activeFilter?.label}
                             showSearch={view !== 'settings'}
                             searchValue={searchKeyword}
-                            onSearch={setSearchKeyword}
+                            onSearch={handleSearchChange}
                             searchPlaceholder={searchPlaceholder}
                             searchDisabled={!searchEnabled}
                             scanDisabled={Boolean(activeScan) || scanRequestPendingLibraryID === currentLib?.id}
                             onScanWithMode={showLibraryActions ? handleScanWithMode : undefined}
-                            onEditLibrary={showLibraryActions && currentLib ? () => setEditingLib(currentLib) : undefined}
                             onRandomPlay={showListActions ? handleRandomPlay : undefined}
                             onSortSelect={showListActions ? handleSortSelect : undefined}
                             sortField={sortField}
                             sortOrder={sortOrder}
                             sortOptions={showListActions ? currentSortOptions : undefined}
-                            onBackButtonClick={view !== 'libs' && view !== 'settings' ? handleNavigateHome : undefined}
+                            onBackButtonClick={topBarBackAction}
+                            backButtonLabel={topBarBackLabel}
                             onClearFilter={activeFilter || searchKeyword.trim() ? clearFilter : undefined}
                         />
 

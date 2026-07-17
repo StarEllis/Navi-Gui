@@ -43,6 +43,9 @@ type ThumbnailWorker struct {
 	started               bool
 	stopped               bool
 	running               map[string]string
+	runningCancels        map[string]context.CancelFunc
+	runningDone           map[string]chan struct{}
+	blockedMedia          map[string]int
 	queued                map[string]string
 	retryReservations     map[string]thumbnailRetryReservation
 	retryTerminals        map[string]bool
@@ -78,6 +81,9 @@ func NewThumbnailWorker(mediaRepo *repository.MediaRepo, thumbSvc *ThumbnailServ
 		cancel:            cancel,
 		wakeCh:            make(chan struct{}, 1),
 		running:           make(map[string]string),
+		runningCancels:    make(map[string]context.CancelFunc),
+		runningDone:       make(map[string]chan struct{}),
+		blockedMedia:      make(map[string]int),
 		queued:            make(map[string]string),
 		retryReservations: make(map[string]thumbnailRetryReservation),
 		retryTerminals:    make(map[string]bool),
@@ -241,21 +247,24 @@ func thumbnailTaskKey(media *model.Media) string {
 	}, "|")
 }
 
-func (w *ThumbnailWorker) beginTask(media *model.Media) (string, bool, bool) {
+func (w *ThumbnailWorker) beginTask(ctx context.Context, media *model.Media) (string, bool, context.Context, bool) {
 	key := thumbnailTaskKey(media)
 	if key == "" {
-		return "", false, false
+		return "", false, nil, false
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.stopped {
-		return "", false, false
+		return "", false, nil, false
+	}
+	if w.blockedMedia[media.ID] > 0 {
+		return "", false, nil, false
 	}
 	if _, exists := w.running[key]; exists {
-		return "", false, false
+		return "", false, nil, false
 	}
 	if reservation, exists := w.retryReservations[key]; exists && reservation.phase == "reserved" {
-		return "", false, false
+		return "", false, nil, false
 	}
 	taskID, queued := w.queued[key]
 	delete(w.queued, key)
@@ -263,26 +272,92 @@ func (w *ThumbnailWorker) beginTask(media *model.Media) (string, bool, bool) {
 	if taskID == "" {
 		taskID = uuid.NewString()
 	}
+	taskCtx, cancel := context.WithCancel(ctx)
 	w.running[key] = taskID
-	return taskID, queued, true
+	w.runningCancels[key] = cancel
+	w.runningDone[key] = make(chan struct{})
+	return taskID, queued, taskCtx, true
 }
 
 func (w *ThumbnailWorker) releaseTask(media *model.Media) {
 	key := thumbnailTaskKey(media)
 	w.mu.Lock()
+	cancel := w.runningCancels[key]
+	done := w.runningDone[key]
 	delete(w.running, key)
+	delete(w.runningCancels, key)
+	delete(w.runningDone, key)
 	w.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		close(done)
+	}
+}
+
+// QuiesceMediaGeneration blocks new thumbnail tasks for a media item, stops an
+// in-flight task, and waits until it can no longer write generated artwork.
+func (w *ThumbnailWorker) QuiesceMediaGeneration(ctx context.Context, mediaID string) (func(), error) {
+	if w == nil || strings.TrimSpace(mediaID) == "" {
+		return func() {}, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	w.mu.Lock()
+	w.blockedMedia[mediaID]++
+	var cancels []context.CancelFunc
+	var doneChannels []chan struct{}
+	for key, cancel := range w.runningCancels {
+		keyMediaID, _, _ := strings.Cut(key, "|")
+		if keyMediaID != mediaID {
+			continue
+		}
+		cancels = append(cancels, cancel)
+		if done := w.runningDone[key]; done != nil {
+			doneChannels = append(doneChannels, done)
+		}
+	}
+	w.mu.Unlock()
+	var resumeOnce sync.Once
+	resume := func() {
+		resumeOnce.Do(func() {
+			w.mu.Lock()
+			if w.blockedMedia[mediaID] <= 1 {
+				delete(w.blockedMedia, mediaID)
+			} else {
+				w.blockedMedia[mediaID]--
+			}
+			w.mu.Unlock()
+		})
+	}
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	for _, done := range doneChannels {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			resume()
+			return func() {}, ctx.Err()
+		}
+	}
+	return resume, nil
 }
 
 func (w *ThumbnailWorker) processTask(ctx context.Context, task *model.Media) {
 	if w == nil || task == nil || strings.TrimSpace(task.ID) == "" || ctx.Err() != nil {
 		return
 	}
-	taskID, pendingAlreadySent, accepted := w.beginTask(task)
+	taskID, pendingAlreadySent, taskCtx, accepted := w.beginTask(ctx, task)
 	if !accepted {
 		return
 	}
 	defer w.releaseTask(task)
+	ctx = taskCtx
 
 	locked, err := w.mediaRepo.LockThumbnailTask(task.ID, w.workerID, w.lockTimeout)
 	if err != nil {

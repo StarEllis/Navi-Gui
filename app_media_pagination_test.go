@@ -79,6 +79,96 @@ func TestGetMediaListPreservesCompleteServerSearchSemantics(t *testing.T) {
 	}
 }
 
+func TestGetMediaListActorFilterCoalescesSimplifiedAndTraditionalNames(t *testing.T) {
+	app := newMediaPaginationTestApp(t)
+	person := model.Person{ID: "actor-mita", Name: "三田真铃"}
+	if err := app.db.Create(&person).Error; err != nil {
+		t.Fatal(err)
+	}
+	items := []model.Media{
+		{ID: "mita-simplified", LibraryID: "library-a", Title: "三田真铃", FilePath: "C:/media/simplified.mp4", MediaType: "movie"},
+		{ID: "mita-traditional", LibraryID: "library-a", Title: "三田真鈴", FilePath: "C:/media/traditional.mp4", MediaType: "movie"},
+	}
+	if err := app.db.Create(&items).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range items {
+		if err := app.db.Create(&model.MediaPerson{
+			ID: item.ID + "-actor", MediaID: item.ID, PersonID: person.ID, Role: "actor",
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := repository.RefreshMediaSearchIndex(app.db, item.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	value, err := app.GetMediaList("library-a", 1, 20, "created_at", "desc", "", "actor", "三田真鈴")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, page := mediaPageResult(t, value)
+	if result["total"] != int64(2) || len(page) != 2 {
+		t.Fatalf("traditional actor filter total=%v page=%v", result["total"], page)
+	}
+
+	if err := app.db.Model(&model.Media{}).
+		Where("id IN ?", []string{"mita-simplified", "mita-traditional"}).
+		Update("search_text", "legacy index without actor name").Error; err != nil {
+		t.Fatal(err)
+	}
+	value, err = app.GetMediaList("library-a", 1, 20, "created_at", "desc", "三田真鈴", "actor", person.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, page = mediaPageResult(t, value)
+	if result["total"] != int64(2) || len(page) != 2 {
+		t.Fatalf("traditional actor search total=%v page=%v", result["total"], page)
+	}
+}
+
+func TestGetMediaListSpaceSeparatedActorNamesAreExplicitIntersection(t *testing.T) {
+	app := newMediaPaginationTestApp(t)
+	people := []model.Person{
+		{ID: "actor-komatsu", Name: "小松空"},
+		{ID: "actor-mita", Name: "三田真铃"},
+	}
+	if err := app.db.Create(&people).Error; err != nil {
+		t.Fatal(err)
+	}
+	items := []model.Media{
+		{ID: "komatsu-only", LibraryID: "library-a", Title: "小松空单人作品", FilePath: "C:/media/komatsu.mp4", MediaType: "movie"},
+		{ID: "mita-only", LibraryID: "library-a", Title: "三田真铃单人作品", FilePath: "C:/media/mita.mp4", MediaType: "movie"},
+		{ID: "both-actors", LibraryID: "library-a", Title: "共同出演", FilePath: "C:/media/both.mp4", MediaType: "movie"},
+	}
+	if err := app.db.Create(&items).Error; err != nil {
+		t.Fatal(err)
+	}
+	relations := []model.MediaPerson{
+		{ID: "komatsu-only-cast", MediaID: "komatsu-only", PersonID: "actor-komatsu", Role: "actor"},
+		{ID: "mita-only-cast", MediaID: "mita-only", PersonID: "actor-mita", Role: "actor"},
+		{ID: "both-komatsu-cast", MediaID: "both-actors", PersonID: "actor-komatsu", Role: "actor"},
+		{ID: "both-mita-cast", MediaID: "both-actors", PersonID: "actor-mita", Role: "actor"},
+	}
+	if err := app.db.Create(&relations).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range items {
+		if err := repository.RefreshMediaSearchIndex(app.db, item.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	value, err := app.GetMediaList("library-a", 1, 20, "created_at", "desc", "小松空 三田", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, page := mediaPageResult(t, value)
+	if result["total"] != int64(1) || len(page) != 1 || page[0].ID != "both-actors" {
+		t.Fatalf("space-separated actor intersection total=%v page=%v", result["total"], page)
+	}
+}
+
 func TestGetMediaListTenThousandRowsRemainServerPaginated(t *testing.T) {
 	app := newMediaPaginationTestApp(t)
 	items := make([]model.Media, 10000)

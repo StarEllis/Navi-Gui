@@ -247,7 +247,7 @@ func (c *ArtworkCache) recordFile(path string) {
 	path = filepath.Clean(path)
 	c.mu.Lock()
 	old := c.index[path]
-	entry := artworkIndexEntry{Path: path, Size: info.Size(), LastAccess: time.Now()}
+	entry := artworkIndexEntry{Path: path, Size: info.Size(), LastAccess: time.Now(), Evicting: old.Evicting}
 	c.index[path] = entry
 	c.indexBytes += entry.Size - old.Size
 	c.indexUsable = true
@@ -652,10 +652,24 @@ func (c *ArtworkCache) Cleanup(ctx context.Context, highBytes, lowBytes int64, m
 }
 
 func (c *ArtworkCache) evictPath(path string) (bool, error) {
+	return c.evictPathMode(path, false)
+}
+
+func (c *ArtworkCache) removeMediaPath(path string) (bool, error) {
+	return c.evictPathMode(path, true)
+}
+
+func (c *ArtworkCache) evictPathMode(path string, deferWhileActive bool) (bool, error) {
 	path = filepath.Clean(path)
 	c.mu.Lock()
 	entry, ok := c.index[path]
 	if !ok {
+		if deferWhileActive && c.active[path] > 0 {
+			entry = artworkIndexEntry{Path: path, Evicting: true}
+			c.index[path] = entry
+			c.mu.Unlock()
+			return false, nil
+		}
 		c.mu.Unlock()
 		info, err := os.Stat(path)
 		if err != nil {
@@ -672,12 +686,28 @@ func (c *ArtworkCache) evictPath(path string) (bool, error) {
 			c.indexBytes += entry.Size
 		}
 	}
-	if entry.Evicting || c.active[path] > 0 {
+	if entry.Evicting || (!deferWhileActive && c.active[path] > 0) {
 		c.mu.Unlock()
 		return false, nil
 	}
 	entry.Evicting = true
 	c.index[path] = entry
+	active := c.active[path] > 0
+	c.mu.Unlock()
+	if active {
+		return false, nil
+	}
+	return c.finishEvictingPath(path)
+}
+
+func (c *ArtworkCache) finishEvictingPath(path string) (bool, error) {
+	path = filepath.Clean(path)
+	c.mu.Lock()
+	entry, ok := c.index[path]
+	if !ok || !entry.Evicting || c.active[path] > 0 {
+		c.mu.Unlock()
+		return false, nil
+	}
 	c.mu.Unlock()
 
 	err := c.remove(path)
@@ -687,7 +717,7 @@ func (c *ArtworkCache) evictPath(path string) (bool, error) {
 	c.mu.Lock()
 	current, stillPresent := c.index[path]
 	if err != nil {
-		if stillPresent {
+		if stillPresent && current.Evicting {
 			current.Evicting = false
 			c.index[path] = current
 		}

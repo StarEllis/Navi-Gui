@@ -462,6 +462,15 @@ func (r *MediaRepo) ListByLibraryID(libraryID string) ([]model.Media, error) {
 	return media, err
 }
 
+func (r *MediaRepo) ListQuickMetadataIDs() ([]string, error) {
+	var ids []string
+	err := r.db.Model(&model.Media{}).
+		Where("metadata_phase = ?", "quick").
+		Order("created_at ASC").
+		Pluck("id", &ids).Error
+	return ids, err
+}
+
 func (r *MediaRepo) ListBySeriesID(seriesID string) ([]model.Media, error) {
 	var media []model.Media
 	err := r.db.Where("series_id = ?", seriesID).
@@ -623,6 +632,20 @@ func (r *MediaRepo) CountRecentImports(days int) (int64, error) {
 func (r *MediaRepo) ListByMediaType(mediaType string) ([]model.Media, error) {
 	var media []model.Media
 	err := r.db.Where("media_type = ?", mediaType).Find(&media).Error
+	return media, err
+}
+
+func (r *MediaRepo) ListMoviesMissingActorRelations() ([]model.Media, error) {
+	var media []model.Media
+	err := r.db.
+		Select("id, library_id, file_path, media_type").
+		Where("media_type = ? AND file_path <> ?", "movie", "").
+		Where(`NOT EXISTS (
+			SELECT 1 FROM media_people
+			WHERE media_people.media_id = media.id AND media_people.role = ?
+		)`, "actor").
+		Order("created_at ASC").
+		Find(&media).Error
 	return media, err
 }
 

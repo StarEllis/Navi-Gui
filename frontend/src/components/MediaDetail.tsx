@@ -725,7 +725,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     };
 
     const handleDelete = async () => {
-        if (!window.confirm('确定要从数据库中移除此条目吗？注意：不会删除本地文件。')) {
+		if (!window.confirm('确定要从数据库中移除此条目吗？不会删除影片文件；会清理 Navi 生成的缩略图。')) {
             return;
         }
 

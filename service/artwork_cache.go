@@ -318,6 +318,16 @@ func (c *ArtworkCache) RemoveMedia(mediaID string) error {
 
 	c.mu.Lock()
 	recoveryScan := c.reconcileNeeded || !c.indexUsable
+	for path := range c.inflight {
+		for _, role := range roles {
+			if samePath(filepath.Dir(path), c.mediaRoleDir(role, mediaID)) {
+				if _, exists := seen[path]; !exists {
+					seen[path] = struct{}{}
+					targets = append(targets, path)
+				}
+			}
+		}
+	}
 	for path := range c.index {
 		for _, role := range roles {
 			roleDir := c.roleDir(role)
@@ -356,7 +366,7 @@ func (c *ArtworkCache) RemoveMedia(mediaID string) error {
 		}
 	}
 	for _, path := range targets {
-		if _, err := c.evictPath(path); err != nil {
+		if _, err := c.removeMediaPath(path); err != nil {
 			return err
 		}
 	}
@@ -558,11 +568,35 @@ func (c *ArtworkCache) generateOnce(path string, fn func(context.Context) error)
 	}
 	c.mu.Lock()
 	delete(c.inflight, path)
-	delete(c.active, path)
 	close(call.done)
 	c.mu.Unlock()
+	c.releaseActivePath(path)
 	c.finishProducer()
 	return call.err
+}
+
+func (c *ArtworkCache) releaseActivePath(path string) {
+	path = filepath.Clean(path)
+	c.mu.Lock()
+	if c.active[path] <= 1 {
+		delete(c.active, path)
+	} else {
+		c.active[path]--
+	}
+	entry, indexed := c.index[path]
+	finishEviction := indexed && entry.Evicting && c.active[path] == 0
+	overLimit := c.indexBytes > c.highBytes || len(c.index) > c.maxFiles
+	c.mu.Unlock()
+
+	if finishEviction {
+		if _, err := c.finishEvictingPath(path); err != nil && c.logger != nil {
+			c.logger.Warnf("remove released artwork cache path failed: path=%s err=%v", path, err)
+		}
+		return
+	}
+	if overLimit {
+		c.requestCleanup()
+	}
 }
 
 // Reserve prevents capacity cleanup from removing a file while a caller reads it.
@@ -587,17 +621,7 @@ func (c *ArtworkCache) Reserve(path string) (func(), bool) {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			c.mu.Lock()
-			if c.active[path] <= 1 {
-				delete(c.active, path)
-			} else {
-				c.active[path]--
-			}
-			overLimit := c.indexBytes > c.highBytes || len(c.index) > c.maxFiles
-			c.mu.Unlock()
-			if overLimit {
-				c.requestCleanup()
-			}
+			c.releaseActivePath(path)
 		})
 	}, true
 }

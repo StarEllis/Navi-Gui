@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -617,6 +618,72 @@ func previewDirectory(mediaPath string) string {
 
 func generatedPreviewName(mediaPath string, index int) string {
 	return fmt.Sprintf("%s-preview-%02d.jpg", strings.TrimSuffix(filepath.Base(mediaPath), filepath.Ext(mediaPath)), index)
+}
+
+// RemoveLegacyGeneratedThumbnailFiles removes only the old on-disk thumbnail
+// layout used before generated artwork moved into the managed cache.
+func RemoveLegacyGeneratedThumbnailFiles(media *model.Media) (int, error) {
+	if media == nil || strings.TrimSpace(media.FilePath) == "" || strings.TrimSpace(media.ThumbnailFingerprint) == "" {
+		return 0, nil
+	}
+	switch normalizeThumbnailStatus(media.ThumbnailStatus) {
+	case ThumbnailStatusProcessing, ThumbnailStatusGenerated, ThumbnailStatusPartial,
+		ThumbnailStatusFailed, ThumbnailStatusCanceled, ThumbnailStatusStale:
+	default:
+		return 0, nil
+	}
+
+	sidecars := collectDirectorySidecarFiles(filepath.Dir(media.FilePath))
+	if sidecars != nil && strings.TrimSpace(sidecars.nfoPathForMedia(media.FilePath)) != "" {
+		return 0, nil
+	}
+
+	previewDir := previewDirectory(media.FilePath)
+	entries, err := os.ReadDir(previewDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	stem := strings.TrimSuffix(filepath.Base(media.FilePath), filepath.Ext(media.FilePath))
+	prefix := strings.ToLower(stem + "-preview-")
+	var targets []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".jpg") {
+			continue
+		}
+		nameStem := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+		lowerNameStem := strings.ToLower(nameStem)
+		if !strings.HasPrefix(lowerNameStem, prefix) {
+			continue
+		}
+		index, parseErr := strconv.Atoi(strings.TrimPrefix(lowerNameStem, prefix))
+		if parseErr != nil || index <= 0 {
+			continue
+		}
+		targets = append(targets, filepath.Join(previewDir, entry.Name()))
+	}
+	// The exact preview naming is the strongest legacy ownership signal. Do not
+	// delete poster/fanart sidecars when no generated preview can prove origin.
+	if len(targets) == 0 {
+		return 0, nil
+	}
+	targets = append(targets, generatedPosterPath(media.FilePath), generatedBackdropPath(media.FilePath))
+
+	removed := 0
+	var removeErrs []error
+	for _, path := range targets {
+		if err := os.Remove(path); err != nil {
+			if !os.IsNotExist(err) {
+				removeErrs = append(removeErrs, fmt.Errorf("remove %s: %w", path, err))
+			}
+			continue
+		}
+		removed++
+	}
+	_ = os.Remove(previewDir)
+	return removed, errors.Join(removeErrs...)
 }
 
 func fileExists(path string) bool {

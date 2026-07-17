@@ -686,6 +686,30 @@ func TestNonOverwriteMetadataProbeFailureRemainsBestEffort(t *testing.T) {
 	}
 }
 
+func TestNonOverwriteMalformedNFORemainsBestEffort(t *testing.T) {
+	fixture := newOverwriteSafetyFixture(t, "movie", true)
+	if err := os.WriteFile(filepath.Join(fixture.root, "kept.nfo"), []byte(`<movie><title>Broken & title</movie>`), 0644); err != nil {
+		t.Fatalf("write malformed NFO: %v", err)
+	}
+	if err := fixture.db.Model(&model.Media{}).Where("id = ?", "media-kept").Update("metadata_phase", MetadataPhaseQuick).Error; err != nil {
+		t.Fatalf("mark media quick: %v", err)
+	}
+
+	if err := fixture.scanner.completeMediaMetadataByID("media-kept"); err != nil {
+		t.Fatalf("ordinary metadata completion stopped on malformed NFO: %v", err)
+	}
+	var kept model.Media
+	if err := fixture.db.First(&kept, "id = ?", "media-kept").Error; err != nil {
+		t.Fatalf("load completed media: %v", err)
+	}
+	if NormalizeMetadataPhase(kept.MetadataPhase) != MetadataPhaseFull {
+		t.Fatalf("ordinary malformed NFO completion remained pending: %s", kept.MetadataPhase)
+	}
+	if kept.Duration <= 0 {
+		t.Fatalf("technical metadata was not completed: duration=%v", kept.Duration)
+	}
+}
+
 func TestOverwriteExplicitEmptyActorListClearsOldRelations(t *testing.T) {
 	fixture := newOverwriteSafetyFixture(t, "movie", true)
 	seedOverwriteActor(t, fixture, "old-actor", "Old Actor")

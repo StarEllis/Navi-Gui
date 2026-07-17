@@ -4,7 +4,6 @@ import {
     ArrowLeft,
     ArrowUp,
     ChevronDown,
-    Edit3,
     RefreshCw,
     Search,
     Shuffle,
@@ -39,13 +38,13 @@ interface TopBarProps {
     searchDisabled?: boolean;
     scanDisabled?: boolean;
     onScanWithMode?: (mode: string) => void;
-    onEditLibrary?: () => void;
     onRandomPlay?: () => void;
     onSortSelect?: (field: string) => void;
     sortField?: string;
     sortOrder?: 'asc' | 'desc';
     sortOptions?: SortOption[];
     onBackButtonClick?: () => void;
+    backButtonLabel?: string;
     onClearFilter?: () => void;
 }
 
@@ -136,13 +135,13 @@ const TopBar: React.FC<TopBarProps> = ({
     searchDisabled = false,
     scanDisabled = false,
     onScanWithMode,
-    onEditLibrary,
     onRandomPlay,
     onSortSelect,
     sortField = 'created_at',
     sortOrder = 'desc',
     sortOptions = DEFAULT_SORT_OPTIONS,
     onBackButtonClick,
+    backButtonLabel = '返回主页',
     onClearFilter,
 }) => {
     const [openMenu, setOpenMenu] = useState<MenuType>(null);
@@ -348,7 +347,7 @@ const TopBar: React.FC<TopBarProps> = ({
     return (
         <>
             <div className={`topbar ${hidden ? 'topbar-hidden' : ''}`} ref={menuRootRef} onDoubleClick={handleHeaderDoubleClick}>
-                <div className={`workspace-header-main ${showSearch ? '' : 'no-search'}`.trim()}>
+                <div className={`workspace-header-main ${showSearch ? '' : 'no-search'} ${onBackButtonClick ? 'has-back-action' : ''}`.trim()}>
                     <div className="workspace-header-heading">
                         <div className="workspace-header-title-row">
                             <span className="workspace-library-current" title={currentLibraryName}>
@@ -395,9 +394,15 @@ const TopBar: React.FC<TopBarProps> = ({
                     <div className="workspace-header-actions no-drag">
 
                         {onBackButtonClick && (
-                            <button type="button" className="workspace-action-btn subtle" onClick={onBackButtonClick}>
+                            <button
+                                type="button"
+                                className="workspace-action-btn subtle workspace-back-action"
+                                onClick={onBackButtonClick}
+                                title={backButtonLabel}
+                                aria-label={backButtonLabel}
+                            >
                                 <ArrowLeft size={14} />
-                                <span>返回主页</span>
+                                <span>{backButtonLabel}</span>
                             </button>
                         )}
 
@@ -484,16 +489,6 @@ const TopBar: React.FC<TopBarProps> = ({
                             </div>
                         )}
 
-                        {onEditLibrary && (
-                            <button
-                                type="button"
-                                className="workspace-icon-btn"
-                                onClick={onEditLibrary}
-                                title="编辑当前媒体库"
-                            >
-                                <Edit3 size={15} />
-                            </button>
-                        )}
                     </div>
                 </div>
             </div>
