@@ -1528,6 +1528,11 @@ func (a *App) GetMediaDetail(mediaID string) (*model.Media, error) {
 	if err := a.db.Preload("Series").First(&media, "id = ?", mediaID).Error; err != nil {
 		return nil, err
 	}
+	if repaired, err := a.repairMissingMediaFilePath(&media); err != nil {
+		a.logger.Warnf("repair missing media file path failed: media=%s path=%s err=%v", media.ID, media.FilePath, err)
+	} else if repaired {
+		a.logger.Infof("repaired missing media file path: media=%s path=%s", media.ID, media.FilePath)
+	}
 
 	if shouldAutoCompleteDetailMetadata(&media) {
 		a.scanner.EnqueueMetadataCompletion(media.ID, true)
@@ -1638,6 +1643,72 @@ func (a *App) getMediaFilesByPath(filePath string) []string {
 	}
 	sort.Strings(files)
 	return files
+}
+
+func mediaFileExists(filePath string) bool {
+	info, err := os.Stat(strings.TrimSpace(filePath))
+	return err == nil && info != nil && !info.IsDir()
+}
+
+func selectReplacementMediaFile(media *model.Media, files []string) string {
+	if media == nil || len(files) == 0 {
+		return ""
+	}
+	if len(files) == 1 {
+		return files[0]
+	}
+
+	mediaCode := service.ExtractDerivedMediaMetadata(media).Code
+	if mediaCode == "" {
+		return ""
+	}
+
+	matches := make([]string, 0, 1)
+	for _, filePath := range files {
+		candidate := &model.Media{FilePath: filePath}
+		if strings.EqualFold(service.ExtractDerivedMediaMetadata(candidate).Code, mediaCode) {
+			matches = append(matches, filePath)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0]
+	}
+	return ""
+}
+
+func (a *App) repairMissingMediaFilePath(media *model.Media) (bool, error) {
+	if a == nil || a.repos == nil || media == nil || strings.TrimSpace(media.FilePath) == "" {
+		return false, nil
+	}
+	if mediaFileExists(media.FilePath) {
+		return false, nil
+	}
+
+	replacement := selectReplacementMediaFile(media, a.getMediaFilesByPath(media.FilePath))
+	if replacement == "" || sameAppPath(replacement, media.FilePath) {
+		return false, nil
+	}
+
+	existing, err := a.repos.Media.FindByFilePathInLibrary(media.LibraryID, replacement)
+	if err == nil && existing != nil && existing.ID != media.ID {
+		return false, nil
+	}
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, err
+	}
+
+	previousPath := media.FilePath
+	media.FilePath = replacement
+	if err := a.repos.Media.Update(media); err != nil {
+		media.FilePath = previousPath
+		return false, err
+	}
+	if a.scanner != nil {
+		if err := a.scanner.SyncActorsAfterMediaPathRepair(media, a.db); err != nil {
+			a.logger.Warnf("sync actors after media path repair failed: media=%s path=%s err=%v", media.ID, media.FilePath, err)
+		}
+	}
+	return true, nil
 }
 
 func (a *App) getMediaPreviewsByPath(filePath string) []string {
@@ -2754,6 +2825,16 @@ func (a *App) PlayMedia(mediaID string, filePath string) error {
 	totalStart := time.Now()
 	if targetPath == "" {
 		return fmt.Errorf("empty file path")
+	}
+	if !mediaFileExists(targetPath) {
+		if repaired, repairErr := a.repairMissingMediaFilePath(media); repairErr != nil {
+			return fmt.Errorf("repair missing media file path: %w", repairErr)
+		} else if repaired {
+			targetPath = media.FilePath
+		}
+	}
+	if !mediaFileExists(targetPath) {
+		return fmt.Errorf("media file does not exist: %s", targetPath)
 	}
 	if a.playback != nil {
 		settings, _ := a.GetDesktopSettings()

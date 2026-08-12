@@ -2631,6 +2631,18 @@ func (s *ScannerService) SyncActorsForMediaStrict(media *model.Media) error {
 	return s.syncActorsForMedia(media, true)
 }
 
+// SyncActorsAfterMediaPathRepair refreshes actor relations from the repaired
+// media path atomically and without performing optional avatar network I/O.
+func (s *ScannerService) SyncActorsAfterMediaPathRepair(media *model.Media, db *gorm.DB) error {
+	if db == nil {
+		return fmt.Errorf("database is nil")
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		repos := repository.NewRepositories(tx)
+		return s.syncActorsForMediaWithOptions(media, true, repos.Person, repos.MediaPerson, false)
+	})
+}
+
 // SyncActorsForMediaStrictWithDB binds the relation work to the caller's
 // transaction. NFO file replacement is completed before callers open that tx.
 func (s *ScannerService) SyncActorsForMediaStrictWithDB(media *model.Media, db *gorm.DB) error {

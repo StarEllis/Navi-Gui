@@ -101,8 +101,14 @@ func parseNFOXMLDocument(data []byte, tolerateBareAmpersand bool) (*nfoXMLDocume
 				element.end = element.openEnd
 			}
 		case xml.CharData:
-			if len(stack) == 0 && len(bytes.TrimSpace([]byte(typed))) != 0 {
-				return nil, fmt.Errorf("NFO contains text outside the root element")
+			if len(stack) == 0 {
+				text := bytes.TrimSpace([]byte(typed))
+				if root == nil && before == 0 {
+					text = bytes.TrimSpace(bytes.TrimPrefix(text, []byte{0xEF, 0xBB, 0xBF}))
+				}
+				if len(text) != 0 {
+					return nil, fmt.Errorf("NFO contains text outside the root element")
+				}
 			}
 		}
 	}

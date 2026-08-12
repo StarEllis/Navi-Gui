@@ -121,6 +121,34 @@ func TestLoadEditorDataReadsNestedSetSeries(t *testing.T) {
 	}
 }
 
+func TestLoadEditorDataAcceptsUTF8BOM(t *testing.T) {
+	service := NewNFOService(zap.NewNop().Sugar())
+	content := append([]byte{0xEF, 0xBB, 0xBF}, []byte(nestedSetSeriesNFO)...)
+	nfoPath := writeTempNFO(t, string(content))
+
+	data, err := service.LoadEditorData(nfoPath, &model.Media{FilePath: `C:\videos\MIAA-085.mp4`})
+	if err != nil {
+		t.Fatalf("LoadEditorData returned error for UTF-8 BOM: %v", err)
+	}
+	if data.Series != "Super Deluxe Series" {
+		t.Fatalf("expected series from BOM-prefixed NFO, got %q", data.Series)
+	}
+}
+
+func TestParseNFOXMLDocumentStillRejectsTextOutsideRoot(t *testing.T) {
+	for name, content := range map[string]string{
+		"before": "unexpected<movie/>",
+		"after":  "<movie/>unexpected",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := parseNFOXMLDocument([]byte(content), false)
+			if err == nil || !strings.Contains(err.Error(), "text outside the root element") {
+				t.Fatalf("expected outside-root text error, got %v", err)
+			}
+		})
+	}
+}
+
 func TestSaveEditorDataWritesSeriesForEditorRoundTrip(t *testing.T) {
 	service := NewNFOService(zap.NewNop().Sugar())
 	nfoPath := writeTempNFO(t, nestedSetSeriesNFO)
