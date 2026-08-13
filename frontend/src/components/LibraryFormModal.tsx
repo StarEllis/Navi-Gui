@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { FolderIcon, FolderPlusIcon, XIcon } from 'lucide-react';
 import { CreateLibrary, DeleteLibrary, SelectDirectory, UpdateLibrary } from "../../wailsjs/go/main/App";
 import {
     buildLibraryPayload,
@@ -37,6 +38,8 @@ const LibraryFormModal: React.FC<LibraryFormModalProps> = ({
     const [viewMode, setViewMode] = useState(DEFAULT_LIBRARY_VIEW_MODE);
     const [titleField, setTitleField] = useState(DEFAULT_LIBRARY_TITLE_FIELD);
     const [subtitleField, setSubtitleField] = useState(DEFAULT_LIBRARY_SUBTITLE_FIELD);
+    const [nameTouched, setNameTouched] = useState(false);
+    const [attempted, setAttempted] = useState(false);
     const [msg, setMsg] = useState('');
 
     const resetForm = () => {
@@ -47,6 +50,8 @@ const LibraryFormModal: React.FC<LibraryFormModalProps> = ({
         setTitleField(config.titleField);
         setSubtitleField(config.subtitleField);
         setManualPath('');
+        setNameTouched(false);
+        setAttempted(false);
         setMsg('');
     };
 
@@ -75,14 +80,7 @@ const LibraryFormModal: React.FC<LibraryFormModalProps> = ({
     };
 
     const handleSave = async () => {
-        if (!name.trim()) {
-            setMsg('媒体库名称不能为空');
-            return;
-        }
-        if (folderPaths.length === 0) {
-            setMsg('请至少保留一个文件夹路径');
-            return;
-        }
+        setAttempted(true);
 
         const payload = buildLibraryPayload(library || {}, {
             name: name.trim(),
@@ -130,6 +128,7 @@ const LibraryFormModal: React.FC<LibraryFormModalProps> = ({
     };
 
     const isCreateMode = mode === 'create';
+    const canSave = name.trim().length > 0 && folderPaths.length > 0;
 
     return (
         <div className="modal-overlay" onClick={onClose}>
@@ -140,106 +139,121 @@ const LibraryFormModal: React.FC<LibraryFormModalProps> = ({
                 </div>
 
                 <div className="library-edit-body">
-                    <div className="library-edit-field">
-                        <label>媒体库名</label>
+                    <div className="library-edit-row">
+                        <label className="library-edit-label">名称</label>
                         <input
                             className="library-edit-input"
                             value={name}
-                            onChange={(event) => setName(event.target.value)}
+                            autoFocus={isCreateMode}
+                            placeholder={isCreateMode ? '给它起个名字' : undefined}
+                            onChange={(event) => {
+                                setName(event.target.value);
+                                setNameTouched(true);
+                            }}
+                            onBlur={() => setNameTouched(true)}
                         />
-                    </div>
-
-                    <div className="library-edit-grid">
-                        <div className="library-edit-field">
-                            <label>视图</label>
-                            <select
-                                className="library-edit-select"
-                                value={viewMode}
-                                onChange={(event) => setViewMode(event.target.value)}
-                            >
-                                <option value="poster">海报图</option>
-                                <option value="compact">紧凑图</option>
-                            </select>
-                        </div>
-
-                        <div className="library-edit-field">
-                            <label>标题</label>
-                            <select
-                                className="library-edit-select"
-                                value={titleField}
-                                onChange={(event) => setTitleField(event.target.value)}
-                            >
-                                <option value="title">标题</option>
-                                <option value="code">视频编码</option>
-                                <option value="orig_title">原标题</option>
-                            </select>
-                        </div>
-
-                        <div className="library-edit-field">
-                            <label>副标题</label>
-                            <select
-                                className="library-edit-select"
-                                value={subtitleField}
-                                onChange={(event) => setSubtitleField(event.target.value)}
-                            >
-                                <option value="year">年份</option>
-                                <option value="release_date">发行日期</option>
-                                <option value="none">无</option>
-                            </select>
-                        </div>
-                    </div>
-
-                    <div className="library-edit-field">
-                        <label>文件夹路径</label>
-                        <div className="library-edit-path-actions">
-                            <button type="button" className="library-edit-small-btn" onClick={handleSelectDir}>+ 文件夹</button>
-                            <button type="button" className="library-edit-small-btn secondary" onClick={() => pushPath(manualPath)}>手动添加</button>
-                        </div>
-                        <input
-                            className="library-edit-input"
-                            value={manualPath}
-                            onChange={(event) => setManualPath(event.target.value)}
-                            placeholder="输入路径后点击手动添加"
-                        />
-                    </div>
-
-                    <div className="library-path-list">
-                        <div className="library-path-list-header">
-                            <span className="index">序号</span>
-                            <span className="path">路径</span>
-                            <span className="actions">操作</span>
-                        </div>
-
-                        {folderPaths.length > 0 ? folderPaths.map((path, index) => (
-                            <div key={path} className="library-path-row">
-                                <span className="index">{index + 1}</span>
-                                <span className="path" title={path}>{path}</span>
-                                <span className="actions">
-                                    <button
-                                        type="button"
-                                        className="library-path-action danger"
-                                        onClick={() => setFolderPaths((prev) => prev.filter((item) => item !== path))}
-                                    >
-                                        删除
-                                    </button>
-                                </span>
-                            </div>
-                        )) : (
-                            <div className="library-path-empty">尚未添加文件夹路径</div>
+                        {nameTouched && !name.trim() && (
+                            <div className="library-edit-error">媒体库名称不能为空</div>
                         )}
+                    </div>
+
+                    <div className="library-edit-row">
+                        <label className="library-edit-label">视图</label>
+                        <div className="library-edit-segment">
+                            <button
+                                type="button"
+                                aria-pressed={viewMode === 'poster'}
+                                onClick={() => setViewMode('poster')}
+                            >
+                                海报图
+                            </button>
+                            <button
+                                type="button"
+                                aria-pressed={viewMode === 'compact'}
+                                onClick={() => setViewMode('compact')}
+                            >
+                                紧凑图
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="library-edit-row">
+                        <label className="library-edit-label">卡片文字</label>
+                        <div className="library-edit-pickers">
+                            <div className="library-edit-picker">
+                                <select value={titleField} onChange={(event) => setTitleField(event.target.value)}>
+                                    <option value="title">标题</option>
+                                    <option value="code">视频编码</option>
+                                    <option value="orig_title">原标题</option>
+                                </select>
+                            </div>
+                            <span className="library-edit-pickers-sep">/</span>
+                            <div className="library-edit-picker">
+                                <select value={subtitleField} onChange={(event) => setSubtitleField(event.target.value)}>
+                                    <option value="year">年份</option>
+                                    <option value="release_date">发行日期</option>
+                                    <option value="none">无</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div className="library-edit-row library-edit-row--paths">
+                        <label className="library-edit-label">文件夹</label>
+                        <div>
+                            <div className="library-path-list">
+                                {folderPaths.length > 0 ? folderPaths.map((path) => (
+                                    <div key={path} className="library-path-row">
+                                        <FolderIcon className="icon" />
+                                        <span className="path" title={path}>{path}</span>
+                                        <button
+                                            type="button"
+                                            className="library-path-remove"
+                                            title="移除"
+                                            onClick={() => setFolderPaths((prev) => prev.filter((item) => item !== path))}
+                                        >
+                                            <XIcon size={14} />
+                                        </button>
+                                    </div>
+                                )) : (
+                                    <div className={`library-path-empty${attempted ? ' invalid' : ''}`}>
+                                        还没有文件夹，至少选一个
+                                    </div>
+                                )}
+                            </div>
+                            <div className="library-edit-path-add">
+                                <button type="button" className="library-edit-browse-btn" onClick={handleSelectDir}>
+                                    <FolderPlusIcon size={14} />选择文件夹
+                                </button>
+                                <input
+                                    className="library-edit-manual-input"
+                                    value={manualPath}
+                                    placeholder="或粘贴路径后回车"
+                                    onChange={(event) => setManualPath(event.target.value)}
+                                    onKeyDown={(event) => {
+                                        if (event.key === 'Enter') {
+                                            event.preventDefault();
+                                            pushPath(manualPath);
+                                        }
+                                    }}
+                                />
+                            </div>
+                        </div>
                     </div>
                 </div>
 
                 <div className="library-edit-footer">
-                    {msg && <span className="library-edit-msg">{msg}</span>}
+                    {!isCreateMode
+                        ? <button type="button" className="library-edit-footer-btn danger" onClick={handleDelete}>删除媒体库</button>
+                        : <span />}
                     <div className="library-edit-footer-actions">
+                        {msg && <span className="library-edit-msg">{msg}</span>}
                         {!isCreateMode && (
-                            <button type="button" className="library-edit-footer-btn danger" onClick={handleDelete}>删除</button>
+                            <button type="button" className="library-edit-footer-btn quiet" onClick={resetForm}>重置</button>
                         )}
-                        <button type="button" className="library-edit-footer-btn" onClick={resetForm}>重置</button>
                         <button type="button" className="library-edit-footer-btn" onClick={onClose}>取消</button>
-                        <button type="button" className="library-edit-footer-btn primary" onClick={handleSave}>
-                            {isCreateMode ? '保存' : '保存'}
+                        <button type="button" className="library-edit-footer-btn primary" disabled={!canSave} onClick={handleSave}>
+                            保存
                         </button>
                     </div>
                 </div>

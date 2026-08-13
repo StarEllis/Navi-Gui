@@ -37,11 +37,11 @@ export namespace gorm {
 }
 
 export namespace main {
-
+	
 	export class DeleteLibraryResult {
 	    deleted: boolean;
 	    warning?: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new DeleteLibraryResult(source);
 	    }
@@ -153,7 +153,7 @@ export namespace main {
 	        this.files = source["files"];
 	        this.previews = source["previews"];
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -185,11 +185,11 @@ export namespace main {
 	    started_at: any;
 	    // Go type: time
 	    finished_at?: any;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ScanTaskInfo(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.task_id = source["task_id"];
@@ -646,7 +646,7 @@ export namespace repository {
 }
 
 export namespace service {
-
+	
 	export class RelatedMediaItem {
 	    media: model.Media;
 	    reason: string;
@@ -763,7 +763,7 @@ export namespace service {
 	        this.updated_fields = source["updated_fields"];
 	    }
 	}
-
+	
 	export class ThumbnailTaskEventData {
 	    task_id: string;
 	    media_id: string;
@@ -774,11 +774,11 @@ export namespace service {
 	    phase: string;
 	    message: string;
 	    retryable: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ThumbnailTaskEventData(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.task_id = source["task_id"];
@@ -794,3 +794,4 @@ export namespace service {
 	}
 
 }
+

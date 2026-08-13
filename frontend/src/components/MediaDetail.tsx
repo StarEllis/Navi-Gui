@@ -273,6 +273,9 @@ const isTechnicalTag = (tag: string) => {
     return TECHNICAL_KEYWORDS.some((keyword) => upper.includes(keyword) || tag.includes(keyword));
 };
 
+/** chip 文案比对用：忽略大小写、空白与全半角冒号，用来判断固定 chip 是否已在 NFO 标签里。 */
+const normalizeTagKey = (tag: string) => tag.replace(/[：:]/g, ':').replace(/\s+/g, '').toLowerCase();
+
 /** 技术规格（1080P / HEVC / 中文字幕…）与内容标签分成两档：前者进番号行，后者才做 chip。 */
 const splitDetailTags = (detail: AppMedia) => {
     const rawTags = detail.genres
@@ -905,6 +908,8 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     const detailSeries = detail.series;
     const studioLabel = (detail.studio || detail.publisher || '').trim();
     const makerLabel = (detail.maker || detail.label || '').trim();
+    const contentTagKeys = new Set(contentTags.map(normalizeTagKey));
+    const hasContentTag = (label: string) => contentTagKeys.has(normalizeTagKey(label));
     const metadataPhase = normalizeMetadataPhase(detail.metadata_phase);
     const metadataHint = metadataPhase === 'quick'
         ? '正在后台补全时长、演员和技术信息…'
@@ -1258,7 +1263,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                                             {tag}
                                         </button>
                                     )) : <span className="navi-detail-attr-empty">未分类</span>}
-                                    {detailSeries?.title && (
+                                    {detailSeries?.title && !hasContentTag(`系列: ${detailSeries.title}`) && (
                                         <button
                                             type="button"
                                             className="navi-tag-pill"
@@ -1267,8 +1272,8 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                                             系列: {detailSeries.title}
                                         </button>
                                     )}
-                                    {makerLabel && <span className="navi-tag-pill is-static">片商: {makerLabel}</span>}
-                                    {studioLabel && <span className="navi-tag-pill is-static">发行: {studioLabel}</span>}
+                                    {makerLabel && !hasContentTag(`片商: ${makerLabel}`) && <span className="navi-tag-pill is-static">片商: {makerLabel}</span>}
+                                    {studioLabel && !hasContentTag(`发行: ${studioLabel}`) && <span className="navi-tag-pill is-static">发行: {studioLabel}</span>}
                                 </div>
                             </div>
 

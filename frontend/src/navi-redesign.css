@@ -376,6 +376,15 @@ body {
   display: none;
 }
 
+/* 标题和计数是一组，内部按基线对齐，整组在横栏里居中 */
+.navi-topbar-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+
 .navi-topbar-title {
   margin: 0;
   min-width: 0;
@@ -389,12 +398,23 @@ body {
 }
 
 .navi-topbar-count {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  flex: none;              /* 计数不参与压缩，宁可压标题 */
   white-space: nowrap;
   color: var(--navi-text-dim);
-  font: 500 12px ui-monospace, Menlo, monospace;
+  font: 500 12.5px/1 -apple-system, 'Segoe UI', sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+.navi-topbar-count-sep {
+  width: 3px;
+  height: 3px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: .42;
 }
 
 .navi-topbar-actions {
@@ -2537,4 +2557,440 @@ body {
   text-overflow: ellipsis;
   color: rgba(239, 234, 240, 0.38);
   font: 500 11px ui-monospace, Menlo, monospace;
+}
+
+/* ===== 媒体库编辑弹窗 ===== */
+.library-edit-modal {
+  display: flex;
+  flex-direction: column;
+  width: 508px;
+  max-width: calc(100vw - 48px);
+  max-height: min(620px, 86vh);
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, .09);
+  border-radius: 14px;
+  background: #17161b;
+  box-shadow: 0 30px 80px rgba(0, 0, 0, .75);
+  color: #faf6fb;
+  text-align: left;
+}
+
+/* --- 头部 --- */
+.library-edit-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: none;
+  height: 58px;
+  padding: 0 16px 0 22px;
+  border-bottom: 1px solid rgba(255, 255, 255, .06);
+  font: 700 14.5px/1 -apple-system, 'Segoe UI', sans-serif;
+}
+
+.library-edit-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: rgba(239, 234, 240, .62);
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease;
+}
+
+.library-edit-close:hover {
+  background: rgba(255, 255, 255, .09);
+  color: #faf6fb;
+}
+
+/* --- 主体 --- */
+.library-edit-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 22px 14px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, .09) transparent;
+}
+
+.library-edit-body::-webkit-scrollbar { width: 7px; }
+
+.library-edit-body::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .09);
+}
+
+/* --- 行 --- */
+.library-edit-row {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr);
+  column-gap: 18px;
+  align-items: center;
+  padding: 11px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, .05);
+}
+
+.library-edit-row--paths {
+  align-items: start;
+  padding: 13px 0 4px;
+  border-bottom: 0;
+}
+
+.library-edit-label {
+  color: rgba(239, 234, 240, .42);
+  font: 500 12px/1.4 -apple-system, 'Segoe UI', sans-serif;
+  text-align: right;
+}
+
+.library-edit-row--paths .library-edit-label { padding-top: 7px; }
+
+/* --- 名称输入（深色凹槽，静止透明） --- */
+.library-edit-input {
+  box-sizing: border-box;
+  width: 260px;
+  max-width: 100%;
+  height: 30px;
+  margin: 0;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  outline: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  background-clip: padding-box;
+  box-shadow: inset 0 0 0 1px transparent;
+  color: #efeaf0;
+  font: 600 13.5px/30px -apple-system, 'Segoe UI', sans-serif;
+  caret-color: #4a9eff;
+  text-align: left;
+  transition: background .15s ease, box-shadow .15s ease;
+}
+
+.library-edit-input::placeholder {
+  color: rgba(239, 234, 240, .3);
+  font-weight: 500;
+  opacity: 1;
+}
+
+.library-edit-input::selection {
+  background: rgba(74, 158, 255, .32);
+  color: #fff;
+}
+
+.library-edit-input:hover:not(:focus) {
+  background: rgba(0, 0, 0, .16);
+}
+
+.library-edit-input:focus {
+  background: rgba(0, 0, 0, .3);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .12);
+}
+
+/* --- 分段控件（视图） --- */
+.library-edit-segment {
+  display: inline-flex;
+  align-items: stretch;
+  width: max-content;
+  height: 26px;
+  padding: 2px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .05);
+}
+
+.library-edit-segment button {
+  padding: 0 13px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(239, 234, 240, .5);
+  font: 500 12px -apple-system, 'Segoe UI', sans-serif;
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease;
+}
+
+.library-edit-segment button:hover { color: #faf6fb; }
+
+.library-edit-segment button[aria-pressed='true'] {
+  background: rgba(255, 255, 255, .13);
+  color: #faf6fb;
+  font-weight: 600;
+}
+
+/* --- 卡片文字：两个下拉 --- */
+.library-edit-pickers {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.library-edit-pickers-sep {
+  color: rgba(239, 234, 240, .26);
+  font: 400 12px ui-monospace, Menlo, monospace;
+}
+
+/* 原生 select 包一层，保留原生弹出菜单，只换外观 */
+.library-edit-picker {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, .05);
+  transition: background .15s ease;
+}
+
+.library-edit-picker:hover { background: rgba(255, 255, 255, .1); }
+
+.library-edit-picker select {
+  height: 26px;
+  padding: 0 27px 0 10px;
+  border: 0;
+  outline: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #efeaf0;
+  font: 600 13px -apple-system, 'Segoe UI', sans-serif;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.library-edit-picker select option {
+  background: #17161b;
+  color: #efeaf0;
+}
+
+.library-edit-picker::after {
+  content: '';
+  position: absolute;
+  right: 10px;
+  width: 7px;
+  height: 7px;
+  border-right: 1.6px solid rgba(239, 234, 240, .42);
+  border-bottom: 1.6px solid rgba(239, 234, 240, .42);
+  transform: translateY(-2px) rotate(45deg);
+  pointer-events: none;
+}
+
+/* --- 路径列表 --- */
+.library-path-list {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.library-path-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 32px;
+  padding: 0 8px 0 10px;
+  border-radius: 8px;
+  transition: background .15s ease;
+}
+
+.library-path-row:hover { background: rgba(255, 255, 255, .045); }
+
+.library-path-row .icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: rgba(239, 234, 240, .32);
+}
+
+/* direction:rtl 让长路径从左侧省略，保住结尾的文件夹名 */
+.library-path-row .path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  direction: rtl;
+  color: #e4dfe6;
+  font: 400 12px/1 ui-monospace, Menlo, monospace;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.library-path-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(239, 234, 240, .34);
+  cursor: pointer;
+  opacity: 0;
+  transition: background .15s ease, color .15s ease, opacity .15s ease;
+}
+
+.library-path-row:hover .library-path-remove { opacity: 1; }
+
+.library-path-remove:hover {
+  background: rgba(201, 90, 90, .2);
+  color: #ffbdbd;
+}
+
+/* 键盘可达：opacity:0 的按钮 focus 时必须现形 */
+.library-path-remove:focus-visible {
+  opacity: 1;
+  outline: 1px solid rgba(255, 255, 255, .3);
+  outline-offset: 1px;
+}
+
+.library-path-empty {
+  color: rgba(239, 234, 240, .36);
+  font: 400 12px/1.5 -apple-system, 'Segoe UI', sans-serif;
+}
+
+.library-path-empty.invalid { color: #e08a8a; }
+
+/* --- 添加路径 --- */
+.library-edit-path-add {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.library-edit-browse-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px dashed rgba(255, 255, 255, .18);
+  border-radius: 8px;
+  background: transparent;
+  color: rgba(239, 234, 240, .72);
+  font: 600 12px -apple-system, 'Segoe UI', sans-serif;
+  cursor: pointer;
+  transition: background .15s ease, border-color .15s ease, color .15s ease;
+}
+
+.library-edit-browse-btn:hover {
+  border-color: rgba(255, 255, 255, .32);
+  background: rgba(255, 255, 255, .04);
+  color: #faf6fb;
+}
+
+.library-edit-manual-input {
+  box-sizing: border-box;
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, .09);
+  border-radius: 8px;
+  outline: 0;
+  background: rgba(0, 0, 0, .24);
+  color: #efeaf0;
+  font: 400 12px ui-monospace, Menlo, monospace;
+}
+
+.library-edit-manual-input::placeholder {
+  color: rgba(239, 234, 240, .28);
+  opacity: 1;
+}
+
+.library-edit-manual-input:focus { border-color: rgba(255, 255, 255, .2); }
+
+/* --- 校验红字 --- */
+.library-edit-error {
+  grid-column: 2;
+  margin-top: 6px;
+  color: #e08a8a;
+  font: 500 11.5px/1.4 -apple-system, 'Segoe UI', sans-serif;
+}
+
+/* --- 页脚 --- */
+.library-edit-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex: none;
+  height: 60px;
+  padding: 0 18px 0 20px;
+  border-top: 1px solid rgba(255, 255, 255, .06);
+  background: rgba(0, 0, 0, .16);
+}
+
+.library-edit-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.library-edit-footer-btn {
+  height: 32px;
+  padding: 0 14px;
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .05);
+  color: #efeaf0;
+  font: 600 12.5px -apple-system, 'Segoe UI', sans-serif;
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease;
+}
+
+.library-edit-footer-btn:hover { background: rgba(255, 255, 255, .1); }
+
+.library-edit-footer-btn.quiet {
+  padding: 0 12px;
+  border: 0;
+  background: transparent;
+  color: rgba(239, 234, 240, .5);
+}
+
+.library-edit-footer-btn.quiet:hover {
+  background: rgba(255, 255, 255, .07);
+  color: #faf6fb;
+}
+
+.library-edit-footer-btn.primary {
+  padding: 0 18px;
+  border: 0;
+  background: #4a9eff;
+  color: #fff;
+  font-weight: 700;
+}
+
+.library-edit-footer-btn.primary:hover { background: #63acff; }
+
+.library-edit-footer-btn.primary:disabled {
+  background: rgba(74, 158, 255, .4);
+  color: rgba(255, 255, 255, .6);
+  cursor: not-allowed;
+}
+
+.library-edit-footer-btn.danger {
+  height: 30px;
+  padding: 0 6px;
+  border: 0;
+  background: transparent;
+  color: rgba(214, 120, 120, .82);
+}
+
+.library-edit-footer-btn.danger:hover {
+  background: rgba(201, 90, 90, .16);
+  color: #ffbdbd;
+}
+
+.library-edit-msg {
+  color: #e08a8a;
+  font: 500 11.5px/1.4 -apple-system, 'Segoe UI', sans-serif;
 }

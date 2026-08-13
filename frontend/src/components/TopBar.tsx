@@ -389,9 +389,20 @@ const TopBar: React.FC<TopBarProps> = ({
                     </button>
                 )}
 
-                <h2 className="navi-topbar-title" title={title}>{title}</h2>
+                <div className="navi-topbar-heading">
+                    <h2 className="navi-topbar-title" title={title}>{title}</h2>
 
-                {stats && <span className="navi-topbar-count">{stats}</span>}
+                    {stats && (
+                        <span className="navi-topbar-count">
+                            {stats.split(' · ').map((part, i) => (
+                                <React.Fragment key={part + i}>
+                                    {i > 0 && <i className="navi-topbar-count-sep" aria-hidden="true" />}
+                                    <span>{part}</span>
+                                </React.Fragment>
+                            ))}
+                        </span>
+                    )}
+                </div>
 
                 {hasFilterChip && (
                     <div className="navi-filter-chip">
