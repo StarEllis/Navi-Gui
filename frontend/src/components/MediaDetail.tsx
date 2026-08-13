@@ -6,6 +6,7 @@ import {
     GetNFOEditorData,
     OpenMediaFolder,
     PlayMedia,
+    RestartMedia,
     SaveNFOEditorData,
     ToggleFavorite,
     ToggleWatched,
@@ -17,13 +18,17 @@ import {
     ChevronDown,
     ChevronLeft,
     ChevronRight,
+    Copy,
     Eye,
     EyeOff,
-    FileEdit,
+    FilePenLine,
+    FileVideo,
     FolderOpen,
     Play,
+    RotateCcw,
     Star,
     Trash2,
+    UserRound,
 } from 'lucide-react';
 import NFOEditModal from './NFOEditModal';
 import RecommendationRail from './RecommendationRail';
@@ -52,6 +57,7 @@ import {
 interface MediaDetailProps {
     media: AppMedia;
     mediaStateUpdate?: MediaStateUpdate | null;
+    libraryName?: string;
     onClose: () => void;
     onSelectMedia: (media: AppMedia) => void;
     onSelectFilter: (filter: MediaFilter) => void;
@@ -70,6 +76,27 @@ interface CopyFeedback {
 }
 
 type DetailImageRole = 'poster' | 'backdrop';
+
+const DETAIL_STICKY_HEIGHT = 60;
+const RESUME_PROGRESS_LIMIT = 90;
+
+const formatFileSize = (bytes?: number) => {
+    if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0) {
+        return '';
+    }
+    const gb = 1024 ** 3;
+    return bytes >= gb
+        ? `${(bytes / gb).toFixed(2)} GB`
+        : `${(bytes / (1024 ** 2)).toFixed(1)} MB`;
+};
+
+const formatDateOnly = (value: unknown) => {
+    if (typeof value !== 'string' || !value.trim()) {
+        return '';
+    }
+    const match = value.trim().match(/^\d{4}-\d{2}-\d{2}/);
+    return match?.[0] || '';
+};
 
 const imageTokenPattern = /[-_.\s]+/;
 const coverTokens = ['cover', 'folder', 'thumb', 'movie', 'show'];
@@ -229,21 +256,28 @@ const normalizeActors = (detail: AppMedia): DetailActor[] => {
     return [];
 };
 
-const normalizeTags = (detail: AppMedia) => {
+const TECHNICAL_KEYWORDS = [
+    '4K', '1080P', '720P', 'UHD', 'HD', 'FHD', 'SD',
+    'H265', 'HEVC', 'H264', 'X264', 'X265', 'AV1', 'HDR',
+    '中文字幕', '字幕', '60FPS', 'FPS', '无码', '破解', '流出', 'REMUX', 'WEB-DL',
+];
+
+const CORE_KEYWORDS = [
+    '剧情', '恋爱', '人妻', '素人', '学生', '老师', '护士', '秘书', 'OL',
+    '校园', '职场', '旅行', '温泉', '家庭', '情侣', '制服', '巨乳',
+    '熟女', '姐姐', '妹妹', '偶像', '角色', '人物',
+];
+
+const isTechnicalTag = (tag: string) => {
+    const upper = tag.toUpperCase();
+    return TECHNICAL_KEYWORDS.some((keyword) => upper.includes(keyword) || tag.includes(keyword));
+};
+
+/** 技术规格（1080P / HEVC / 中文字幕…）与内容标签分成两档：前者进番号行，后者才做 chip。 */
+const splitDetailTags = (detail: AppMedia) => {
     const rawTags = detail.genres
         ? String(detail.genres).split(/[,，/]/).map((tag: string) => tag.trim()).filter(Boolean)
         : [];
-
-    const technicalKeywords = [
-        '4K', '1080P', '720P', 'UHD', 'HD', 'FHD', 'SD',
-        'H265', 'HEVC', 'H264', 'X264', 'X265', 'AV1', 'HDR',
-        '中文字幕', '字幕', '60FPS', 'FPS', '无码', '流出', 'REMUX', 'WEB-DL',
-    ];
-    const coreKeywords = [
-        '剧情', '恋爱', '人妻', '素人', '学生', '老师', '护士', '秘书', 'OL',
-        '校园', '职场', '旅行', '温泉', '家庭', '情侣', '制服', '巨乳',
-        '熟女', '姐姐', '妹妹', '偶像', '角色', '人物',
-    ];
 
     const seen = new Set<string>();
     const uniqueTags = rawTags.filter((tag: string) => {
@@ -256,19 +290,37 @@ const normalizeTags = (detail: AppMedia) => {
     });
 
     const scoreTag = (tag: string) => {
-        const upper = tag.toUpperCase();
-        const isTechnical = technicalKeywords.some((keyword) => upper.includes(keyword) || tag.includes(keyword));
-        if (isTechnical) {
-            return 200 + tag.length;
-        }
-        const isCore = coreKeywords.some((keyword) => tag.includes(keyword));
-        if (isCore) {
-            return tag.length;
-        }
-        return 80 + tag.length;
+        const isCore = CORE_KEYWORDS.some((keyword) => tag.includes(keyword));
+        return (isCore ? 0 : 80) + tag.length;
     };
 
-    return uniqueTags.sort((left: string, right: string) => scoreTag(left) - scoreTag(right));
+    return {
+        technical: uniqueTags.filter(isTechnicalTag),
+        content: uniqueTags
+            .filter((tag: string) => !isTechnicalTag(tag))
+            .sort((left: string, right: string) => scoreTag(left) - scoreTag(right)),
+    };
+};
+
+/** 番号行右侧那串规格：分辨率、编码在前，NFO 里的技术标签在后，忽略大小写去重。 */
+const buildTechnicalSpecs = (detail: AppMedia, technicalTags: string[]) => {
+    const specs: string[] = [];
+    const seen = new Set<string>();
+
+    [detail.resolution, detail.video_codec, ...technicalTags].forEach((value) => {
+        const text = (typeof value === 'string' ? value : '').trim();
+        if (!text) {
+            return;
+        }
+        const key = text.toUpperCase();
+        if (seen.has(key)) {
+            return;
+        }
+        seen.add(key);
+        specs.push(/^[a-z0-9.\-]+$/i.test(text) ? key : text);
+    });
+
+    return specs;
 };
 
 const getRecommendationMediaKey = (item: RecommendationItem) => {
@@ -353,6 +405,7 @@ const applyKnownMediaStatesToRecommendations = (
 const MediaDetail: React.FC<MediaDetailProps> = ({
     media,
     mediaStateUpdate,
+    libraryName,
     onClose,
     onSelectMedia,
     onSelectFilter,
@@ -360,6 +413,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     onMediaDelete,
 }) => {
     const [detail, setDetail] = useState(media);
+    const [isOverviewExpanded, setIsOverviewExpanded] = useState(false);
     const [msg, setMsg] = useState('');
     const [files, setFiles] = useState<string[]>([]);
     const [previews, setPreviews] = useState<string[]>([]);
@@ -373,11 +427,12 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     const [nfoSaving, setNfoSaving] = useState(false);
     const [previewViewerIndex, setPreviewViewerIndex] = useState<number | null>(null);
     const [codeCopyFeedback, setCodeCopyFeedback] = useState<CopyFeedback | null>(null);
+    const [isStickyBarVisible, setIsStickyBarVisible] = useState(false);
     const fileDropdownRef = useRef<HTMLDivElement | null>(null);
-    const chipRowRef = useRef<HTMLDivElement | null>(null);
-    const chipStripRef = useRef<HTMLDivElement | null>(null);
-    const previewStripRef = useRef<HTMLDivElement | null>(null);
     const codeCopyTimerRef = useRef<number | null>(null);
+    // 详情页整页滚动容器，同时是吸顶栏 IntersectionObserver 的 root
+    const scrollRef = useRef<HTMLDivElement | null>(null);
+    const titleRef = useRef<HTMLHeadingElement | null>(null);
     const mediaStateByIDRef = useRef(new Map<string, MediaStateUpdate>());
 
     const showMsg = (message: string) => {
@@ -448,7 +503,13 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
         setRecommendations(emptyRecommendations);
         setRecommendationLoading(true);
         setCodeCopyFeedback(null);
+        setIsOverviewExpanded(false);
+        setIsStickyBarVisible(false);
         clearCodeCopyFeedbackTimer();
+        // 从推荐位跳到下一部时，详情页得回到首屏，否则吸顶栏一进来就是显示态。
+        if (scrollRef.current) {
+            scrollRef.current.scrollTop = 0;
+        }
 
         GetDetailRecommendations(media.id, 12)
             .then((nextRecommendations) => {
@@ -526,6 +587,25 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
         };
     }, []);
 
+    // 首屏标题滚出可视区后，吸顶栏才淡入。
+    useEffect(() => {
+        const scrollNode = scrollRef.current;
+        const titleNode = titleRef.current;
+        if (!scrollNode || !titleNode) {
+            return;
+        }
+
+        const observer = new IntersectionObserver(
+            ([entry]) => setIsStickyBarVisible(!entry.isIntersecting),
+            { root: scrollNode, rootMargin: `-${DETAIL_STICKY_HEIGHT}px 0px 0px 0px`, threshold: 0 },
+        );
+        observer.observe(titleNode);
+
+        return () => {
+            observer.disconnect();
+        };
+    }, []);
+
     useEffect(() => {
         if (previewViewerIndex === null) {
             return;
@@ -568,48 +648,6 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
             setPreviewViewerIndex(previews.length > 0 ? previews.length - 1 : null);
         }
     }, [previewViewerIndex, previews.length]);
-
-    useEffect(() => {
-        const chipRow = chipRowRef.current;
-        if (!chipRow) {
-            return;
-        }
-
-        const handleWheel = (event: WheelEvent) => {
-            if (!scrollHorizontalContainer(chipStripRef.current, event.deltaX, event.deltaY)) {
-                return;
-            }
-
-            event.preventDefault();
-            event.stopPropagation();
-        };
-
-        chipRow.addEventListener('wheel', handleWheel, { passive: false, capture: true });
-        return () => {
-            chipRow.removeEventListener('wheel', handleWheel, true);
-        };
-    }, []);
-
-    useEffect(() => {
-        const previewStrip = previewStripRef.current;
-        if (!previewStrip) {
-            return;
-        }
-
-        const handleWheel = (event: WheelEvent) => {
-            if (!scrollHorizontalContainer(previewStrip, event.deltaX, event.deltaY)) {
-                return;
-            }
-
-            event.preventDefault();
-            event.stopPropagation();
-        };
-
-        previewStrip.addEventListener('wheel', handleWheel, { passive: false, capture: true });
-        return () => {
-            previewStrip.removeEventListener('wheel', handleWheel, true);
-        };
-    }, [previews.length]);
 
     useEffect(() => {
         return () => {
@@ -675,6 +713,33 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
         } catch (error) {
             console.error(error);
             showMsg(`播放失败：${formatError(error)}`);
+        }
+    };
+
+    const handleRestart = async () => {
+        const targetPath = (currFilePath || detail.file_path || media.file_path || '').trim();
+        if (!targetPath) {
+            showMsg('播放失败：当前没有可播放文件');
+            return;
+        }
+
+        try {
+            showMsg(`正在从头播放：${targetPath.split(/[\\/]/).pop()}`);
+            await RestartMedia(detail.id, targetPath);
+            setDetail((currentDetail) => {
+                const nextDetail = {
+                    ...currentDetail,
+                    position: 0,
+                    progress_percent: 0,
+                    playback_state: 'starting',
+                };
+                mergeMediaDetailCacheEntry(nextDetail);
+                onMediaChange?.(nextDetail);
+                return nextDetail;
+            });
+        } catch (error) {
+            console.error(error);
+            showMsg(`从头播放失败：${formatError(error)}`);
         }
     };
 
@@ -770,28 +835,6 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
         }
     };
 
-    const scrollHorizontalContainer = (
-        container: HTMLDivElement | null,
-        deltaX: number,
-        deltaY: number,
-    ) => {
-        if (!container) {
-            return false;
-        }
-
-        if (container.scrollWidth <= container.clientWidth) {
-            return false;
-        }
-
-        const delta = Math.abs(deltaX) > Math.abs(deltaY) ? deltaX : deltaY;
-        if (delta === 0) {
-            return false;
-        }
-
-        container.scrollLeft += delta;
-        return true;
-    };
-
     const handleOpenPreviewViewer = (index: number) => {
         setPreviewViewerIndex(index);
     };
@@ -818,14 +861,14 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
         });
     };
 
-    const handleCopyMediaCode = async (event: React.MouseEvent<HTMLButtonElement>) => {
-        const code = getMediaCode(detail, currFilePath).trim();
-        if (!code) {
+    const copyTextWithFeedback = async (text: string, event: React.MouseEvent<HTMLButtonElement>) => {
+        const value = text.trim();
+        if (!value) {
             return;
         }
 
         try {
-            const copied = await ClipboardSetText(code);
+            const copied = await ClipboardSetText(value);
             if (!copied) {
                 clearCodeCopyFeedbackTimer();
                 setCodeCopyFeedback(null);
@@ -855,10 +898,13 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     const posterUrl = posterPath ? toLocalAssetUrl(posterPath) : '';
     const backdropUrl = backdropPath ? toLocalAssetUrl(backdropPath) : '';
     const actors = normalizeActors(detail);
-    const tags = normalizeTags(detail);
+    const { technical: technicalTags, content: contentTags } = splitDetailTags(detail);
+    const technicalSpecs = buildTechnicalSpecs(detail, technicalTags);
     const filename = currFilePath?.split(/[\\/]/).pop() || '未知文件';
     const mediaCode = getMediaCode(detail, currFilePath);
     const detailSeries = detail.series;
+    const studioLabel = (detail.studio || detail.publisher || '').trim();
+    const makerLabel = (detail.maker || detail.label || '').trim();
     const metadataPhase = normalizeMetadataPhase(detail.metadata_phase);
     const metadataHint = metadataPhase === 'quick'
         ? '正在后台补全时长、演员和技术信息…'
@@ -874,232 +920,406 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     const mergedRecommendations = mergeRecommendationItems(recommendations);
     const playbackProgress = getMediaProgressPercent(detail);
     const playbackDuration = detail.watch_duration || detail.duration;
-    const showPlaybackProgress = playbackProgress !== null
-        && (playbackProgress > 0 || typeof detail.revision === 'number');
+    const showPlaybackProgress = playbackProgress !== null && playbackProgress > 0;
+    const resumePosition = typeof detail.position === 'number' && detail.position > 0 ? detail.position : 0;
+    const isPlaybackComplete = resumePosition > 0
+        && playbackProgress !== null
+        && playbackProgress >= RESUME_PROGRESS_LIMIT;
+    const hasResumePoint = resumePosition > 0 && !isPlaybackComplete;
+    const playLabel = isPlaybackComplete
+        ? '重新观看'
+        : hasResumePoint
+            ? `继续播放 ${formatPlaybackTime(resumePosition)}`
+            : '播放';
+    const primaryActor = actors[0];
+    const runtimeLabel = detail.duration
+        ? `${Math.floor(detail.duration / 60)} min`
+        : (detail.runtime ? `${detail.runtime} min` : getMetadataFallback(detail, '未知'));
+    const releaseLabel = studioLabel || makerLabel || getMetadataFallback(detail, '未知');
+    const releaseDateLabel = detail.release_date_normalized || detail.year || getMetadataFallback(detail, '未知');
+    const fileSizeLabel = formatFileSize(detail.file_size);
+    const addedDateLabel = formatDateOnly(detail.created_at);
+    const hasFileFacts = Boolean(fileSizeLabel || addedDateLabel);
+    const isOverviewCollapsible = overviewText.length > 90;
 
     return (
         <>
-            <div className="detail-workspace">
-                <div className="detail-backdrop-layer" aria-hidden="true">
-                    {backdropUrl && (
-                        <>
-                            <div
-                                className="detail-backdrop-image"
-                                style={{ backgroundImage: `url("${backdropUrl}")` }}
-                            />
-                            <div className="detail-backdrop-overlay" />
-                        </>
-                    )}
-                </div>
+            <div className="navi-detail">
+                <div
+                    className="navi-detail-backdrop"
+                    aria-hidden="true"
+                    style={backdropUrl ? { backgroundImage: `url("${backdropUrl}")` } : undefined}
+                />
+                <div className="navi-detail-scrim" aria-hidden="true" />
 
-                <div className="detail-drag-zone" onDoubleClick={WindowToggleMaximise} />
+                <div className="navi-detail-body" ref={scrollRef}>
+                    <div
+                        className={`navi-detail-sticky ${isStickyBarVisible ? 'visible' : ''}`.trim()}
+                        onDoubleClick={WindowToggleMaximise}
+                    >
+                        <button
+                            type="button"
+                            className="navi-sticky-back"
+                            onClick={onClose}
+                            title="返回列表"
+                            aria-label="返回列表"
+                        >
+                            <ArrowLeft size={16} />
+                        </button>
 
-                <div className="detail-main">
-                    <div className="detail-hero">
-                        <div className="detail-poster-section">
-                            {posterUrl ? (
-                                <img src={posterUrl} className="detail-poster" alt="poster" />
-                            ) : (
-                                <div className="detail-poster no-poster">No Poster</div>
+                        <div className="navi-sticky-poster" aria-hidden="true">
+                            {posterUrl && <img src={posterUrl} alt="" />}
+                        </div>
+
+                        <div className="navi-sticky-copy">
+                            <div className="navi-sticky-code">{mediaCode}</div>
+                            <div className="navi-sticky-title" title={detail.title}>{detail.title}</div>
+                        </div>
+
+                        <div className="navi-sticky-actions">
+                            <button type="button" className="navi-sticky-play" onClick={handlePlay}>
+                                <Play size={14} fill="currentColor" />
+                                <span>{playLabel}</span>
+                            </button>
+                            <button
+                                type="button"
+                                className={`navi-sticky-fav ${detail.is_favorite ? 'on' : ''}`.trim()}
+                                onClick={handleFav}
+                                title={detail.is_favorite ? '已收藏' : '收藏'}
+                                aria-label={detail.is_favorite ? '已收藏' : '收藏'}
+                            >
+                                <Star size={15} fill={detail.is_favorite ? 'currentColor' : 'none'} />
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="navi-detail-topbar" onDoubleClick={WindowToggleMaximise}>
+                        <button type="button" className="navi-back-btn" onClick={onClose} title="返回列表" aria-label="返回列表">
+                            <ArrowLeft size={15} />
+                        </button>
+
+                        <div className="navi-breadcrumb">
+                            {libraryName && (
+                                <>
+                                    <span className="navi-breadcrumb-link" title={libraryName}>{libraryName}</span>
+                                    <span>/</span>
+                                </>
                             )}
+                            {primaryActor && (
+                                <>
+                                    <button
+                                        type="button"
+                                        className="navi-breadcrumb-link"
+                                        onClick={() => onSelectFilter({
+                                            type: 'actor',
+                                            value: primaryActor.id || primaryActor.name,
+                                            label: primaryActor.name,
+                                        })}
+                                    >
+                                        {primaryActor.name}
+                                    </button>
+                                    <span>/</span>
+                                </>
+                            )}
+                            <span className="navi-breadcrumb-current">{mediaCode}</span>
                         </div>
 
-                        <div className="detail-info-section">
-                            <div className="detail-info-surface">
-                        <div className="detail-header-row">
-                            <div className="detail-title">{detail.title}</div>
-                            {msg && <span className="detail-status-msg">{msg}</span>}
+                        {msg && <span className="navi-detail-status">{msg}</span>}
+                    </div>
+
+                    <div className="navi-detail-hero">
+                        <div className="navi-detail-aside">
+                            <div className="navi-detail-poster">
+                                {posterUrl && <img src={posterUrl} alt="poster" />}
+                            </div>
                         </div>
 
-                        <div className="detail-toolbar">
-                            <button className="toolbar-btn danger" title="仅从数据库移除这条记录，不删除本地文件" onClick={handleDelete}><Trash2 size={16} /></button>
-                            <button className="toolbar-btn" title="打开文件所在目录" onClick={handleOpenDir}><FolderOpen size={16} /></button>
-                            <button className="toolbar-btn" title="编辑 NFO" onClick={handleOpenNFO}><FileEdit size={16} /></button>
-                            <button className="toolbar-btn primary" title="播放当前选中文件" onClick={handlePlay}><Play size={16} fill="currentColor" /></button>
-                            <button className="toolbar-btn" title="返回列表" onClick={onClose}><ArrowLeft size={16} /></button>
-                            <div className="toolbar-divider" />
-                            <button className="toolbar-btn" title={detail.is_favorite ? '取消收藏' : '收藏'} onClick={handleFav}>
-                                <Star size={16} fill={detail.is_favorite ? "var(--accent)" : "none"} color={detail.is_favorite ? "var(--accent)" : "currentColor"} />
-                            </button>
-                            <button className="toolbar-btn" title={detail.is_watched ? '标记未看' : '标记已看'} onClick={handleWatched}>
-                                {detail.is_watched ? <EyeOff size={16} /> : <Eye size={16} />}
-                            </button>
-                        </div>
-
-                        <div className="detail-file-row">
-                            <div className="detail-file-dropdown" ref={fileDropdownRef}>
+                        <div className="navi-detail-main">
+                            <div className="navi-detail-eyebrow">
+                                {showPlaybackProgress && playbackProgress !== null && (
+                                    <span className="navi-detail-progress-chip">看到 {Math.round(playbackProgress)}%</span>
+                                )}
                                 <button
                                     type="button"
-                                    className={`detail-file-select ${showFileMenu ? 'open' : ''}`}
-                                    onClick={() => setShowFileMenu((open) => !open)}
+                                    className="navi-detail-code"
+                                    onClick={(event) => void copyTextWithFeedback(mediaCode, event)}
+                                    aria-label={`Copy code ${mediaCode}`}
+                                    title="点击复制"
                                 >
-                                    <span className="file-active-name" title={currFilePath}>{filename}</span>
-                                    <ChevronDown size={14} className={`chevron ${showFileMenu ? 'open' : ''}`} />
+                                    {mediaCode}
+                                </button>
+                                {technicalSpecs.length > 0 && (
+                                    <span className="navi-detail-specs">{technicalSpecs.join(' · ')}</span>
+                                )}
+                            </div>
+
+                            <h1 className="navi-detail-title" ref={titleRef}>{detail.title}</h1>
+
+                            <div className="navi-detail-actions">
+                                <div className="navi-detail-play-group">
+                                    <button type="button" className="main" onClick={handlePlay}>
+                                        <Play size={17} fill="currentColor" />
+                                        <span>{playLabel}</span>
+                                    </button>
+                                    {hasResumePoint && (
+                                        <button
+                                            type="button"
+                                            className="restart"
+                                            title="从头重看"
+                                            aria-label="从头重看"
+                                            onClick={handleRestart}
+                                        >
+                                            <RotateCcw size={16} />
+                                        </button>
+                                    )}
+                                </div>
+                                <button
+                                    type="button"
+                                    className={`navi-outline-btn ${detail.is_favorite ? 'on' : ''}`.trim()}
+                                    onClick={handleFav}
+                                >
+                                    <Star size={16} fill={detail.is_favorite ? 'currentColor' : 'none'} />
+                                    <span>{detail.is_favorite ? '已收藏' : '收藏'}</span>
+                                </button>
+                                <button
+                                    type="button"
+                                    className={`navi-outline-btn ${detail.is_watched ? 'on' : ''}`.trim()}
+                                    onClick={handleWatched}
+                                >
+                                    {detail.is_watched ? <EyeOff size={16} /> : <Eye size={16} />}
+                                    <span>{detail.is_watched ? '标记未看' : '标记已看'}</span>
                                 </button>
 
-                                {showFileMenu && (
-                                    <div className="file-dropdown-menu">
-                                        {files.map((file, index) => (
+                                <span className="navi-detail-actions-divider" aria-hidden="true" />
+
+                                <button
+                                    type="button"
+                                    className="navi-file-btn"
+                                    title="打开文件所在目录"
+                                    aria-label="打开文件所在目录"
+                                    onClick={handleOpenDir}
+                                >
+                                    <FolderOpen size={16} />
+                                </button>
+                                <button
+                                    type="button"
+                                    className="navi-file-btn"
+                                    title="编辑 NFO"
+                                    aria-label="编辑 NFO"
+                                    onClick={handleOpenNFO}
+                                >
+                                    <FilePenLine size={16} />
+                                </button>
+                                <button
+                                    type="button"
+                                    className="navi-file-btn danger"
+                                    title="仅从数据库移除这条记录，不删除本地文件"
+                                    aria-label="从数据库移除"
+                                    onClick={handleDelete}
+                                >
+                                    <Trash2 size={16} />
+                                </button>
+                            </div>
+
+                            <div className="navi-detail-file-block">
+                                <div className="navi-detail-file" ref={fileDropdownRef}>
+                                    <FileVideo size={15} />
+                                    <span className="navi-detail-file-name" title={currFilePath}>{filename}</span>
+
+                                    {files.length > 1 && (
+                                        <>
+                                            <span className="navi-detail-file-count">{files.length} 个文件</span>
                                             <button
-                                                key={`${file}-${index}`}
                                                 type="button"
-                                                className={`file-menu-item ${file === currFilePath ? 'active' : ''}`}
-                                                onClick={() => {
-                                                    setCurrFilePath(file);
-                                                    setShowFileMenu(false);
-                                                }}
+                                                className="navi-detail-file-toggle"
+                                                title="切换文件"
+                                                aria-label="切换文件"
+                                                onClick={() => setShowFileMenu((open) => !open)}
                                             >
-                                                <span className="file-item-name">{file.split(/[\\/]/).pop()}</span>
-                                                {file === currFilePath && <Check size={12} color="var(--accent)" />}
+                                                <ChevronDown size={14} />
                                             </button>
-                                        ))}
+                                        </>
+                                    )}
+
+                                    <button
+                                        type="button"
+                                        className="navi-detail-file-toggle"
+                                        title="复制完整路径"
+                                        aria-label="复制完整路径"
+                                        onClick={(event) => void copyTextWithFeedback(currFilePath, event)}
+                                    >
+                                        <Copy size={13} />
+                                    </button>
+
+                                    {showFileMenu && (
+                                        <div className="navi-detail-file-menu">
+                                            {files.map((file, index) => (
+                                                <button
+                                                    key={`${file}-${index}`}
+                                                    type="button"
+                                                    className={`navi-detail-file-item ${file === currFilePath ? 'active' : ''}`.trim()}
+                                                    onClick={() => {
+                                                        setCurrFilePath(file);
+                                                        setShowFileMenu(false);
+                                                    }}
+                                                >
+                                                    <span>{file.split(/[\\/]/).pop()}</span>
+                                                    {file === currFilePath && <Check size={12} />}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+
+                                {showPlaybackProgress && playbackProgress !== null && (
+                                    <div
+                                        className="navi-detail-timeline"
+                                        data-playback-state={detail.playback_state || ''}
+                                        role="progressbar"
+                                        aria-label="Playback progress"
+                                        aria-valuemin={0}
+                                        aria-valuemax={100}
+                                        aria-valuenow={Math.round(playbackProgress)}
+                                    >
+                                        <span>{formatPlaybackTime(detail.position)}</span>
+                                        <div className="navi-detail-timeline-track">
+                                            <span style={{ width: `${playbackProgress}%` }} />
+                                        </div>
+                                        <span>{formatPlaybackTime(playbackDuration)}</span>
                                     </div>
                                 )}
                             </div>
-                        </div>
 
-                        {showPlaybackProgress && (
-                            <div className="detail-playback-progress" data-playback-state={detail.playback_state || ''}>
-                                <div className="detail-playback-progress-copy">
-                                    <span>{formatPlaybackTime(detail.position)} / {formatPlaybackTime(playbackDuration)}</span>
-                                    <span>{Math.round(playbackProgress)}%</span>
+                            {metadataHint && (
+                                <div className={`navi-detail-hint ${metadataPhase}`}>
+                                    {metadataHint}
                                 </div>
-                                <div
-                                    className="playback-progress-track detail-playback-progress-track"
-                                    role="progressbar"
-                                    aria-label="Playback progress"
-                                    aria-valuemin={0}
-                                    aria-valuemax={100}
-                                    aria-valuenow={Math.round(playbackProgress)}
-                                >
-                                    <span className="playback-progress-value" style={{ width: `${playbackProgress}%` }} />
-                                </div>
-                            </div>
-                        )}
+                            )}
 
-                        {metadataHint && (
-                            <div className={`detail-metadata-hint ${metadataPhase}`}>
-                                {metadataHint}
-                            </div>
-                        )}
-
-                        <div className="detail-meta-grid">
-                            <div className="meta-row">
-                                <span className="meta-label">编号</span>
-                                <div className="meta-value meta-copy-wrap">
-                                    <button
-                                        type="button"
-                                        className="meta-copy-button highlight"
-                                        onClick={handleCopyMediaCode}
-                                        aria-label={`Copy code ${mediaCode}`}
-                                        title={'\u70b9\u51fb\u590d\u5236'}
-                                    >
-                                        {mediaCode}
-                                    </button>
+                            <div className="navi-detail-facts">
+                                <div className="navi-detail-fact">
+                                    <div className="k">日期</div>
+                                    <div className="v">{releaseDateLabel}</div>
                                 </div>
+                                <div className="navi-detail-fact">
+                                    <div className="k">时长</div>
+                                    <div className="v">{runtimeLabel}</div>
+                                </div>
+                                <div className="navi-detail-fact">
+                                    <div className="k">发行</div>
+                                    <div className="v">{releaseLabel}</div>
+                                </div>
+                                {hasFileFacts && (
+                                    <>
+                                        <div className="sep" aria-hidden="true" />
+                                        {fileSizeLabel && (
+                                            <div className="navi-detail-fact">
+                                                <div className="k k--file">文件大小</div>
+                                                <div className="v v--file">{fileSizeLabel}</div>
+                                            </div>
+                                        )}
+                                        {addedDateLabel && (
+                                            <div className="navi-detail-fact">
+                                                <div className="k k--file">加入时间</div>
+                                                <div className="v v--file">{addedDateLabel}</div>
+                                            </div>
+                                        )}
+                                    </>
+                                )}
                             </div>
-                            <div className="meta-row">
-                                <span className="meta-label">日期</span>
-                                <span className="meta-value">{detail.release_date_normalized || detail.year || '未知'}</span>
-                            </div>
-                            <div className="meta-row">
-                                <span className="meta-label">时长</span>
-                                <span className="meta-value">
-                                    {detail.duration ? `${Math.floor(detail.duration / 60)} min` : (detail.runtime ? `${detail.runtime} min` : '未知')}
-                                </span>
-                            </div>
-                            <div className="meta-row chips-row">
-                                <span className="meta-label">演员</span>
-                                <div className="meta-value actor-chip-strip">
+
+                            <div className="navi-detail-attr">
+                                <div className="k">演员</div>
+                                <div className="navi-detail-attr-values">
                                     {actors.length > 0 ? actors.map((actor: DetailActor, index: number) => (
                                         <button
                                             type="button"
                                             key={actor.id || `${actor.name}-${index}`}
-                                            className="meta-pill-chip actor-pill-chip"
+                                            className="navi-actor-pill"
                                             onClick={() => onSelectFilter({ type: 'actor', value: actor.id || actor.name, label: actor.name })}
                                         >
+                                            <UserRound size={12} />
                                             {actor.name}
                                         </button>
-                                    )) : '未知'}
+                                    )) : <span className="navi-detail-attr-empty">未知</span>}
                                 </div>
                             </div>
-                            <div className="meta-row chips-row" ref={chipRowRef}>
-                                <span className="meta-label">类型</span>
-                                <div
-                                    className="meta-value chip-strip-shell"
-                                    ref={chipStripRef}
-                                >
-                                    <div className="tag-chips-scroll">
-                                        {tags.length > 0 ? tags.map((tag: string, index: number) => (
-                                            <button
-                                                key={`${tag}-${index}`}
-                                                type="button"
-                                                className="meta-pill-chip"
-                                                onClick={() => onSelectFilter({ type: 'genre', value: tag, label: tag })}
-                                            >
-                                                {tag}
-                                            </button>
-                                        )) : '未分类'}
-                                    </div>
+
+                            <div className="navi-detail-attr is-tags">
+                                <div className="k">类型</div>
+                                <div className="navi-detail-attr-values">
+                                    {contentTags.length > 0 ? contentTags.map((tag: string, index: number) => (
+                                        <button
+                                            key={`${tag}-${index}`}
+                                            type="button"
+                                            className="navi-tag-pill"
+                                            onClick={() => onSelectFilter({ type: 'genre', value: tag, label: tag })}
+                                        >
+                                            {tag}
+                                        </button>
+                                    )) : <span className="navi-detail-attr-empty">未分类</span>}
+                                    {detailSeries?.title && (
+                                        <button
+                                            type="button"
+                                            className="navi-tag-pill"
+                                            onClick={() => onSelectFilter({ type: 'series', value: detailSeries.id, label: detailSeries.title })}
+                                        >
+                                            系列: {detailSeries.title}
+                                        </button>
+                                    )}
+                                    {makerLabel && <span className="navi-tag-pill is-static">片商: {makerLabel}</span>}
+                                    {studioLabel && <span className="navi-tag-pill is-static">发行: {studioLabel}</span>}
                                 </div>
                             </div>
-                            {detailSeries?.title && (
-                                <div className="meta-row">
-                                    <span className="meta-label">系列</span>
-                                    <span
-                                        className="meta-value meta-item-clickable"
-                                        onClick={() => onSelectFilter({ type: 'series', value: detailSeries.id, label: detailSeries.title })}
+
+                            <div className={`navi-detail-overview ${isOverviewExpanded ? '' : 'collapsed'}`.trim()}>
+                                {overviewText || getMetadataFallback(detail, '暂无简介')}
+                                {isOverviewCollapsible && (
+                                    <button
+                                        type="button"
+                                        className="navi-detail-overview-toggle"
+                                        onClick={() => setIsOverviewExpanded((expanded) => !expanded)}
                                     >
-                                        {detailSeries.title}
-                                    </span>
-                                </div>
-                            )}
-                            {(detail.studio || detail.publisher) && (
-                                <div className="meta-row">
-                                    <span className="meta-label">发行</span>
-                                    <span className="meta-value">{detail.studio || detail.publisher}</span>
-                                </div>
-                            )}
+                                        {isOverviewExpanded ? '收起' : '展开'}
+                                    </button>
+                                )}
+                            </div>
                         </div>
+                    </div>
 
-                        <div className="detail-desc">
-                            {overviewText || getMetadataFallback(detail, '暂无简介')}
-                        </div>
-
+                    <div className="navi-detail-wide">
                         {previews.length > 0 && (
-                            <div className="detail-previews-container">
-                                <div className="previews-label">预览剧照 ({previews.length})</div>
-                                <div
-                                    className={`preview-strip ${previews.length > 1 ? 'has-scrollbar' : 'no-scrollbar'}`}
-                                    ref={previewStripRef}
-                                >
+                            <div className="navi-detail-block">
+                                <div className="navi-detail-block-head">
+                                    <span className="navi-detail-block-title">预览剧照</span>
+                                    <span className="navi-detail-block-meta">{previews.length}</span>
+                                </div>
+                                <div className="navi-stills-grid">
                                     {previews.map((preview, index) => (
                                         <button
                                             key={`${preview}-${index}`}
                                             type="button"
-                                            className="preview-item"
+                                            className="navi-still"
                                             onClick={() => handleOpenPreviewViewer(index)}
                                         >
-                                            <img src={toLocalAssetUrl(preview)} className="preview-img" alt="preview" loading="lazy" />
+                                            <img src={toLocalAssetUrl(preview)} alt="preview" loading="lazy" />
                                         </button>
                                     ))}
                                 </div>
                             </div>
                         )}
-                            </div>
-                        </div>
-                    </div>
-                    {(recommendationLoading || mergedRecommendations.length > 0) && (
-                        <div className="detail-recommendation-block">
+
+                        {(recommendationLoading || mergedRecommendations.length > 0) && (
                             <RecommendationRail
                                 title="继续看"
+                                subtitle="同演员 · 同类型"
                                 items={mergedRecommendations}
                                 loading={recommendationLoading}
                                 onSelectMedia={onSelectMedia}
                                 onStatus={showMsg}
                             />
-                        </div>
-                    )}
+                        )}
+                    </div>
                 </div>
 
                 {isPreviewViewerOpen && currentPreviewPath && (

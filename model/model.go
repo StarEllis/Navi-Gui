@@ -36,6 +36,7 @@ type Library struct {
 	TitleField    string     `json:"title_field,omitempty" gorm:"-"`
 	SubtitleField string     `json:"subtitle_field,omitempty" gorm:"-"`
 	MediaCount    int        `json:"media_count,omitempty" gorm:"-"`
+	TotalSize     int64      `json:"total_size,omitempty" gorm:"-"` // 媒体文件总字节数，用于媒体库概览
 	// 高级设置
 	PreferLocalNFO    bool   `json:"prefer_local_nfo" gorm:"default:true"`         // 优先读取本地NFO和图片
 	MinFileSize       int    `json:"min_file_size" gorm:"default:3"`               // 排除小于此大小(MB)的视频文件

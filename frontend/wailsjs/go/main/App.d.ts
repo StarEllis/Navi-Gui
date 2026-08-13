@@ -61,6 +61,8 @@ export function PlayWithExternalPlayer(arg1:string):Promise<void>;
 
 export function RestartApp():Promise<void>;
 
+export function RestartMedia(arg1:string,arg2:string):Promise<void>;
+
 export function RetryFailedScan(arg1:string):Promise<main.ScanTaskInfo>;
 
 export function RetryThumbnailTask(arg1:string):Promise<service.ThumbnailTaskEventData>;

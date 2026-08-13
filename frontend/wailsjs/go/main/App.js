@@ -114,6 +114,10 @@ export function RestartApp() {
   return window['go']['main']['App']['RestartApp']();
 }
 
+export function RestartMedia(arg1, arg2) {
+  return window['go']['main']['App']['RestartMedia'](arg1, arg2);
+}
+
 export function RetryFailedScan(arg1) {
   return window['go']['main']['App']['RetryFailedScan'](arg1);
 }

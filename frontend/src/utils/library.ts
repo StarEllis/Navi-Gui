@@ -90,21 +90,53 @@ export const buildLibraryPayload = (library: any, updates: {
     subtitle_field: updates.subtitleField || DEFAULT_LIBRARY_SUBTITLE_FIELD,
 });
 
-const toSegments = (path: string) => path.replace(/\\/g, '/').replace(/\/+$/, '').split('/').filter(Boolean);
-
-export const formatLibraryPathLabel = (path: string, siblingPaths: string[] = []) => {
-    const segments = toSegments(path);
-    if (segments.length === 0) {
-        return path;
+export const formatLibrarySize = (bytes: unknown) => {
+    const value = typeof bytes === 'number' && Number.isFinite(bytes) ? bytes : 0;
+    if (value <= 0) {
+        return '';
     }
 
-    const base = segments[segments.length - 1];
-    const duplicateBaseCount = siblingPaths.filter((item) => toSegments(item).slice(-1)[0] === base).length;
-    if (duplicateBaseCount > 1 && segments.length > 1) {
-        return `${segments[segments.length - 2]}/${base}`;
+    const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+    let scaled = value;
+    let unitIndex = 0;
+    while (scaled >= 1024 && unitIndex < units.length - 1) {
+        scaled /= 1024;
+        unitIndex += 1;
     }
 
-    return base;
+    const digits = unitIndex >= 3 && scaled < 100 ? 1 : 0;
+    return `${scaled.toFixed(digits)} ${units[unitIndex]}`;
+};
+
+export const formatLastScanLabel = (lastScan: unknown, now: number = Date.now()) => {
+    if (typeof lastScan !== 'string' || !lastScan.trim() || lastScan.startsWith('0001-01-01')) {
+        return '';
+    }
+
+    const scannedAt = new Date(lastScan).getTime();
+    if (!Number.isFinite(scannedAt)) {
+        return '';
+    }
+
+    const minutes = Math.floor((now - scannedAt) / 60000);
+    if (minutes < 1) {
+        return '刚刚扫描';
+    }
+    if (minutes < 60) {
+        return `${minutes} 分钟前扫描`;
+    }
+
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) {
+        return `${hours} 小时前扫描`;
+    }
+
+    const days = Math.floor(hours / 24);
+    if (days < 30) {
+        return `${days} 天前扫描`;
+    }
+
+    return `${new Date(scannedAt).toLocaleDateString('zh-CN')} 扫描`;
 };
 
 export const getSortLabel = (field: string) => {

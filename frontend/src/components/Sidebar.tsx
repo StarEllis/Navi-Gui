@@ -1,22 +1,16 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
-    ChevronDown,
-    ChevronRight,
-    Copy,
     Eye,
-    FolderPlus,
     Heart,
-    Minus,
+    Library,
     Pencil,
+    Plus,
     Settings,
     Shapes,
-    Square,
     UserRound,
-    X,
 } from 'lucide-react';
 import { Quit, WindowIsMaximised, WindowMinimise, WindowToggleMaximise } from '../../wailsjs/runtime/runtime';
 import logoImage from '../assets/images/logo-universal.png';
-import { formatLibraryPathLabel, getLibraryConfig } from '../utils/library';
 
 interface SidebarProps {
     appName: string;
@@ -60,10 +54,9 @@ const Sidebar: React.FC<SidebarProps> = ({
     onAddLib,
     onEditLib,
 }) => {
-    const [expandedLibId, setExpandedLibId] = useState<string | null>(null);
-    const [isLibrariesCollapsed, setIsLibrariesCollapsed] = useState(false);
-    const [isStatsCollapsed, setIsStatsCollapsed] = useState(false);
     const [isMaximised, setIsMaximised] = useState(false);
+    const [showLibraryPicker, setShowLibraryPicker] = useState(false);
+    const libraryPickerRef = useRef<HTMLDivElement | null>(null);
 
     useEffect(() => {
         const syncWindowState = () => {
@@ -78,17 +71,31 @@ const Sidebar: React.FC<SidebarProps> = ({
         };
     }, []);
 
-    const toggleLibraryFolders = (libraryId: string) => {
-        setExpandedLibId((prev) => (prev === libraryId ? null : libraryId));
-    };
+    useEffect(() => {
+        if (!showLibraryPicker) {
+            return;
+        }
 
-    const toggleLibrariesSection = () => {
-        setIsLibrariesCollapsed((prev) => !prev);
-    };
+        const handlePointerDown = (event: MouseEvent) => {
+            if (!libraryPickerRef.current?.contains(event.target as Node)) {
+                setShowLibraryPicker(false);
+            }
+        };
 
-    const toggleStatsSection = () => {
-        setIsStatsCollapsed((prev) => !prev);
-    };
+        const handleEscape = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                setShowLibraryPicker(false);
+            }
+        };
+
+        document.addEventListener('mousedown', handlePointerDown);
+        document.addEventListener('keydown', handleEscape);
+
+        return () => {
+            document.removeEventListener('mousedown', handlePointerDown);
+            document.removeEventListener('keydown', handleEscape);
+        };
+    }, [showLibraryPicker]);
 
     const handleWindowToggle = () => {
         WindowToggleMaximise();
@@ -97,7 +104,7 @@ const Sidebar: React.FC<SidebarProps> = ({
         }, 80);
     };
 
-    const handleHeaderDoubleClick = (event: React.MouseEvent<HTMLDivElement>) => {
+    const handleRailDoubleClick = (event: React.MouseEvent<HTMLElement>) => {
         if (shouldIgnoreHeaderDoubleClick(event.target)) {
             return;
         }
@@ -105,165 +112,127 @@ const Sidebar: React.FC<SidebarProps> = ({
         handleWindowToggle();
     };
 
+    // 媒体库：不在媒体库视图时先回到网格，已经在网格上时再点开切换库的浮层。
+    const handleLibraryRailClick = () => {
+        if (currentView !== 'libs') {
+            setShowLibraryPicker(false);
+            onSelectView('libs');
+            return;
+        }
+        setShowLibraryPicker((open) => !open);
+    };
+
     return (
-        <aside className="sidebar">
-            <div className="sidebar-header" onDoubleClick={handleHeaderDoubleClick}>
-                <div className="sidebar-window-controls">
-                    <button type="button" className="sidebar-window-btn close" onClick={Quit} aria-label="关闭">
-                        <X size={13} />
-                    </button>
-                    <button type="button" className="sidebar-window-btn" onClick={WindowMinimise} aria-label="最小化">
-                        <Minus size={13} />
-                    </button>
-                    <button type="button" className="sidebar-window-btn" onClick={handleWindowToggle} aria-label="最大化">
-                        {isMaximised ? <Copy size={12} /> : <Square size={12} />}
-                    </button>
-                </div>
-
-                <div className="sidebar-brand">
-                    <div className="sidebar-brand-mark" aria-hidden="true">
-                        <img className="sidebar-brand-mark-image" src={logoImage} alt="" />
-                    </div>
-                    <div className="sidebar-brand-copy">
-                        <span className="sidebar-brand-name">{appName}</span>
-                        <span className="sidebar-brand-subtitle">媒体库</span>
-                    </div>
-                </div>
-            </div>
-
-            <div className="sidebar-main">
-                <div className="sidebar-group">
-                    <div className="sidebar-group-title">
-                        <span>我的媒体</span>
-                        <div className="sidebar-group-actions">
-                            <button
-                                type="button"
-                                className="sidebar-group-add"
-                                onClick={onAddLib}
-                                aria-label="新建媒体库"
-                                title="新建媒体库"
-                            >
-                                <FolderPlus size={13} strokeWidth={2} />
-                            </button>
-                            <button
-                                type="button"
-                                className={`sidebar-group-toggle ${isLibrariesCollapsed ? 'collapsed' : ''}`}
-                                onClick={toggleLibrariesSection}
-                                aria-label={isLibrariesCollapsed ? '展开媒体列表' : '收起媒体列表'}
-                                aria-expanded={!isLibrariesCollapsed}
-                            >
-                                <ChevronDown size={13} />
-                            </button>
-                        </div>
-                    </div>
-
-                    {!isLibrariesCollapsed && (
-                        <div className="sidebar-library-list">
-                            {libraries.map((lib) => {
-                                const isExpanded = expandedLibId === lib.id;
-                                const isActive = currentLib?.id === lib.id;
-                                const { folderPaths } = getLibraryConfig(lib);
-
-                                return (
-                                    <div key={lib.id} className={`sidebar-library-item ${isExpanded ? 'expanded' : ''}`}>
-                                        <div className={`sidebar-library-row ${isActive ? 'active' : ''}`}>
-                                            <button
-                                                type="button"
-                                                className={`sidebar-library-toggle ${isExpanded ? 'expanded' : ''}`}
-                                                onClick={() => toggleLibraryFolders(lib.id)}
-                                                aria-label={isExpanded ? '收起媒体库目录' : '展开媒体库目录'}
-                                            >
-                                                <ChevronRight size={13} />
-                                            </button>
-
-                                            <button type="button" className="sidebar-library-main" onClick={() => onSelectLib(lib)}>
-                                                <span className="sidebar-library-name" title={lib.name}>
-                                                    {lib.name}
-                                                </span>
-                                                <span className="sidebar-library-count">
-                                                    {(lib.media_count || 0).toLocaleString()}
-                                                </span>
-                                            </button>
-
-                                            <button
-                                                type="button"
-                                                className="sidebar-library-edit"
-                                                title="编辑媒体库"
-                                                onClick={(event) => {
-                                                    event.stopPropagation();
-                                                    onEditLib(lib);
-                                                }}
-                                            >
-                                                <Pencil size={13} />
-                                            </button>
-                                        </div>
-
-                                        {isExpanded && (
-                                            <div className="sidebar-library-paths">
-                                                {folderPaths.length > 0 ? (
-                                                    folderPaths.map((path) => (
-                                                        <div key={path} className="sidebar-library-path" title={path}>
-                                                            {formatLibraryPathLabel(path, folderPaths)}
-                                                        </div>
-                                                    ))
-                                                ) : (
-                                                    <div className="sidebar-library-path empty">未配置文件夹</div>
-                                                )}
-                                            </div>
-                                        )}
-                                    </div>
-                                );
-                            })}
-                        </div>
-                    )}
-                </div>
-
-                <div className="sidebar-group">
-                    <div className="sidebar-group-title">
-                        <span>信息统计</span>
-                        <button
-                            type="button"
-                            className={`sidebar-group-toggle ${isStatsCollapsed ? 'collapsed' : ''}`}
-                            onClick={toggleStatsSection}
-                            aria-label={isStatsCollapsed ? '展开信息统计' : '收起信息统计'}
-                            aria-expanded={!isStatsCollapsed}
-                        >
-                            <ChevronDown size={13} />
-                        </button>
-                    </div>
-
-                    {!isStatsCollapsed && (
-                        <div className="sidebar-nav-list">
-                            {navItems.map((item) => {
-                                const Icon = item.icon;
-                                const isActive = currentView === item.key;
-                                return (
-                                    <button
-                                        key={item.key}
-                                        type="button"
-                                        className={`sidebar-nav-item ${isActive ? 'active' : ''}`}
-                                        onClick={() => onSelectView(item.key)}
-                                    >
-                                        <Icon size={16} strokeWidth={1.85} />
-                                        <span>{item.label}</span>
-                                    </button>
-                                );
-                            })}
-                        </div>
-                    )}
-                </div>
-            </div>
-
-            <div className="sidebar-footer">
+        <aside className="navi-rail" onDoubleClick={handleRailDoubleClick}>
+            <div className="navi-window-controls">
+                <button type="button" className="navi-window-btn close" onClick={Quit} aria-label="关闭" />
+                <button type="button" className="navi-window-btn min" onClick={WindowMinimise} aria-label="最小化" />
                 <button
                     type="button"
-                    className={`sidebar-nav-item sidebar-settings-item ${currentView === 'settings' ? 'active' : ''}`}
-                    onClick={onOpenSettings}
-                >
-                    <Settings size={16} strokeWidth={1.85} />
-                    <span>设置</span>
-                </button>
+                    className={`navi-window-btn max${isMaximised ? ' restore' : ''}`}
+                    onClick={handleWindowToggle}
+                    aria-label="最大化"
+                />
             </div>
+
+            <div className="navi-rail-logo" title={appName} aria-hidden="true">
+                <img src={logoImage} alt="" />
+            </div>
+
+            <button
+                type="button"
+                className={`navi-rail-item ${currentView === 'libs' ? 'active' : ''}`.trim()}
+                onClick={handleLibraryRailClick}
+                title={currentLib?.name ? `媒体库：${currentLib.name}` : '媒体库'}
+                aria-expanded={showLibraryPicker}
+            >
+                <Library size={17} strokeWidth={1.85} />
+                <span>媒体库</span>
+            </button>
+
+            {navItems.map((item) => {
+                const Icon = item.icon;
+                return (
+                    <button
+                        key={item.key}
+                        type="button"
+                        className={`navi-rail-item ${currentView === item.key ? 'active' : ''}`.trim()}
+                        onClick={() => {
+                            setShowLibraryPicker(false);
+                            onSelectView(item.key);
+                        }}
+                    >
+                        <Icon size={17} strokeWidth={1.85} />
+                        <span>{item.label}</span>
+                    </button>
+                );
+            })}
+
+            <button
+                type="button"
+                className={`navi-rail-item settings ${currentView === 'settings' ? 'active' : ''}`.trim()}
+                onClick={() => {
+                    setShowLibraryPicker(false);
+                    onOpenSettings();
+                }}
+            >
+                <Settings size={17} strokeWidth={1.85} />
+                <span>设置</span>
+            </button>
+
+            {showLibraryPicker && (
+                <div className="navi-library-popover" ref={libraryPickerRef} role="menu" aria-label="切换媒体库">
+                    <div className="navi-library-popover-title">媒体库</div>
+
+                    {libraries.length === 0 && (
+                        <div className="navi-library-empty">还没有媒体库</div>
+                    )}
+
+                    {libraries.map((lib) => (
+                        <div
+                            key={lib.id}
+                            className={`navi-library-row ${currentLib?.id === lib.id ? 'active' : ''}`.trim()}
+                        >
+                            <button
+                                type="button"
+                                className="navi-library-main"
+                                onClick={() => {
+                                    setShowLibraryPicker(false);
+                                    onSelectLib(lib);
+                                }}
+                            >
+                                <span className="navi-library-name" title={lib.name}>{lib.name}</span>
+                                <span className="navi-library-count">
+                                    {(lib.media_count || 0).toLocaleString()}
+                                </span>
+                            </button>
+                            <button
+                                type="button"
+                                className="navi-library-edit"
+                                title="编辑媒体库"
+                                onClick={() => {
+                                    setShowLibraryPicker(false);
+                                    onEditLib(lib);
+                                }}
+                            >
+                                <Pencil size={13} />
+                            </button>
+                        </div>
+                    ))}
+
+                    <button
+                        type="button"
+                        className="navi-library-add"
+                        onClick={() => {
+                            setShowLibraryPicker(false);
+                            onAddLib();
+                        }}
+                    >
+                        <Plus size={14} />
+                        <span>新建媒体库</span>
+                    </button>
+                </div>
+            )}
         </aside>
     );
 };

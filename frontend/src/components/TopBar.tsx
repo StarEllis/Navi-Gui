@@ -1,16 +1,19 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-    ArrowDown,
+    ArrowDownNarrowWide,
     ArrowLeft,
-    ArrowUp,
-    ChevronDown,
+    ArrowUpNarrowWide,
+    Folder,
+    LayoutGrid,
+    List,
     RefreshCw,
     Search,
     Shuffle,
+    X,
 } from 'lucide-react';
 import { ClipboardGetText, ClipboardSetText, WindowToggleMaximise } from '../../wailsjs/runtime/runtime';
 
-const CLEAR_FILTER_LABEL = '\u6e05\u9664\u7b5b\u9009';
+const CLEAR_FILTER_LABEL = '清除筛选';
 
 type MenuType = 'scan' | 'sort' | null;
 type SearchEditAction = 'cut' | 'copy' | 'paste' | 'selectAll' | 'undo' | 'redo';
@@ -27,15 +30,17 @@ type SortOption = {
 };
 
 interface TopBarProps {
-    currentLibraryName: string;
-    mediaCount: number;
     hidden?: boolean;
-    filterLabel?: string;
+    title: string;
+    stats?: string;
+    filterKind?: string;
+    filterValue?: string;
     showSearch?: boolean;
     searchValue: string;
     onSearch: (keyword: string) => void;
     searchPlaceholder?: string;
     searchDisabled?: boolean;
+    compactSearch?: boolean;
     scanDisabled?: boolean;
     onScanWithMode?: (mode: string) => void;
     onRandomPlay?: () => void;
@@ -46,6 +51,11 @@ interface TopBarProps {
     onBackButtonClick?: () => void;
     backButtonLabel?: string;
     onClearFilter?: () => void;
+    viewMode?: 'grid' | 'list';
+    onToggleViewMode?: () => void;
+    libraryName?: string;
+    libraryPath?: string;
+    libraryMediaCount?: number;
 }
 
 const DEFAULT_SORT_OPTIONS: SortOption[] = [
@@ -61,17 +71,33 @@ const SCAN_OPTIONS = [
     { mode: 'incremental', label: '新增刷新' },
 ];
 
+// 只加不删不改的新增刷新没什么可后悔的，直接跑；另外两种按危险程度分两档确认。
+type ConfirmScanMode = 'overwrite' | 'delete_update';
+
+const SCAN_CONFIRMATIONS: Record<ConfirmScanMode, { label: string; body: string; danger: boolean }> = {
+    overwrite: {
+        label: '覆盖刷新',
+        body: '清空这个媒体库的全部条目并重新扫描目录。已看、收藏和评分会一起丢失。',
+        danger: true,
+    },
+    delete_update: {
+        label: '删改刷新',
+        body: '重新扫描目录：文件已经不在的条目会从库里移除，信息有变动的条目会被更新。已看和收藏保留。',
+        danger: false,
+    },
+};
+
 const SEARCH_CONTEXT_MENU_WIDTH = 196;
 const SEARCH_CONTEXT_MENU_HEIGHT = 252;
 const SEARCH_CONTEXT_MENU_MARGIN = 8;
 
 const SEARCH_EDIT_ACTIONS: Array<{ action: SearchEditAction; label: string; shortcut: string }> = [
-    { action: 'cut', label: '\u526a\u5207', shortcut: 'Ctrl+X' },
-    { action: 'copy', label: '\u590d\u5236', shortcut: 'Ctrl+C' },
-    { action: 'paste', label: '\u7c98\u8d34', shortcut: 'Ctrl+V' },
-    { action: 'selectAll', label: '\u5168\u9009', shortcut: 'Ctrl+A' },
-    { action: 'undo', label: '\u64a4\u9500', shortcut: 'Ctrl+Z' },
-    { action: 'redo', label: '\u91cd\u505a', shortcut: 'Ctrl+Y' },
+    { action: 'cut', label: '剪切', shortcut: 'Ctrl+X' },
+    { action: 'copy', label: '复制', shortcut: 'Ctrl+C' },
+    { action: 'paste', label: '粘贴', shortcut: 'Ctrl+V' },
+    { action: 'selectAll', label: '全选', shortcut: 'Ctrl+A' },
+    { action: 'undo', label: '撤销', shortcut: 'Ctrl+Z' },
+    { action: 'redo', label: '重做', shortcut: 'Ctrl+Y' },
 ];
 
 const getSortLabel = (field: string, sortOptions: SortOption[]) => {
@@ -124,15 +150,17 @@ const shouldIgnoreHeaderDoubleClick = (target: EventTarget | null) => {
 };
 
 const TopBar: React.FC<TopBarProps> = ({
-    currentLibraryName,
-    mediaCount,
     hidden = false,
-    filterLabel,
+    title,
+    stats,
+    filterKind,
+    filterValue,
     showSearch = true,
     searchValue,
     onSearch,
-    searchPlaceholder = '\u641c\u7d22\u5a92\u4f53\u3001\u6f14\u5458\u3001\u6807\u7b7e',
+    searchPlaceholder = '搜索媒体、演员、标签',
     searchDisabled = false,
+    compactSearch = false,
     scanDisabled = false,
     onScanWithMode,
     onRandomPlay,
@@ -143,9 +171,14 @@ const TopBar: React.FC<TopBarProps> = ({
     onBackButtonClick,
     backButtonLabel = '返回主页',
     onClearFilter,
+    viewMode = 'grid',
+    onToggleViewMode,
+    libraryName = '',
+    libraryPath = '',
+    libraryMediaCount = 0,
 }) => {
     const [openMenu, setOpenMenu] = useState<MenuType>(null);
-    const [confirmScanMode, setConfirmScanMode] = useState<'overwrite' | null>(null);
+    const [confirmScanMode, setConfirmScanMode] = useState<ConfirmScanMode | null>(null);
     const [searchContextMenu, setSearchContextMenu] = useState<SearchContextMenuState>(null);
     const menuRootRef = useRef<HTMLDivElement | null>(null);
     const searchContextMenuRef = useRef<HTMLDivElement | null>(null);
@@ -182,12 +215,6 @@ const TopBar: React.FC<TopBarProps> = ({
     }, []);
 
     useEffect(() => {
-        if (searchInputRef.current) {
-            searchInputRef.current.placeholder = searchPlaceholder;
-        }
-    }, [searchPlaceholder]);
-
-    useEffect(() => {
         if (scanDisabled) {
             setOpenMenu(null);
             setConfirmScanMode(null);
@@ -200,8 +227,8 @@ const TopBar: React.FC<TopBarProps> = ({
         }
         setOpenMenu(null);
         setSearchContextMenu(null);
-        if (mode === 'overwrite') {
-            setConfirmScanMode('overwrite');
+        if (mode === 'overwrite' || mode === 'delete_update') {
+            setConfirmScanMode(mode);
             return;
         }
         onScanWithMode?.(mode);
@@ -339,157 +366,178 @@ const TopBar: React.FC<TopBarProps> = ({
         window.requestAnimationFrame(() => syncSearchValueFromInput(input));
     };
 
-    const countLabel = `${mediaCount.toLocaleString()} 个项目`;
-    const headerHint = filterLabel || '';
     const currentSortLabel = getSortLabel(sortField, sortOptions);
-    const showClearAction = Boolean(onClearFilter);
+    const SortIcon = sortOrder === 'asc' ? ArrowUpNarrowWide : ArrowDownNarrowWide;
+    const hasFilterChip = Boolean(filterValue);
 
     return (
         <>
-            <div className={`topbar ${hidden ? 'topbar-hidden' : ''}`} ref={menuRootRef} onDoubleClick={handleHeaderDoubleClick}>
-                <div className={`workspace-header-main ${showSearch ? '' : 'no-search'} ${onBackButtonClick ? 'has-back-action' : ''}`.trim()}>
-                    <div className="workspace-header-heading">
-                        <div className="workspace-header-title-row">
-                            <span className="workspace-library-current" title={currentLibraryName}>
-                                {currentLibraryName}
-                            </span>
-                            <span className="workspace-library-count">{countLabel}</span>
-                        </div>
-                        {headerHint && <div className="workspace-header-subtitle">{headerHint}</div>}
-                    </div>
+            <div
+                className={`navi-topbar ${hidden ? 'hidden' : ''}`.trim()}
+                ref={menuRootRef}
+                onDoubleClick={handleHeaderDoubleClick}
+            >
+                {onBackButtonClick && (
+                    <button
+                        type="button"
+                        className="navi-back-btn"
+                        onClick={onBackButtonClick}
+                        title={backButtonLabel}
+                        aria-label={backButtonLabel}
+                    >
+                        <ArrowLeft size={15} />
+                    </button>
+                )}
 
-                    {showSearch && <div className="workspace-header-search no-drag">
-                        <div className="workspace-search-group">
-                            <label className={`workspace-search-shell ${searchDisabled ? 'disabled' : ''} ${showClearAction ? 'has-clear' : ''}`}>
-                                <span className="workspace-search-icon-wrap">
-                                    <Search size={15} strokeWidth={2} className="workspace-search-icon" />
-                                </span>
-                                <input
-                                    type="text"
-                                    className="workspace-search" ref={searchInputRef}
-                                    placeholder="搜索媒体、演员、标签"
-                                    value={searchValue}
-                                    onChange={(event) => {
-                                        setSearchContextMenu(null);
-                                        onSearch(event.target.value);
-                                    }}
-                                    onContextMenu={handleSearchContextMenu}
-                                    onKeyDown={handleSearchKeyDown}
-                                    disabled={searchDisabled}
-                                />
-                                {showClearAction && (
-                                    <button
-                                        type="button"
-                                        className="workspace-search-clear"
-                                        aria-label={CLEAR_FILTER_LABEL}
-                                        onClick={() => onClearFilter?.()}
-                                    >
-                                        {CLEAR_FILTER_LABEL}
-                                    </button>
-                                )}
-                            </label>
-                        </div>
-                    </div>}
+                <h2 className="navi-topbar-title" title={title}>{title}</h2>
 
-                    <div className="workspace-header-actions no-drag">
+                {stats && <span className="navi-topbar-count">{stats}</span>}
 
-                        {onBackButtonClick && (
+                {hasFilterChip && (
+                    <div className="navi-filter-chip">
+                        {filterKind && <span className="navi-filter-chip-kind">{filterKind}</span>}
+                        <span className="navi-filter-chip-value" title={filterValue}>{filterValue}</span>
+                        {onClearFilter && (
                             <button
                                 type="button"
-                                className="workspace-action-btn subtle workspace-back-action"
-                                onClick={onBackButtonClick}
-                                title={backButtonLabel}
-                                aria-label={backButtonLabel}
+                                className="navi-filter-chip-clear"
+                                title={CLEAR_FILTER_LABEL}
+                                aria-label={CLEAR_FILTER_LABEL}
+                                onClick={onClearFilter}
                             >
-                                <ArrowLeft size={14} />
-                                <span>{backButtonLabel}</span>
+                                <X size={13} />
                             </button>
                         )}
+                    </div>
+                )}
 
-                        {onRandomPlay && (
-                            <button type="button" className="workspace-action-btn" onClick={onRandomPlay}>
-                                <Shuffle size={15} />
-                                <span>随机玩玩</span>
+                {onClearFilter && !hasFilterChip && (
+                    <button type="button" className="navi-ghost-btn" onClick={onClearFilter}>
+                        {CLEAR_FILTER_LABEL}
+                    </button>
+                )}
+
+                <div className="navi-topbar-actions">
+                    {showSearch && (
+                        <label className={`navi-search ${compactSearch ? 'compact' : ''} ${searchDisabled ? 'disabled' : ''}`.trim()}>
+                            <Search size={15} strokeWidth={2} />
+                            <input
+                                type="text"
+                                ref={searchInputRef}
+                                placeholder={searchPlaceholder}
+                                value={searchValue}
+                                onChange={(event) => {
+                                    setSearchContextMenu(null);
+                                    onSearch(event.target.value);
+                                }}
+                                onContextMenu={handleSearchContextMenu}
+                                onKeyDown={handleSearchKeyDown}
+                                disabled={searchDisabled}
+                            />
+                        </label>
+                    )}
+
+                    {onRandomPlay && (
+                        <button
+                            type="button"
+                            className="navi-icon-btn"
+                            title="随机玩玩"
+                            aria-label="随机玩玩"
+                            onClick={onRandomPlay}
+                        >
+                            <Shuffle size={16} />
+                        </button>
+                    )}
+
+                    {onSortSelect && (
+                        <div className={`navi-menu-shell ${openMenu === 'sort' ? 'open' : ''}`.trim()}>
+                            <button
+                                type="button"
+                                className="navi-icon-btn"
+                                title={`按${currentSortLabel}排序`}
+                                aria-label={`按${currentSortLabel}排序`}
+                                onClick={() => {
+                                    setSearchContextMenu(null);
+                                    setOpenMenu((prev) => (prev === 'sort' ? null : 'sort'));
+                                }}
+                            >
+                                <SortIcon size={16} />
                             </button>
-                        )}
 
-                        {onSortSelect && (
-                            <div className={`workspace-menu-shell ${openMenu === 'sort' ? 'open' : ''}`}>
-                                <button
-                                    type="button"
-                                    className="workspace-action-btn"
-                                    onClick={() => {
-                                        setSearchContextMenu(null);
-                                        setOpenMenu((prev) => (prev === 'sort' ? null : 'sort'));
-                                    }}
-                                >
-                                    {sortOrder === 'asc' ? <ArrowUp size={15} /> : <ArrowDown size={15} />}
-                                    <span>{`按${currentSortLabel}排序`}</span>
-                                </button>
-
-                                {openMenu === 'sort' && (
-                                    <div className="workspace-dropdown-menu">
-                                        {sortOptions.map((option) => {
-                                            const isActive = sortField === option.field;
-                                            return (
-                                                <button
-                                                    key={option.field}
-                                                    type="button"
-                                                    className={`workspace-dropdown-item ${isActive ? 'active' : ''}`}
-                                                    onClick={() => {
-                                                        onSortSelect(option.field);
-                                                        setOpenMenu(null);
-                                                    }}
-                                                >
-                                                    <span>{option.label}</span>
-                                                    {isActive && (
-                                                        <span className="workspace-dropdown-meta">
-                                                            {sortOrder === 'desc' ? '降序' : '升序'}
-                                                        </span>
-                                                    )}
-                                                </button>
-                                            );
-                                        })}
-                                    </div>
-                                )}
-                            </div>
-                        )}
-
-                        {onScanWithMode && (
-                            <div className={`workspace-menu-shell ${openMenu === 'scan' ? 'open' : ''}`}>
-                                <button
-                                    type="button"
-                                    className="workspace-action-btn compact"
-                                    disabled={scanDisabled}
-                                    onClick={() => {
-                                        setSearchContextMenu(null);
-                                        setOpenMenu((prev) => (prev === 'scan' ? null : 'scan'));
-                                    }}
-                                >
-                                    <RefreshCw size={15} />
-                                    <span>刷新</span>
-                                    <ChevronDown size={13} />
-                                </button>
-
-                                {openMenu === 'scan' && (
-                                    <div className="workspace-dropdown-menu">
-                                        {SCAN_OPTIONS.map((option) => (
+                            {openMenu === 'sort' && (
+                                <div className="navi-menu">
+                                    {sortOptions.map((option) => {
+                                        const isActive = sortField === option.field;
+                                        return (
                                             <button
-                                                key={option.mode}
+                                                key={option.field}
                                                 type="button"
-                                                className="workspace-dropdown-item"
-                                                disabled={scanDisabled}
-                                                onClick={() => handleScanModeClick(option.mode)}
+                                                className={`navi-menu-item ${isActive ? 'active' : ''}`.trim()}
+                                                onClick={() => {
+                                                    onSortSelect(option.field);
+                                                    setOpenMenu(null);
+                                                }}
                                             >
                                                 <span>{option.label}</span>
+                                                {isActive && (
+                                                    <span className="navi-menu-meta">
+                                                        {sortOrder === 'desc' ? '降序' : '升序'}
+                                                    </span>
+                                                )}
                                             </button>
-                                        ))}
-                                    </div>
-                                )}
-                            </div>
-                        )}
+                                        );
+                                    })}
+                                </div>
+                            )}
+                        </div>
+                    )}
 
-                    </div>
+                    {onToggleViewMode && (
+                        <button
+                            type="button"
+                            className="navi-icon-btn"
+                            title={viewMode === 'list' ? '切换网格视图' : '切换列表视图'}
+                            aria-label={viewMode === 'list' ? '切换网格视图' : '切换列表视图'}
+                            aria-pressed={viewMode === 'list'}
+                            onClick={onToggleViewMode}
+                        >
+                            {viewMode === 'list' ? <LayoutGrid size={16} /> : <List size={16} />}
+                        </button>
+                    )}
+
+                    {onScanWithMode && (
+                        <div className={`navi-menu-shell ${openMenu === 'scan' ? 'open' : ''}`.trim()}>
+                            <button
+                                type="button"
+                                className="navi-icon-btn"
+                                title="重新扫描"
+                                aria-label="重新扫描"
+                                disabled={scanDisabled}
+                                onClick={() => {
+                                    setSearchContextMenu(null);
+                                    setOpenMenu((prev) => (prev === 'scan' ? null : 'scan'));
+                                }}
+                            >
+                                <RefreshCw size={16} />
+                            </button>
+
+                            {openMenu === 'scan' && (
+                                <div className="navi-menu">
+                                    {SCAN_OPTIONS.map((option) => (
+                                        <button
+                                            key={option.mode}
+                                            type="button"
+                                            className="navi-menu-item"
+                                            disabled={scanDisabled}
+                                            onClick={() => handleScanModeClick(option.mode)}
+                                        >
+                                            <span>{option.label}</span>
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    )}
                 </div>
             </div>
 
@@ -499,7 +547,7 @@ const TopBar: React.FC<TopBarProps> = ({
                     className="workspace-search-context-menu"
                     style={{ left: searchContextMenu.x, top: searchContextMenu.y }}
                     role="menu"
-                    aria-label="\u641c\u7d22\u7f16\u8f91\u83dc\u5355"
+                    aria-label="搜索编辑菜单"
                     onContextMenu={(event) => event.preventDefault()}
                 >
                     {SEARCH_EDIT_ACTIONS.map((item) => {
@@ -526,31 +574,37 @@ const TopBar: React.FC<TopBarProps> = ({
                 </div>
             )}
 
-            {confirmScanMode === 'overwrite' && (
+            {confirmScanMode && (
                 <div className="modal-overlay" onClick={() => setConfirmScanMode(null)}>
                     <div
                         className="confirm-modal"
                         onClick={(event) => event.stopPropagation()}
                         role="dialog"
                         aria-modal="true"
-                        aria-labelledby="overwrite-confirm-title"
+                        aria-labelledby="scan-confirm-title"
                     >
                         <div className="confirm-modal-header">
-                            <span id="overwrite-confirm-title">提示</span>
+                            <span id="scan-confirm-title">
+                                {SCAN_CONFIRMATIONS[confirmScanMode].label}「{libraryName || title}」
+                            </span>
                             <button
                                 type="button"
                                 className="confirm-modal-close"
                                 onClick={() => setConfirmScanMode(null)}
                                 aria-label="关闭"
                             >
-                                ×
+                                <X size={14} />
                             </button>
                         </div>
 
                         <div className="confirm-modal-body">
-                            <div className="confirm-modal-icon">!</div>
                             <div className="confirm-modal-text">
-                                你确定要覆盖刷新吗？这会清空当前媒体库并重新扫描。
+                                {SCAN_CONFIRMATIONS[confirmScanMode].body}
+                            </div>
+                            <div className="confirm-modal-target">
+                                <Folder size={12} />
+                                <span className="confirm-modal-target-path" title={libraryPath}>{libraryPath}</span>
+                                <span className="confirm-modal-target-count">{libraryMediaCount.toLocaleString()} 部</span>
                             </div>
                         </div>
 
@@ -560,17 +614,17 @@ const TopBar: React.FC<TopBarProps> = ({
                             </button>
                             <button
                                 type="button"
-                                className="confirm-modal-btn primary"
+                                className={`confirm-modal-btn ${SCAN_CONFIRMATIONS[confirmScanMode].danger ? 'danger' : 'primary'}`}
                                 disabled={scanDisabled}
                                 onClick={() => {
                                     if (scanDisabled) {
                                         return;
                                     }
-                                    onScanWithMode?.('overwrite');
+                                    onScanWithMode?.(confirmScanMode);
                                     setConfirmScanMode(null);
                                 }}
                             >
-                                确定
+                                {SCAN_CONFIRMATIONS[confirmScanMode].label}
                             </button>
                         </div>
                     </div>

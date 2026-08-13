@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,8 +22,38 @@ import (
 const (
 	gfriendsIndexTTL              = 7 * 24 * time.Hour
 	maxGfriendsIndexDownloadBytes = 32 << 20
-	maxGfriendsAvatarBytes        = 2 << 20
+	maxGfriendsAvatarBytes        = 4 << 20
 )
+
+// gfriends uses Japanese stage names while local NFO files commonly contain
+// Chinese translations. Keep this list explicit so similarly named actors are
+// never matched heuristically.
+var gfriendsActorAliases = map[string]string{
+	"七濑爱丽丝": "七瀬アリス",
+	"仓本堇":   "倉本すみれ",
+	"佐佐木明希": "佐々木あき",
+	"凉森玲梦":  "涼森れむ",
+	"坂道美琉":  "坂道みる",
+	"夏希栗":   "夏希まろん",
+	"小花暖":   "小花のん",
+	"明日花绮罗": "明日花キララ",
+	"仲村美羽":  "仲村みう",
+	"枫芙爱":   "楓ふうあ",
+	"桃乃木香奈": "桃乃木かな",
+	"梦乃爱华":  "夢乃あいか",
+	"椎名由奈":  "椎名ゆな",
+	"樱空桃":   "桜空もも",
+	"武藤彩香":  "武藤あやか",
+	"水卜樱":   "水卜さくら",
+	"沙月芽衣":  "さつき芽衣",
+	"筱田优":   "篠田ゆう",
+	"纱仓真菜":  "紗倉まな",
+	"藤浦惠":   "藤浦めぐ",
+	"辻井穗乃果": "辻井ほのか",
+	"香水纯":   "香水じゅん",
+	"白峰美羽":  "白峰ミウ",
+	"黑川纱里奈": "黒川サリナ",
+}
 
 var defaultGfriendsIndexURLs = []string{
 	"https://raw.githubusercontent.com/gfriends/gfriends/master/Filetree.json",
@@ -199,14 +230,19 @@ func (s *GfriendsAvatarService) loadIndexFromFile(indexPath string, stamp time.T
 
 func (s *GfriendsAvatarService) loadIndex(data []byte, stamp time.Time) error {
 	var filetree struct {
-		Content map[string]map[string]string `json:"Content"`
+		Content json.RawMessage `json:"Content"`
 	}
 	if err := json.Unmarshal(data, &filetree); err != nil {
 		return err
 	}
+	studios, err := decodeGfriendsStudios(filetree.Content)
+	if err != nil {
+		return err
+	}
 
 	index := make(map[string]AvatarCandidate)
-	for studio, files := range filetree.Content {
+	for _, entry := range studios {
+		studio, files := entry.name, entry.files
 		for aliasFileName, targetWithQuery := range files {
 			targetFileName, query := splitGfriendsTarget(targetWithQuery)
 			if targetFileName == "" {
@@ -226,6 +262,13 @@ func (s *GfriendsAvatarService) loadIndex(data []byte, stamp time.Time) error {
 			}
 		}
 	}
+	for alias, canonical := range gfriendsActorAliases {
+		candidate, ok := index[normalizeGfriendsName(canonical)]
+		if !ok {
+			continue
+		}
+		index[normalizeGfriendsName(alias)] = candidate
+	}
 
 	s.mu.Lock()
 	s.index = index
@@ -233,6 +276,43 @@ func (s *GfriendsAvatarService) loadIndex(data []byte, stamp time.Time) error {
 	s.indexStamp = stamp
 	s.mu.Unlock()
 	return nil
+}
+
+type gfriendsStudioFiles struct {
+	name  string
+	files map[string]string
+}
+
+func decodeGfriendsStudios(content json.RawMessage) ([]gfriendsStudioFiles, error) {
+	decoder := json.NewDecoder(bytes.NewReader(content))
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
+		return nil, fmt.Errorf("invalid gfriends Content object")
+	}
+
+	var studios []gfriendsStudioFiles
+	for decoder.More() {
+		nameToken, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		name, ok := nameToken.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid gfriends studio name")
+		}
+		var files map[string]string
+		if err := decoder.Decode(&files); err != nil {
+			return nil, err
+		}
+		studios = append(studios, gfriendsStudioFiles{name: name, files: files})
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, err
+	}
+	return studios, nil
 }
 
 func (s *GfriendsAvatarService) downloadCandidate(candidate AvatarCandidate) ([]byte, error) {
@@ -373,7 +453,7 @@ func actorStem(fileName string) string {
 }
 
 func normalizeGfriendsName(value string) string {
-	value = actorStem(value)
+	value = model.NormalizeChineseVariants(actorStem(value))
 	var builder strings.Builder
 	for _, r := range value {
 		if unicode.IsLetter(r) || unicode.IsNumber(r) {

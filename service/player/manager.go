@@ -84,6 +84,16 @@ func NewPlaybackSessionManager(adapter PlayerAdapter, store HistoryStore, events
 
 // Play loads resume state before launch. A warning means playback started but sync did not.
 func (m *PlaybackSessionManager) Play(ctx context.Context, mediaID, filePath, executablePath string) error {
+	return m.play(ctx, mediaID, filePath, executablePath, nil)
+}
+
+// PlayAt launches playback and explicitly seeks to the requested position once
+// the new player window is ready.
+func (m *PlaybackSessionManager) PlayAt(ctx context.Context, mediaID, filePath, executablePath string, position time.Duration) error {
+	return m.play(ctx, mediaID, filePath, executablePath, &position)
+}
+
+func (m *PlaybackSessionManager) play(ctx context.Context, mediaID, filePath, executablePath string, startPosition *time.Duration) error {
 	if m == nil || m.adapter == nil {
 		return ErrUnsupported
 	}
@@ -109,6 +119,9 @@ func (m *PlaybackSessionManager) Play(ctx context.Context, mediaID, filePath, ex
 		return fmt.Errorf("load playback history: %w", err)
 	}
 	history.MediaID = mediaID
+	if startPosition != nil {
+		history.Position = *startPosition
+	}
 	result, err := m.adapter.Start(ctx, executablePath, filePath)
 	if err != nil {
 		return err
@@ -123,7 +136,7 @@ func (m *PlaybackSessionManager) Play(ctx context.Context, mediaID, filePath, ex
 	id := m.nextID.Add(1)
 	sessionCtx, cancel := context.WithCancel(m.ctx)
 	s := &managedSession{id: id, mediaID: mediaID, player: result.Session, cancel: cancel, history: history, state: StateStarting, done: make(chan struct{})}
-	if history.Duration > 0 && history.Position > 0 && float64(history.Position)/float64(history.Duration) < 0.90 {
+	if startPosition != nil || (history.Duration > 0 && history.Position > 0 && float64(history.Position)/float64(history.Duration) < 0.90) {
 		s.seekPending = true
 	}
 	m.mu.Lock()
@@ -135,6 +148,45 @@ func (m *PlaybackSessionManager) Play(ctx context.Context, mediaID, filePath, ex
 	if result.Warning != nil {
 		return &StartedWithoutSyncError{Cause: result.Warning}
 	}
+	return nil
+}
+
+// ResetPosition stops any active session before clearing the saved resume point.
+// Waiting for the old session first prevents its final save from restoring the
+// position that was just cleared.
+func (m *PlaybackSessionManager) ResetPosition(ctx context.Context, mediaID string) error {
+	if m == nil || m.store == nil {
+		return ErrUnsupported
+	}
+	m.playMu.Lock()
+	defer m.playMu.Unlock()
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return errors.New("playback session manager is shut down")
+	}
+	old := m.sessions[m.byMedia[mediaID]]
+	m.mu.Unlock()
+	if old != nil {
+		old.cancel()
+		select {
+		case <-old.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	history, err := m.store.Load(ctx, mediaID)
+	if err != nil {
+		return fmt.Errorf("load playback history: %w", err)
+	}
+	history.MediaID = mediaID
+	history.Position = 0
+	history.UpdatedAt = time.Now()
+	if err := m.store.Save(ctx, &history); err != nil {
+		return fmt.Errorf("reset playback history: %w", err)
+	}
+	m.emitHistory(mediaID, StateStarting, history)
 	return nil
 }
 
@@ -237,6 +289,10 @@ func (m *PlaybackSessionManager) saveWithRetry(ctx context.Context, s *managedSe
 }
 
 func (m *PlaybackSessionManager) emit(s *managedSession, history History) {
+	m.emitHistory(s.mediaID, s.state, history)
+}
+
+func (m *PlaybackSessionManager) emitHistory(mediaID string, state PlaybackState, history History) {
 	if m.events == nil {
 		return
 	}
@@ -245,7 +301,7 @@ func (m *PlaybackSessionManager) emit(s *managedSession, history History) {
 	if h.Duration > 0 {
 		percent = float64(h.Position) / float64(h.Duration) * 100
 	}
-	m.events.MediaStateUpdated(StateEvent{MediaID: s.mediaID, Position: h.Position.Seconds(), Duration: h.Duration.Seconds(), ProgressPercent: percent, Completed: h.Completed, IsWatched: h.Completed, LastWatchedAt: h.UpdatedAt, PlaybackState: s.state, Revision: m.revision.Add(1)})
+	m.events.MediaStateUpdated(StateEvent{MediaID: mediaID, Position: h.Position.Seconds(), Duration: h.Duration.Seconds(), ProgressPercent: percent, Completed: h.Completed, IsWatched: h.Completed, LastWatchedAt: h.UpdatedAt, PlaybackState: state, Revision: m.revision.Add(1)})
 }
 
 func (m *PlaybackSessionManager) remove(s *managedSession) {

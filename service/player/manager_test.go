@@ -54,10 +54,11 @@ func (s *fakeSession) Seek(_ context.Context, p time.Duration) error {
 func (s *fakeSession) Detach() error { s.mu.Lock(); s.closed = true; s.mu.Unlock(); return nil }
 
 type fakeStore struct {
-	mu       sync.Mutex
-	loaded   History
-	saves    []History
-	failures int
+	mu           sync.Mutex
+	loaded       History
+	saves        []History
+	failures     int
+	persistLoads bool
 }
 
 func (s *fakeStore) Load(context.Context, string) (History, error) {
@@ -73,6 +74,9 @@ func (s *fakeStore) Save(_ context.Context, h *History) error {
 		return errors.New("locked")
 	}
 	s.saves = append(s.saves, *h)
+	if s.persistLoads {
+		s.loaded = *h
+	}
 	return nil
 }
 
@@ -242,4 +246,49 @@ func TestReplacingMediaSessionFinalizesOldBeforeNewRevision(t *testing.T) {
 	}
 	events.mu.Unlock()
 	_ = m.Shutdown(context.Background())
+}
+
+func TestResetPositionWaitsForOldSessionAndPreservesWatched(t *testing.T) {
+	store := &fakeStore{
+		loaded:       History{MediaID: "same", Position: 50 * time.Second, Duration: 100 * time.Second, Completed: true},
+		persistLoads: true,
+	}
+	m, adapter, events := testManager(store)
+	t.Cleanup(func() { _ = m.Shutdown(context.Background()) })
+	if err := m.Play(context.Background(), "same", "old.mkv", "potplayer"); err != nil {
+		t.Fatal(err)
+	}
+	old := adapter.latest()
+	old.samples <- sample(1, 100, StatePlaying)
+	waitFor(t, func() bool { old.mu.Lock(); defer old.mu.Unlock(); return len(old.seeks) == 1 })
+	old.samples <- sample(60, 100, StatePlaying)
+	waitFor(t, func() bool { return saveCount(store) >= 1 })
+
+	if err := m.ResetPosition(context.Background(), "same"); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	last := store.saves[len(store.saves)-1]
+	store.mu.Unlock()
+	if last.Position != 0 || !last.Completed {
+		t.Fatalf("reset changed the wrong playback fields: %+v", last)
+	}
+	events.mu.Lock()
+	lastEvent := events.events[len(events.events)-1]
+	events.mu.Unlock()
+	if lastEvent.Position != 0 || lastEvent.ProgressPercent != 0 || !lastEvent.IsWatched {
+		t.Fatalf("unexpected reset event: %+v", lastEvent)
+	}
+
+	if err := m.PlayAt(context.Background(), "same", "new.mkv", "potplayer", 0); err != nil {
+		t.Fatal(err)
+	}
+	newSession := adapter.latest()
+	newSession.samples <- sample(1, 100, StatePlaying)
+	waitFor(t, func() bool { newSession.mu.Lock(); defer newSession.mu.Unlock(); return len(newSession.seeks) == 1 })
+	newSession.mu.Lock()
+	defer newSession.mu.Unlock()
+	if newSession.seeks[0] != 0 {
+		t.Fatalf("restart did not explicitly seek to zero: %v", newSession.seeks)
+	}
 }

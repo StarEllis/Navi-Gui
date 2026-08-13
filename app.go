@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -507,6 +508,11 @@ func (a *App) hydrateLibraryForClient(lib *model.Library) {
 	var count int64
 	_ = a.db.Model(&model.Media{}).Where("library_id = ?", lib.ID).Count(&count).Error
 	lib.MediaCount = int(count)
+	var totalSize sql.NullInt64
+	_ = a.db.Model(&model.Media{}).Where("library_id = ?", lib.ID).Select("SUM(file_size)").Scan(&totalSize).Error
+	if totalSize.Valid {
+		lib.TotalSize = totalSize.Int64
+	}
 	lib.HydratePathConfig()
 }
 
@@ -848,6 +854,13 @@ type StatsItem struct {
 	Count       int    `json:"count"`
 	Image       string `json:"image"`
 	FilterValue string `json:"filter_value"`
+}
+
+type actorStatsRow struct {
+	ID         string
+	Name       string
+	ProfileURL string
+	Count      int
 }
 
 const desktopUserID = "desktop_user"
@@ -1417,13 +1430,7 @@ func (a *App) GetDirectoryStats(libraryID string) ([]StatsItem, error) {
 
 // GetActorStats 获取演员聚合统计
 func (a *App) GetActorStats(libraryID string) ([]StatsItem, error) {
-	type Result struct {
-		ID         string
-		Name       string
-		ProfileURL string
-		Count      int
-	}
-	var rawResults []Result
+	var rawResults []actorStatsRow
 	err := a.db.Raw(`
 		SELECT p.id, p.name, p.profile_url, COUNT(mp.media_id) as count
 		FROM people p
@@ -1436,6 +1443,9 @@ func (a *App) GetActorStats(libraryID string) ([]StatsItem, error) {
 	if err != nil {
 		return nil, err
 	}
+	if a.gfriendsAvatarsEnabled() {
+		a.backfillActorStatsAvatars(rawResults)
+	}
 
 	var results []StatsItem
 	for _, r := range rawResults {
@@ -1447,6 +1457,79 @@ func (a *App) GetActorStats(libraryID string) ([]StatsItem, error) {
 		})
 	}
 	return results, nil
+}
+
+func (a *App) gfriendsAvatarsEnabled() bool {
+	if a == nil || a.avatarService == nil {
+		return false
+	}
+	settings, err := a.GetDesktopSettings()
+	if err != nil || settings == nil {
+		return true
+	}
+	return settings.EnableGfriendsAvatars
+}
+
+func (a *App) backfillActorStatsAvatars(rows []actorStatsRow) {
+	if a == nil || a.avatarService == nil || a.db == nil {
+		return
+	}
+
+	type avatarResult struct {
+		index  int
+		person *model.Person
+		err    error
+	}
+	jobs := make(chan int)
+	completed := make(chan avatarResult, len(rows))
+	workerCount := 6
+	if len(rows) < workerCount {
+		workerCount = len(rows)
+	}
+
+	var workers sync.WaitGroup
+	for worker := 0; worker < workerCount; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				row := rows[index]
+				person := &model.Person{ID: row.ID, Name: row.Name, ProfileURL: row.ProfileURL}
+				changed, err := a.avatarService.EnsureActorAvatar(person)
+				if !changed && err == nil {
+					continue
+				}
+				completed <- avatarResult{index: index, person: person, err: err}
+			}
+		}()
+	}
+
+	for index := range rows {
+		if strings.TrimSpace(rows[index].ProfileURL) == "" {
+			jobs <- index
+		}
+	}
+	close(jobs)
+	workers.Wait()
+	close(completed)
+
+	for result := range completed {
+		if result.err != nil {
+			if a.logger != nil {
+				a.logger.Debugf("backfill actor avatar failed: actor=%s err=%v", result.person.Name, result.err)
+			}
+			continue
+		}
+		if err := a.db.Model(&model.Person{}).
+			Where("id = ?", result.person.ID).
+			Update("profile_url", result.person.ProfileURL).Error; err != nil {
+			if a.logger != nil {
+				a.logger.Warnf("persist actor avatar failed: actor=%s err=%v", result.person.Name, err)
+			}
+			continue
+		}
+		rows[result.index].ProfileURL = result.person.ProfileURL
+	}
 }
 
 // GetGenreStats 获取类别聚合统计
@@ -2810,6 +2893,10 @@ func (s playbackEventSink) MediaStateUpdated(event player.StateEvent) {
 
 // PlayMedia starts playback and tracks progress against the stable media ID.
 func (a *App) PlayMedia(mediaID string, filePath string) error {
+	return a.playMedia(mediaID, filePath, nil)
+}
+
+func (a *App) playMedia(mediaID string, filePath string, startPosition *time.Duration) error {
 	mediaID = strings.TrimSpace(mediaID)
 	if mediaID == "" {
 		return fmt.Errorf("empty media ID")
@@ -2840,7 +2927,12 @@ func (a *App) PlayMedia(mediaID string, filePath string) error {
 		settings, _ := a.GetDesktopSettings()
 		playerPath := preferredPlayerPath(settings, false)
 		if isPotPlayerExecutable(playerPath) {
-			err := a.playback.Play(a.ctx, media.ID, targetPath, playerPath)
+			var err error
+			if startPosition != nil {
+				err = a.playback.PlayAt(a.ctx, media.ID, targetPath, playerPath, *startPosition)
+			} else {
+				err = a.playback.Play(a.ctx, media.ID, targetPath, playerPath)
+			}
 			if err == nil {
 				appendPlayLatencyLog("OK_TRACKING path=%q media=%q total=%s", targetPath, media.ID, time.Since(totalStart))
 				return nil
@@ -2866,7 +2958,59 @@ func (a *App) PlayMedia(mediaID string, filePath string) error {
 		return err
 	}
 	appendPlayLatencyLog("OK_UNTRACKED path=%q media=%q player=%q total=%s", targetPath, media.ID, playerPath, time.Since(totalStart))
+	// 没配外部播放器时会走系统默认程序，进度不可能回传。以前这里是完全静默的，
+	// 结果就是「播完回来没有进度条」而没有任何线索。故意选了别的播放器的不打扰。
+	if playerPath == "" && a.eventHub != nil {
+		a.eventHub.BroadcastEvent(service.EventPlayerSyncWarning, map[string]string{
+			"media_id": media.ID,
+			"message":  "已用系统默认程序播放，未记录进度：请在设置里启用外部播放器并指向 PotPlayer",
+		})
+	}
 	return nil
+}
+
+// RestartMedia clears the persisted resume point before launching playback.
+// The watched flag is intentionally preserved: restarting is not marking unseen.
+func (a *App) RestartMedia(mediaID string, filePath string) error {
+	mediaID = strings.TrimSpace(mediaID)
+	if mediaID == "" {
+		return fmt.Errorf("empty media ID")
+	}
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if a.playback != nil {
+		if err := a.playback.ResetPosition(ctx, mediaID); err != nil {
+			return err
+		}
+	} else {
+		store := player.NewGormHistoryStore(a.db, desktopUserID)
+		history, err := store.Load(ctx, mediaID)
+		if err != nil {
+			return err
+		}
+		history.MediaID = mediaID
+		history.Position = 0
+		history.UpdatedAt = time.Now()
+		if err := store.Save(ctx, &history); err != nil {
+			return err
+		}
+		if a.eventHub != nil {
+			position, duration, progress := 0.0, history.Duration.Seconds(), 0.0
+			completed, isWatched := history.Completed, history.Completed
+			lastWatchedAt := history.UpdatedAt
+			playbackState := string(player.StateStarting)
+			a.eventHub.BroadcastEvent(service.EventMediaStateUpdated, service.MediaStateEventData{
+				MediaID: mediaID, Position: &position, Duration: &duration,
+				ProgressPercent: &progress, Completed: &completed, IsWatched: &isWatched,
+				LastWatchedAt: &lastWatchedAt, PlaybackState: &playbackState,
+				Revision: a.mediaStateRevision.Add(1),
+			})
+		}
+	}
+	startPosition := time.Duration(0)
+	return a.playMedia(mediaID, filePath, &startPosition)
 }
 
 func isPotPlayerExecutable(path string) bool {

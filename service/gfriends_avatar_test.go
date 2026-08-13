@@ -142,6 +142,62 @@ func TestGfriendsAvatarServiceRefreshIndexOnlyDownloadsOnceConcurrently(t *testi
 	}
 }
 
+func TestGfriendsAvatarServiceMatchesChineseAndJapaneseNameVariants(t *testing.T) {
+	service := NewGfriendsAvatarService(GfriendsAvatarOptions{})
+	if err := service.loadIndex([]byte(`{
+		"Content": {
+			"StudioA": {
+				"有馬美玖.jpg": "有馬美玖.jpg",
+				"仲村みう.jpg": "仲村みう.jpg",
+				"桃乃木かな.jpg": "桃乃木かな.jpg",
+				"水卜さくら.jpg": "水卜さくら.jpg",
+				"さつき芽衣.jpg": "さつき芽衣.jpg",
+				"白峰ミウ.jpg": "白峰ミウ.jpg"
+			}
+		}
+	}`), time.Now()); err != nil {
+		t.Fatalf("load index: %v", err)
+	}
+
+	tests := map[string]string{
+		"有马美玖":  "有馬美玖.jpg",
+		"仲村美羽":  "仲村みう.jpg",
+		"桃乃木香奈": "桃乃木かな.jpg",
+		"水卜樱":   "水卜さくら.jpg",
+		"沙月芽衣":  "さつき芽衣.jpg",
+		"白峰美羽":  "白峰ミウ.jpg",
+	}
+	for name, expectedFile := range tests {
+		candidate, ok := service.FindCandidate(name)
+		if !ok {
+			t.Fatalf("expected %q to match", name)
+		}
+		if candidate.FileName != expectedFile {
+			t.Fatalf("candidate for %q = %q, want %q", name, candidate.FileName, expectedFile)
+		}
+	}
+}
+
+func TestGfriendsAvatarServicePrefersLaterHigherQualityStudio(t *testing.T) {
+	service := NewGfriendsAvatarService(GfriendsAvatarOptions{})
+	if err := service.loadIndex([]byte(`{
+		"Content": {
+			"9-Javrave": {"桃乃木かな.jpg": "桃乃木かな.jpg"},
+			"0-Hand-Storage": {"桃乃木かな.jpg": "桃乃木かな.jpg"}
+		}
+	}`), time.Now()); err != nil {
+		t.Fatalf("load index: %v", err)
+	}
+
+	candidate, ok := service.FindCandidate("桃乃木香奈")
+	if !ok {
+		t.Fatal("expected 桃乃木香奈 to match")
+	}
+	if candidate.Studio != "0-Hand-Storage" {
+		t.Fatalf("studio = %q, want highest-quality 0-Hand-Storage", candidate.Studio)
+	}
+}
+
 func TestGfriendsAvatarServiceRejectsNonImageDownload(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
@@ -158,12 +214,29 @@ func TestGfriendsAvatarServiceRejectsNonImageDownload(t *testing.T) {
 func TestGfriendsAvatarServiceRejectsOversizedDownload(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/jpeg")
-		fmt.Fprint(w, strings.Repeat("x", (2<<20)+1))
+		fmt.Fprint(w, strings.Repeat("x", maxGfriendsAvatarBytes+1))
 	}))
 	defer server.Close()
 
 	service := NewGfriendsAvatarService(GfriendsAvatarOptions{Client: server.Client()})
 	if _, err := service.downloadURL(server.URL + "/avatar.jpg"); err == nil {
 		t.Fatalf("expected oversized download to be rejected")
+	}
+}
+
+func TestGfriendsAvatarServiceAllowsAvatarAboveTwoMiB(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/jpeg")
+		fmt.Fprint(w, strings.Repeat("x", (2<<20)+1))
+	}))
+	defer server.Close()
+
+	service := NewGfriendsAvatarService(GfriendsAvatarOptions{Client: server.Client()})
+	data, err := service.downloadURL(server.URL + "/avatar.jpg")
+	if err != nil {
+		t.Fatalf("expected avatar above two MiB to be allowed: %v", err)
+	}
+	if len(data) != (2<<20)+1 {
+		t.Fatalf("downloaded %d bytes", len(data))
 	}
 }

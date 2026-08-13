@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { Info, Play, TriangleAlert } from 'lucide-react';
 import './App.css';
 import './library-refine.css';
+import './navi-redesign.css';
 import {
     GetActorStats,
     GetDesktopSettings,
@@ -13,7 +15,11 @@ import { EventsOn, WindowSetDarkTheme, WindowSetTitle } from "../wailsjs/runtime
 import Sidebar from './components/Sidebar';
 import TopBar from './components/TopBar';
 import MediaGrid, { getMediaListCacheKey, type MediaGridMutation } from './components/MediaGrid';
-import CategoryGrid from './components/CategoryGrid';
+import CategoryGrid, {
+    type CategorySortField,
+    type CategoryStats,
+    type CategoryViewMode,
+} from './components/CategoryGrid';
 import SettingsPage from './components/SettingsPage';
 import LibraryModal from './components/LibraryModal';
 import LibraryEditModal from './components/LibraryEditModal';
@@ -32,8 +38,10 @@ import {
     type MediaStateUpdate,
 } from './utils/mediaPlaybackState';
 import { markComponentRender } from './utils/performanceDiagnostics';
+import type { StatusKind } from './types/status';
 import { putBoundedScrollState } from './utils/listViewState';
 import { getTopBarBackLabel } from './utils/filterNavigation';
+import { formatLastScanLabel, formatLibrarySize } from './utils/library';
 import { shouldReplaceActorFilterOnSearchChange } from './utils/mediaSearch';
 import {
     loadSortPreferences,
@@ -58,6 +66,8 @@ import {
 } from './utils/scanTaskEvents';
 
 type ViewName = 'libs' | 'settings' | 'actor' | 'genre' | 'watched' | 'favorite';
+type StatusAction = { label: string; onClick: () => void };
+type StatusToast = { text: string; kind: StatusKind; action?: StatusAction } | null;
 type SortOption = { field: SortField; label: string };
 type FilterState = { type: string; value: string; label: string; showHeaderLabel?: boolean } | null;
 type FilterReturnContext = {
@@ -68,6 +78,10 @@ type FilterReturnContext = {
 } | null;
 const APP_TITLE = 'Navi';
 
+// 刮削事件是成串来的：先攒 1.2s，且两次真正的刷新之间至少隔 2s。
+const METADATA_REFRESH_DEBOUNCE_MS = 1200;
+const METADATA_REFRESH_MIN_INTERVAL_MS = 2000;
+
 const VIEW_LABELS: Record<Exclude<ViewName, 'libs'>, string> = {
     settings: '设置',
     actor: '演员',
@@ -75,6 +89,22 @@ const VIEW_LABELS: Record<Exclude<ViewName, 'libs'>, string> = {
     watched: '已看',
     favorite: '收藏',
 };
+
+const FILTER_KIND_LABELS: Record<string, string> = {
+    actor: '演员',
+    genre: '类别',
+    series: '系列',
+    watched: '已看',
+    favorite: '收藏',
+};
+
+const EMPTY_CATEGORY_STATS: CategoryStats = { total: 0, withImage: 0, works: 0 };
+
+// 演员/类别页的排序维度与媒体列表不同，所以不复用 SortField。
+const CATEGORY_SORT_OPTIONS: Array<{ field: string; label: string }> = [
+    { field: 'count', label: '作品数' },
+    { field: 'name', label: '名称' },
+];
 
 const SEARCH_INPUT_VIEWS = new Set<ViewName>(['libs', 'watched', 'favorite', 'actor', 'genre']);
 const MEDIA_ACTION_VIEWS = new Set<ViewName>(['libs', 'watched', 'favorite']);
@@ -166,13 +196,18 @@ function App() {
     const [showLibModal, setShowLibModal] = useState(false);
     const [editingLib, setEditingLib] = useState<any>(null);
     const [selectedMedia, setSelectedMedia] = useState<any>(null);
-    const [statusMsg, setStatusMsg] = useState('');
+    const [statusToast, setStatusToast] = useState<StatusToast>(null);
     const [mediaCount, setMediaCount] = useState(() => {
         const initialCount = initialLibraryState.currentLibrary?.media_count;
         return typeof initialCount === 'number' ? initialCount : 0;
     });
     const [activeFilter, setActiveFilter] = useState<FilterState>(null);
     const [filterReturnContext, setFilterReturnContext] = useState<FilterReturnContext>(null);
+    const [categoryStats, setCategoryStats] = useState<CategoryStats>(EMPTY_CATEGORY_STATS);
+    const [categorySort, setCategorySort] = useState<{ field: CategorySortField; order: SortOrder }>(
+        { field: 'count', order: 'desc' },
+    );
+    const [categoryViewMode, setCategoryViewMode] = useState<CategoryViewMode>('grid');
     const [sortStateByView, setSortStateByView] = useState<Record<SortViewName, SortConfig>>(() => loadSortPreferences());
     const [gridScrollTops, setGridScrollTops] = useState<Record<string, number>>({});
     const [listMutation, setListMutation] = useState<MediaGridMutation | null>(null);
@@ -183,6 +218,7 @@ function App() {
     const scanTaskLifecycleRef = useRef(createScanTaskLifecycle());
     const resetTitleTimerRef = useRef<number | null>(null);
     const metadataRefreshTimerRef = useRef<number | null>(null);
+    const lastContentRefreshAtRef = useRef(0);
     const statusTimerRef = useRef<number | null>(null);
     const currentLibRef = useRef<any>(null);
     const mediaStateByIDRef = useRef(new Map<string, MediaStateUpdate>());
@@ -252,13 +288,13 @@ function App() {
         setAppTitle(`${APP_TITLE} - ${fallbackPrefix}${ratioText}${detail}${suffix}`);
     };
 
-    const showStatus = useCallback((msg: string) => {
-        setStatusMsg(msg);
+    const showStatus = useCallback((msg: string, kind: StatusKind = 'info', action?: StatusAction) => {
+        setStatusToast({ text: msg, kind, action });
         if (statusTimerRef.current !== null) {
             window.clearTimeout(statusTimerRef.current);
         }
         statusTimerRef.current = window.setTimeout(() => {
-            setStatusMsg('');
+            setStatusToast(null);
             statusTimerRef.current = null;
         }, 5000);
     }, []);
@@ -432,6 +468,7 @@ function App() {
             scanStartedAtRef.current = null;
             scanModeRef.current = '';
             scheduleTitleReset();
+            lastContentRefreshAtRef.current = Date.now();
             setContentRefreshVersion((prev) => prev + 1);
         };
 
@@ -442,13 +479,26 @@ function App() {
                 return;
             }
 
+            // 扫描 / 刮削时这个事件是连着来的，每刷一次整张网格就重排一次。
+            // 扫描期间干脆不刷：scan:completed 收尾时会补一次整表刷新；
+            // 详情页那条媒体走 media:state-updated 单条更新，不需要整列刷。
+            if (activeLibraryId && scanProgressStore.getSnapshot(activeLibraryId)) {
+                return;
+            }
+
             if (metadataRefreshTimerRef.current !== null) {
                 window.clearTimeout(metadataRefreshTimerRef.current);
             }
+            const sinceLastRefresh = Date.now() - lastContentRefreshAtRef.current;
+            const delay = Math.max(
+                METADATA_REFRESH_DEBOUNCE_MS,
+                METADATA_REFRESH_MIN_INTERVAL_MS - sinceLastRefresh,
+            );
             metadataRefreshTimerRef.current = window.setTimeout(() => {
+                lastContentRefreshAtRef.current = Date.now();
                 setContentRefreshVersion((prev) => prev + 1);
                 metadataRefreshTimerRef.current = null;
-            }, 250);
+            }, delay);
         });
 
         const unsubMediaState = EventsOn("media:state-updated", (data: any) => {
@@ -483,7 +533,10 @@ function App() {
 
 		const unsubPlayerSyncWarning = EventsOn("player:sync-warning", (data: any) => {
 			const message = typeof data?.message === 'string' ? data.message.trim() : '';
-			showStatus(message || 'PotPlayer 播放已启动，但进度同步不可用');
+			showStatus(message || 'PotPlayer 播放已启动，但进度同步不可用', 'error', {
+				label: '去设置',
+				onClick: () => handleOpenSettings(),
+			});
 		});
 
         const onScanFail = (data: any) => {
@@ -493,7 +546,7 @@ function App() {
             if (currentLibRef.current?.id !== scanEventIdentity(data).libraryId) {
                 return;
             }
-            showStatus(`扫描失败：${data?.message || '未知错误'}`);
+            showStatus(`扫描失败：${data?.message || '未知错误'}`, 'error');
             updateScanTitle(data, '失败 ');
             scanStartedAtRef.current = null;
             scanModeRef.current = '';
@@ -507,7 +560,7 @@ function App() {
             if (currentLibRef.current?.id !== scanEventIdentity(data).libraryId) {
                 return;
             }
-            showStatus(`扫描未完成：${data?.message || '目录无法完整访问'}`);
+            showStatus(`扫描未完成：${data?.message || '目录无法完整访问'}`, 'error');
             updateScanTitle(data, '未完成 ');
             scanStartedAtRef.current = null;
             scanModeRef.current = '';
@@ -640,6 +693,13 @@ function App() {
         });
     }, []);
 
+    // 网格卡片上的收藏等操作只应更新列表，不能像详情页那样把媒体设为当前选中项。
+    const handleListMediaChange = useCallback((media: any) => {
+        seedMediaDetailCache(media);
+        setListMutation({ type: 'merge', media });
+        setSelectedMedia((prev: any) => (prev && prev.id === media.id ? { ...prev, ...media } : prev));
+    }, []);
+
     const handleDetailDelete = useCallback((mediaID: string) => {
         setListMutation({ type: 'remove', mediaId: mediaID });
         setSelectedMedia((prev: any) => (prev?.id === mediaID ? null : prev));
@@ -686,7 +746,7 @@ function App() {
             try {
                 await startScanForLibrary(createdLib.id, 'incremental');
             } catch (error) {
-                showStatus(`新建媒体库成功，但自动扫描失败：${formatError(error)}`);
+                showStatus(`新建媒体库成功，但自动扫描失败：${formatError(error)}`, 'error');
             }
             return;
         }
@@ -719,7 +779,7 @@ function App() {
         try {
             await startScanForLibrary(libraryId, mode);
         } catch (error) {
-            showStatus(`扫描启动失败：${formatError(error)}`);
+            showStatus(`扫描启动失败：${formatError(error)}`, 'error');
         } finally {
             scanRequestPendingRef.current.delete(libraryId);
             setScanRequestPendingLibraryID((current) => current === libraryId ? '' : current);
@@ -731,9 +791,9 @@ function App() {
         }
         try {
             const filename = await PlayRandomLibraryMedia(currentLib.id);
-            showStatus(`随机播放：${filename}`);
+            showStatus(`随机播放：${filename}`, 'play');
         } catch (error) {
-            showStatus(`随机播放失败：${formatError(error)}`);
+            showStatus(`随机播放失败：${formatError(error)}`, 'error');
         }
     };
 
@@ -761,18 +821,66 @@ function App() {
         });
     };
 
+    // 演员/类别页有自己的排序（作品数 / 名称），与媒体列表的排序互不影响。
+    const handleCategorySortSelect = (field: string) => {
+        const nextField = field as CategorySortField;
+        setCategorySort((prev) => (
+            prev.field === nextField
+                ? { field: prev.field, order: prev.order === 'desc' ? 'asc' : 'desc' }
+                : { field: nextField, order: 'desc' }
+        ));
+    };
+
+    const handleCategoryStatsChange = useCallback((stats: CategoryStats) => {
+        setCategoryStats((prev) => (
+            prev.total === stats.total && prev.withImage === stats.withImage && prev.works === stats.works
+                ? prev
+                : stats
+        ));
+    }, []);
+
     const currentLibraryName = currentLib?.name || '未选择媒体库';
     const baseCount = typeof currentLib?.media_count === 'number' ? currentLib.media_count : mediaCount;
     const headerCount = (view === 'libs' || view === 'watched' || view === 'favorite') ? mediaCount : baseCount;
-    const topBarBackLabel = getTopBarBackLabel(filterReturnContext, view);
-    const topBarBackAction = filterReturnContext
+    const showFilterInHeading = Boolean(activeFilter?.label) && activeFilter?.showHeaderLabel !== false;
+    const headerTitle = view === 'settings'
+        ? VIEW_LABELS.settings
+        : showFilterInHeading
+            ? (activeFilter?.label || '')
+            : view === 'libs'
+                ? currentLibraryName
+                : VIEW_LABELS[view];
+    // 媒体库概览：部数 · 容量 · 上次扫描；筛选态下只说明当前结果条数。
+    const libraryOverview = [
+        `${(headerCount || 0).toLocaleString()} 部`,
+        formatLibrarySize(currentLib?.total_size),
+        formatLastScanLabel(currentLib?.last_scan),
+    ].filter(Boolean).join(' · ');
+    const headerStats = view === 'actor'
+        ? `${categoryStats.total} 人 · ${categoryStats.withImage} 人有头像 · 覆盖 ${categoryStats.works.toLocaleString()} 部`
+        : view === 'genre'
+            ? `${categoryStats.total} 个类别`
+            : view === 'settings'
+                ? 'Navi 1.4.0 · 配置已同步'
+                : (view === 'libs' && !activeFilter && !searchKeyword.trim())
+                    ? libraryOverview
+                    : `${(headerCount || 0).toLocaleString()} 部`;
+    const topBarBackLabel = view === 'settings' ? '返回媒体库' : getTopBarBackLabel(filterReturnContext, view);
+    const topBarBackAction = view === 'settings'
+        ? handleNavigateHome
+        : filterReturnContext
         ? returnToFilterSource
         : topBarBackLabel
             ? handleNavigateHome
             : undefined;
     const searchEnabled = Boolean(currentLib && SEARCH_INPUT_VIEWS.has(view));
+    // 已看 / 收藏 一条都没有时，搜索框没有可搜的目标，整体压暗并禁用。
+    const isEmptyListView = (view === 'watched' || view === 'favorite')
+        && mediaCount === 0
+        && !searchKeyword.trim();
     const showLibraryActions = Boolean(currentLib && view === 'libs');
     const showListActions = Boolean(currentLib && MEDIA_ACTION_VIEWS.has(view));
+    const showCategorySort = Boolean(currentLib && (view === 'actor' || view === 'genre'));
     const searchPlaceholder = view === 'actor'
         ? '\u641c\u7d22\u6f14\u5458'
         : view === 'genre'
@@ -810,6 +918,7 @@ function App() {
                         onSelectMedia={handleSelectMedia}
                         onCountChange={setMediaCount}
                         onQuickPlayStatus={showStatus}
+                        onMediaChange={handleListMediaChange}
                         initialScrollTop={currentGridScrollTop}
                         onScrollPositionChange={handleGridScrollPositionChange}
                         mutation={listMutation}
@@ -828,6 +937,7 @@ function App() {
                         onSelectMedia={handleSelectMedia}
                         onCountChange={setMediaCount}
                         onQuickPlayStatus={showStatus}
+                        onMediaChange={handleListMediaChange}
                         initialScrollTop={currentGridScrollTop}
                         onScrollPositionChange={handleGridScrollPositionChange}
                         mutation={listMutation}
@@ -840,8 +950,12 @@ function App() {
                         libraryId={currentLib.id}
                         keyword={mediaSearchKeyword}
                         refreshVersion={contentRefreshVersion}
+                        sortField={categorySort.field}
+                        sortOrder={categorySort.order}
+                        viewMode={categoryViewMode}
                         fetchFn={GetActorStats}
                         onSelect={(value, label) => applyFilterFromView('actor', { type: 'actor', value, label })}
+                        onStatsChange={handleCategoryStatsChange}
                     />
                 );
             case 'genre':
@@ -851,8 +965,11 @@ function App() {
                         libraryId={currentLib.id}
                         keyword={searchKeyword}
                         refreshVersion={contentRefreshVersion}
+                        sortField={categorySort.field}
+                        sortOrder={categorySort.order}
                         fetchFn={GetGenreStats}
                         onSelect={(value, label) => applyFilterFromView('genre', { type: 'genre', value, label })}
+                        onStatsChange={handleCategoryStatsChange}
                     />
                 );
             case 'settings':
@@ -871,6 +988,7 @@ function App() {
                         onSelectMedia={handleSelectMedia}
                         onCountChange={setMediaCount}
                         onQuickPlayStatus={showStatus}
+                        onMediaChange={handleListMediaChange}
                         initialScrollTop={currentGridScrollTop}
                         onScrollPositionChange={handleGridScrollPositionChange}
                         mutation={listMutation}
@@ -898,24 +1016,43 @@ function App() {
                     <div className="main-content">
                         <TopBar
                             hidden={isDetailOpen}
-                            currentLibraryName={currentLibraryName}
-                            mediaCount={headerCount || 0}
-                            filterLabel={activeFilter?.showHeaderLabel === false ? undefined : activeFilter?.label}
+                            title={headerTitle}
+                            stats={headerStats}
+                            filterKind={activeFilter ? (FILTER_KIND_LABELS[activeFilter.type] || '筛选') : undefined}
+                            filterValue={activeFilter?.label}
                             showSearch={view !== 'settings'}
                             searchValue={searchKeyword}
                             onSearch={handleSearchChange}
                             searchPlaceholder={searchPlaceholder}
-                            searchDisabled={!searchEnabled}
+                            searchDisabled={!searchEnabled || isEmptyListView}
+                            compactSearch={view === 'actor'}
                             scanDisabled={Boolean(activeScan) || scanRequestPendingLibraryID === currentLib?.id}
                             onScanWithMode={showLibraryActions ? handleScanWithMode : undefined}
                             onRandomPlay={showListActions ? handleRandomPlay : undefined}
-                            onSortSelect={showListActions ? handleSortSelect : undefined}
-                            sortField={sortField}
-                            sortOrder={sortOrder}
-                            sortOptions={showListActions ? currentSortOptions : undefined}
+                            onSortSelect={
+                                showCategorySort
+                                    ? handleCategorySortSelect
+                                    : showListActions ? handleSortSelect : undefined
+                            }
+                            viewMode={categoryViewMode}
+                            onToggleViewMode={
+                                currentLib && view === 'actor'
+                                    ? () => setCategoryViewMode((mode) => (mode === 'grid' ? 'list' : 'grid'))
+                                    : undefined
+                            }
+                            sortField={showCategorySort ? categorySort.field : sortField}
+                            sortOrder={showCategorySort ? categorySort.order : sortOrder}
+                            sortOptions={
+                                showCategorySort
+                                    ? CATEGORY_SORT_OPTIONS
+                                    : showListActions ? currentSortOptions : undefined
+                            }
                             onBackButtonClick={topBarBackAction}
                             backButtonLabel={topBarBackLabel}
                             onClearFilter={activeFilter || searchKeyword.trim() ? clearFilter : undefined}
+                            libraryName={currentLibraryName}
+                            libraryPath={currentLib?.path || ''}
+                            libraryMediaCount={baseCount || 0}
                         />
 
                         <div className="content-region">
@@ -927,6 +1064,7 @@ function App() {
                                 <MediaDetail
                                     media={selectedMedia}
                                     mediaStateUpdate={latestMediaStateUpdate}
+                                    libraryName={currentLib?.name || ''}
                                     onClose={() => setSelectedMedia(null)}
                                     onSelectMedia={handleSelectMedia}
                                     onSelectFilter={applyFilterFromDetail}
@@ -952,11 +1090,24 @@ function App() {
                 />
             )}
 
-            {statusMsg && (
-                <div className="status-toast">{statusMsg}</div>
+            {statusToast && (
+                <div className={`status-toast ${statusToast.kind}`}>
+                    {statusToast.kind === 'error'
+                        ? <TriangleAlert size={13} />
+                        : statusToast.kind === 'play'
+                            ? <Play size={13} />
+                            : <Info size={13} />}
+                    <span className="status-toast-text" title={statusToast.text}>{statusToast.text}</span>
+                    {statusToast.action && (
+                        <button type="button" className="status-toast-action" onClick={statusToast.action.onClick}>
+                            {statusToast.action.label}
+                        </button>
+                    )}
+                </div>
             )}
 
-            <ScanTaskPanel hidden={Boolean(statusMsg)} libraryId={currentLib?.id || ''} />
+            {/* 扫描进行中出现提示条时，扫描卡往上顶，而不是被整个藏掉 */}
+            <ScanTaskPanel stacked={Boolean(statusToast)} libraryId={currentLib?.id || ''} />
         </div>
     );
 }

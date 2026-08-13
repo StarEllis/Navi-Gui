@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { EyeOff, HeartOff } from 'lucide-react';
 import { GetMediaList } from "../../wailsjs/go/main/App";
 import MediaCard from './MediaCard';
 import { prefetchMediaDetailCacheEntry, seedMediaDetailCache } from '../utils/mediaDetailCache';
@@ -17,6 +18,7 @@ import {
 } from '../utils/mediaPagination';
 import { markComponentRender } from '../utils/performanceDiagnostics';
 import { shouldInvalidateMediaPagination } from '../utils/mediaPlaybackState';
+import type { StatusKind } from '../types/status';
 
 interface MediaGridProps {
     libraryId: string;
@@ -28,7 +30,8 @@ interface MediaGridProps {
     filter?: { type: string; value: string; label: string } | null;
     onSelectMedia: (media: any) => void;
     onCountChange?: (count: number) => void;
-    onQuickPlayStatus?: (message: string) => void;
+    onQuickPlayStatus?: (message: string, kind?: StatusKind) => void;
+    onMediaChange?: (media: any) => void;
     initialScrollTop?: number;
     onScrollPositionChange?: (scrollTop: number) => void;
     mutation?: MediaGridMutation | null;
@@ -38,12 +41,12 @@ export type MediaGridMutation =
     | { type: 'merge'; media: any; changedFields?: string[] }
     | { type: 'remove'; mediaId: string };
 
-const MEDIA_CARD_WIDTH = 178;
-const MEDIA_CARD_HEIGHT = 297;
-const MEDIA_GRID_MIN_GAP = 18;
-const MEDIA_GRID_MAX_GAP = 24;
-const MEDIA_GRID_ROW_GAP = 24;
-const MEDIA_GRID_HORIZONTAL_PADDING = 48;
+const MEDIA_CARD_WIDTH = 192;
+const MEDIA_CARD_HEIGHT = 330;
+const MEDIA_GRID_MIN_GAP = 24;
+const MEDIA_GRID_MAX_GAP = 36;
+const MEDIA_GRID_ROW_GAP = 26;
+const MEDIA_GRID_HORIZONTAL_PADDING = 56;
 const VIRTUAL_OVERSCAN_ROWS = 2;
 const SCROLL_NOTIFY_MS = 120;
 
@@ -55,6 +58,20 @@ export const getMediaListCacheKey = (
     filterType: string,
     filterValue: string,
 ) => JSON.stringify([libraryId, keyword.trim(), sortField, sortOrder, filterType, filterValue]);
+
+// 空的已看 / 收藏页给一个说明为什么空、怎么填满的空状态，而不是一句报错似的灰字。
+const EMPTY_LIST_STATES: Record<string, { Icon: typeof EyeOff; title: string; hint: string }> = {
+    watched: {
+        Icon: EyeOff,
+        title: '还没有标记过已看',
+        hint: '在任意作品的详情页点「标记已看」，它就会出现在这里',
+    },
+    favorite: {
+        Icon: HeartOff,
+        title: '还没有收藏任何作品',
+        hint: '在任意作品的详情页点「收藏」，它就会出现在这里',
+    },
+};
 
 const matchesActiveFilter = (media: any, filterType: string, filterValue: string) => {
     switch (filterType) {
@@ -84,6 +101,7 @@ const MediaGrid: React.FC<MediaGridProps> = ({
     onSelectMedia,
     onCountChange,
     onQuickPlayStatus,
+    onMediaChange,
     initialScrollTop = 0,
     onScrollPositionChange,
     mutation = null,
@@ -437,6 +455,7 @@ const MediaGrid: React.FC<MediaGridProps> = ({
     const handleFocusMedia = useCallback((mediaID: string) => {
         focusedMediaIDRef.current = mediaID;
     }, []);
+    const emptyListState = normalizedKeyword ? undefined : EMPTY_LIST_STATES[filterType];
     const retry = () => {
         setShowingStaleResults(false);
         const generation = beginRequestGeneration();
@@ -472,9 +491,17 @@ const MediaGrid: React.FC<MediaGridProps> = ({
                 <div className="grid-feedback loading" role="status">正在加载媒体内容...</div>
             )}
             {!isInitialLoading && total === 0 && !error && (
-                <div className="grid-feedback" role="status">
-                    {normalizedKeyword || filterType ? '没有符合当前搜索或筛选条件的媒体' : '当前媒体库为空'}
-                </div>
+                emptyListState ? (
+                    <div className="navi-empty-state" role="status">
+                        <emptyListState.Icon size={26} strokeWidth={1.6} />
+                        <div className="navi-empty-state-title">{emptyListState.title}</div>
+                        <div className="navi-empty-state-hint">{emptyListState.hint}</div>
+                    </div>
+                ) : (
+                    <div className="grid-feedback" role="status">
+                        {normalizedKeyword || filterType ? '没有符合当前搜索或筛选条件的媒体' : '当前媒体库为空'}
+                    </div>
+                )
             )}
             {error && (
                 <div className="grid-error-panel" role="alert">
@@ -484,9 +511,7 @@ const MediaGrid: React.FC<MediaGridProps> = ({
             )}
             {total > 0 && (
                 <>
-                    <div className="grid-page-status" role="status" aria-live="polite">
-                        {loadingPages.size > 0 ? '正在加载当前区域...' : `共 ${total.toLocaleString()} 个项目`}
-                    </div>
+                    {/* 总数在顶部「N 部 · 容量 · 上次扫描」里，加载中由骨架卡说明，这里不再另起浮字 */}
                     <div className="grid-virtual-spacer" style={{ height: `${Math.max(totalContentHeight, effectiveViewportHeight)}px` }}>
                         <div
                             className="grid-virtual-content"
@@ -506,11 +531,13 @@ const MediaGrid: React.FC<MediaGridProps> = ({
                                     onQuickPlayStatus={onQuickPlayStatus}
                                     onPrefetchMedia={handlePrefetchMedia}
                                     onFocusMedia={handleFocusMedia}
+                                    onMediaChange={onMediaChange}
                                 />
                             ) : (
-                                <div key={`placeholder-${index}`} className="media-card media-card-placeholder" aria-hidden="true">
-                                    <div className="media-poster-wrapper" />
-                                    <div className="media-card-placeholder-line" />
+                                <div key={`placeholder-${index}`} className="navi-card navi-card-placeholder" aria-hidden="true">
+                                    <div className="navi-card-poster" />
+                                    <div className="navi-card-title" />
+                                    <div className="navi-card-meta" />
                                 </div>
                             ))}
                         </div>
@@ -533,5 +560,6 @@ export default React.memo(MediaGrid, (prev, next) => (
     && prev.onSelectMedia === next.onSelectMedia
     && prev.onCountChange === next.onCountChange
     && prev.onQuickPlayStatus === next.onQuickPlayStatus
+    && prev.onMediaChange === next.onMediaChange
     && prev.mutation === next.mutation
 ));

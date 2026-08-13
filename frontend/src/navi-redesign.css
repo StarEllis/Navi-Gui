@@ -1,0 +1,2540 @@
+/* ===== Navi 改版：3a 主界面 / 3b 详情页 / 2a 演员页 =====
+   底色采用 3c 的方案 ②：近黑偏紫的 #0b090d，内容区 #0e0d10。 */
+
+:root {
+  --navi-bg: #0b090d;
+  --navi-surface: #0e0d10;
+  --navi-poster: #181119;
+
+  --navi-text: #efeaf0;
+  --navi-text-strong: #faf6fb;
+  --navi-text-mid: rgba(239, 234, 240, 0.62);
+  --navi-text-soft: rgba(239, 234, 240, 0.5);
+  --navi-text-dim: rgba(239, 234, 240, 0.42);
+  --navi-text-weak: rgba(239, 234, 240, 0.4);
+  --navi-text-faint: rgba(239, 234, 240, 0.36);
+  --navi-text-ghost: rgba(239, 234, 240, 0.26);
+  --navi-muted: #9b90a2;
+  --navi-muted-strong: #c9bfcd;
+  --navi-muted-bright: #d8cedb;
+
+  --navi-line: rgba(255, 255, 255, 0.05);
+  --navi-line-soft: rgba(255, 255, 255, 0.06);
+  --navi-line-strong: rgba(255, 255, 255, 0.08);
+  --navi-fill-1: rgba(255, 255, 255, 0.05);
+  --navi-fill-soft: rgba(255, 255, 255, 0.06);
+  --navi-fill-2: rgba(255, 255, 255, 0.07);
+  --navi-fill-hover: rgba(255, 255, 255, 0.09);
+  --navi-fill-3: rgba(255, 255, 255, 0.1);
+  --navi-fill-4: rgba(255, 255, 255, 0.14);
+
+  --navi-primary: #f4eef5;
+  --navi-primary-ink: #1a1119;
+  --navi-play: #f0ecec;
+  --navi-play-hover: #fbf8f8;
+  --navi-play-ink: #17151a;
+
+  /* 详情页：顶部留住 fanart 的颜色，52% 往下必须是纯 --navi-surface */
+  --navi-scrim-top: rgba(14, 13, 16, 0.18);
+  --navi-scrim-mid: rgba(14, 13, 16, 0.6);
+  --navi-sticky-bg: rgba(18, 17, 20, 0.9);
+  --navi-sticky-line: rgba(255, 255, 255, 0.07);
+
+  --navi-danger: #c99a9a;
+  --navi-danger-fill: rgba(201, 90, 90, 0.18);
+  --navi-danger-text: #ffc4c4;
+
+  --navi-poster-stripe: repeating-linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.05) 0 10px,
+    rgba(255, 255, 255, 0) 10px 20px
+  );
+}
+
+body {
+  background: var(--navi-bg);
+  color: var(--navi-text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+.app-container {
+  background: var(--navi-bg);
+}
+
+.window-shell {
+  border: 0;
+  border-radius: 0;
+  background: var(--navi-bg);
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.main-content {
+  background: var(--navi-surface);
+}
+
+/* ===== 窗口按钮：静止时完全不存在，鼠标进入导航条才淡入 ===== */
+.navi-window-controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex: none;
+  height: 14px;
+  margin-bottom: 12px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease;
+  --wails-draggable: no-drag;
+}
+
+.navi-rail:hover .navi-window-controls,
+.navi-window-controls:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.navi-window-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 0;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.4);
+  cursor: pointer;
+  transition: background 0.16s ease;
+}
+
+.navi-window-btn:hover {
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.navi-window-btn.close {
+  background: #e0575c;
+}
+
+.navi-window-btn.close:hover {
+  background: #ef6a6f;
+}
+
+/* 用伪元素画符号，比 14px 的 SVG 清楚得多 */
+.navi-window-btn::before,
+.navi-window-btn::after {
+  content: "";
+  position: absolute;
+  background: rgba(0, 0, 0, 0.62);
+}
+
+.navi-window-btn.close::before,
+.navi-window-btn.close::after {
+  width: 8px;
+  height: 1.5px;
+  border-radius: 1px;
+}
+.navi-window-btn.close::before { transform: rotate(45deg); }
+.navi-window-btn.close::after  { transform: rotate(-45deg); }
+
+.navi-window-btn.min::before {
+  width: 8px;
+  height: 1.5px;
+  border-radius: 1px;
+}
+.navi-window-btn.min::after { display: none; }
+
+.navi-window-btn.max::before {
+  width: 6px;
+  height: 6px;
+  border: 1.5px solid rgba(0, 0, 0, 0.62);
+  border-radius: 1.5px;
+  background: transparent;
+}
+.navi-window-btn.max::after { display: none; }
+
+.navi-window-btn.max.restore::before {
+  width: 5px;
+  height: 5px;
+  transform: translate(1px, 1px);
+}
+.navi-window-btn.max.restore::after {
+  display: block;
+  width: 5px;
+  height: 5px;
+  border: 1.5px solid rgba(0, 0, 0, 0.42);
+  border-radius: 1.5px;
+  background: transparent;
+  transform: translate(-2px, -2px);
+}
+
+/* ===== 左侧图标导航条 ===== */
+.navi-rail {
+  position: relative;
+  width: 72px;
+  min-width: 72px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 0 14px;
+  background: rgba(255, 255, 255, 0.02);
+  border-right: 1px solid var(--navi-line);
+  user-select: none;
+  --wails-draggable: drag;
+}
+
+.navi-rail-logo {
+  width: 32px;
+  height: 32px;
+  margin-bottom: 12px;
+  border: 0;
+  padding: 0;
+  border-radius: 10px;
+  overflow: hidden;
+  background: transparent;
+  cursor: pointer;
+  flex: none;
+  --wails-draggable: no-drag;
+}
+
+.navi-rail-logo img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.navi-rail-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  width: 56px;
+  padding: 7px 0;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: var(--navi-muted);
+  font: inherit;
+  font-size: 10px;
+  line-height: 14px;
+  cursor: pointer;
+  flex: none;
+  transition: background 0.16s ease, color 0.16s ease;
+  --wails-draggable: no-drag;
+}
+
+.navi-rail-item:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--navi-primary);
+}
+
+.navi-rail-item.active {
+  background: var(--navi-fill-3);
+  color: var(--navi-primary);
+}
+
+.navi-rail-item.settings {
+  margin-top: auto;
+}
+
+/* 媒体库切换浮层 */
+.navi-library-popover {
+  position: absolute;
+  left: 68px;
+  top: 52px;
+  z-index: 60;
+  width: 268px;
+  padding: 8px;
+  border-radius: 16px;
+  border: 1px solid var(--navi-line-strong);
+  background: rgba(20, 17, 23, 0.98);
+  box-shadow: 0 22px 48px rgba(0, 0, 0, 0.6);
+  --wails-draggable: no-drag;
+}
+
+.navi-library-popover-title {
+  padding: 6px 10px 8px;
+  color: var(--navi-text-dim);
+  font: 700 10px ui-monospace, Menlo, monospace;
+  letter-spacing: 0.16em;
+}
+
+.navi-library-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px;
+  border-radius: 10px;
+}
+
+.navi-library-row:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.navi-library-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  height: 36px;
+  padding: 0 4px 0 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--navi-text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.navi-library-row.active .navi-library-main {
+  color: var(--navi-text-strong);
+  font-weight: 700;
+}
+
+.navi-library-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.navi-library-count {
+  margin-left: auto;
+  color: var(--navi-text-dim);
+  font: 500 11px ui-monospace, Menlo, monospace;
+}
+
+.navi-library-edit {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin-right: 4px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--navi-muted);
+  cursor: pointer;
+}
+
+.navi-library-edit:hover {
+  background: var(--navi-fill-3);
+  color: var(--navi-text-strong);
+}
+
+.navi-library-empty {
+  padding: 10px;
+  color: var(--navi-text-soft);
+  font-size: 12.5px;
+}
+
+.navi-library-add {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  height: 36px;
+  margin-top: 6px;
+  padding: 0 10px;
+  border: 0;
+  border-top: 1px solid var(--navi-line);
+  border-radius: 0 0 10px 10px;
+  background: transparent;
+  color: var(--navi-muted-bright);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.navi-library-add:hover {
+  color: var(--navi-text-strong);
+}
+
+/* ===== 顶部：标题、计数、工具全部压进一条 56px 横栏 ===== */
+.navi-topbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: none;
+  height: 56px;
+  padding: 0 26px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--navi-line-soft);
+  text-align: left;
+  user-select: none;
+  --wails-draggable: drag;
+}
+
+.navi-topbar.hidden {
+  display: none;
+}
+
+.navi-topbar-title {
+  margin: 0;
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--navi-text-strong);
+  font: 700 19px/1 -apple-system, 'Segoe UI', sans-serif;
+  letter-spacing: -0.01em;
+}
+
+.navi-topbar-count {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--navi-text-dim);
+  font: 500 12px ui-monospace, Menlo, monospace;
+}
+
+.navi-topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  margin-left: auto;
+  --wails-draggable: no-drag;
+}
+
+.navi-back-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border: 0;
+  border-radius: 99px;
+  background: var(--navi-fill-soft);
+  color: var(--navi-primary);
+  cursor: pointer;
+  transition: background 0.16s ease;
+  --wails-draggable: no-drag;
+}
+
+.navi-back-btn:hover {
+  background: var(--navi-fill-4);
+}
+
+.navi-filter-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  flex: none;
+  padding: 0 5px 0 11px;
+  border-radius: 99px;
+  background: var(--navi-fill-hover);
+  border: 1px solid var(--navi-fill-4);
+  font-size: 12.5px;
+  --wails-draggable: no-drag;
+}
+
+.navi-filter-chip-kind {
+  color: rgba(239, 234, 240, 0.6);
+}
+
+.navi-filter-chip-value {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--navi-primary);
+  font-weight: 700;
+}
+
+.navi-filter-chip-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--navi-text);
+  cursor: pointer;
+}
+
+.navi-filter-chip-clear:hover {
+  background: rgba(255, 255, 255, 0.24);
+}
+
+.navi-ghost-btn {
+  height: 28px;
+  flex: none;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 99px;
+  background: transparent;
+  color: var(--navi-text-soft);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease;
+  --wails-draggable: no-drag;
+}
+
+.navi-ghost-btn:hover {
+  background: var(--navi-fill-2);
+  color: var(--navi-primary);
+}
+
+.navi-search {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 250px;
+  height: 34px;
+  padding: 0 13px;
+  border-radius: 99px;
+  background: var(--navi-fill-1);
+  border: 1px solid var(--navi-line-strong);
+}
+
+.navi-search.compact {
+  width: 200px;
+}
+
+.navi-search.disabled {
+  opacity: 0.4;
+}
+
+.navi-search svg {
+  flex: none;
+  color: var(--navi-text-soft);
+}
+
+.navi-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--navi-text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.navi-search input::placeholder {
+  color: var(--navi-text-faint);
+}
+
+/* 静止无底色，hover 才显形——工具按钮不该跟海报抢注意力 */
+.navi-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 0;
+  border-radius: 99px;
+  background: transparent;
+  color: var(--navi-muted);
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease;
+}
+
+.navi-icon-btn:hover:not(:disabled),
+.navi-menu-shell.open .navi-icon-btn {
+  background: var(--navi-fill-hover);
+  color: var(--navi-text-strong);
+}
+
+.navi-icon-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.navi-menu-shell {
+  position: relative;
+}
+
+.navi-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 40;
+  min-width: 180px;
+  padding: 6px;
+  border-radius: 14px;
+  border: 1px solid var(--navi-line-strong);
+  background: rgba(20, 17, 23, 0.98);
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.56);
+}
+
+.navi-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--navi-text);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.navi-menu-item:hover:not(:disabled),
+.navi-menu-item.active {
+  background: var(--navi-fill-2);
+}
+
+.navi-menu-item:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.navi-menu-meta {
+  color: var(--navi-text-dim);
+  font: 500 11px ui-monospace, Menlo, monospace;
+}
+
+/* ===== 媒体网格 ===== */
+.grid-container {
+  padding: 18px 28px 24px;
+  background: transparent;
+}
+
+.grid-feedback {
+  padding: 56px 24px;
+  color: var(--navi-text-soft);
+  font-size: 13px;
+}
+
+/* 已看 / 收藏 空页面：图标 + 两行说明，而不是一个像出错了的大标题 */
+.navi-empty-state {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 96px 24px;
+  text-align: center;
+}
+
+.navi-empty-state svg {
+  color: var(--navi-text-ghost);
+}
+
+.navi-empty-state-title {
+  color: var(--navi-text-mid);
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.navi-empty-state-hint {
+  color: var(--navi-text-faint);
+  font-size: 12.5px;
+}
+
+.grid-error-panel {
+  position: static;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding: 10px 14px;
+  border: 1px solid rgba(201, 154, 154, 0.28);
+  border-radius: 10px;
+  background: rgba(201, 90, 90, 0.12);
+  color: #f0d6d6;
+  font-size: 12.5px;
+}
+
+.grid-error-panel button {
+  height: 28px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 99px;
+  background: var(--navi-fill-3);
+  color: var(--navi-text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+/* ===== 媒体卡片 ===== */
+.navi-card {
+  width: 192px;
+  cursor: pointer;
+  outline: none;
+}
+
+.navi-card-poster {
+  position: relative;
+  width: 192px;
+  height: 288px;
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--navi-poster);
+  background-image: var(--navi-poster-stripe);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.4);
+  transition: transform 0.18s ease, box-shadow 0.18s ease;
+}
+
+.navi-card:hover .navi-card-poster,
+.navi-card:focus-visible .navi-card-poster {
+  transform: translateY(-4px);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.42), 0 14px 34px rgba(0, 0, 0, 0.55);
+}
+
+.navi-card-image {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* 悬浮态：静止时海报干净得像张海报，所有操作只在 hover 时出现。
+   不压暗海报——清晰度靠播放键的阴影和继续胶囊自己撑住。 */
+.navi-card-hover {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.16s ease;
+}
+
+.navi-card:hover .navi-card-hover,
+.navi-card:focus-visible .navi-card-hover,
+.navi-card:focus-within .navi-card-hover {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* 看了一半：播放键下面还有一行「从 42:10 继续」，改竖排 */
+.navi-card-hover.has-resume {
+  flex-direction: column;
+  gap: 10px;
+}
+
+.navi-card-play {
+  width: 48px;
+  height: 48px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding-left: 3px;
+  border: 0;
+  border-radius: 99px;
+  background: rgba(250, 246, 251, 0.94);
+  color: var(--navi-play-ink);
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.55);
+  cursor: pointer;
+}
+
+.navi-card-play:hover {
+  background: #fff;
+}
+
+/* 没有蒙层垫底了，给它一个胶囊底，亮海报上也读得清 */
+.navi-card-resume {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 10px;
+  border-radius: 99px;
+  background: rgba(11, 9, 13, 0.72);
+  font: 600 10.5px ui-monospace, Menlo, monospace;
+  color: rgba(255, 255, 255, 0.94);
+}
+
+.navi-card-corner {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  display: flex;
+  gap: 6px;
+}
+
+.navi-card-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 99px;
+  background: rgba(11, 9, 13, 0.62);
+  color: var(--navi-primary);
+  cursor: pointer;
+}
+
+.navi-card-action:hover {
+  background: rgba(11, 9, 13, 0.85);
+}
+
+.navi-card-action.on {
+  background: rgba(240, 236, 236, 0.9);
+  color: var(--navi-play-ink);
+}
+
+/* 静止态可见的两层：白条压在亮海报上看不出来，所以轨道垫深色、填充用暖橙 */
+.navi-card-scrim {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 3;
+  height: 26px;
+  background: linear-gradient(180deg, rgba(11, 9, 13, 0) 0%, rgba(11, 9, 13, 0.62) 100%);
+  pointer-events: none;
+}
+
+.navi-card-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 4;
+  height: 4px;
+  background: rgba(11, 9, 13, 0.55);
+}
+
+.navi-card-progress > span {
+  display: block;
+  height: 100%;
+  background: #e0a05a;
+}
+
+.navi-card-title {
+  margin-top: 9px;
+  height: 17px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--navi-text);
+  font-size: 12.5px;
+  line-height: 17px;
+  font-weight: 600;
+}
+
+.navi-card-meta {
+  margin-top: 3px;
+  height: 13px;
+  overflow: hidden;
+  white-space: nowrap;
+  color: rgba(239, 234, 240, 0.45);
+  font: 500 10.5px/13px ui-monospace, Menlo, monospace;
+}
+
+/* 已看完：压暗 + 标题变灰。海报图自带角标，这里不再叠打勾。 */
+.navi-card.watched .navi-card-poster::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  background: rgba(11, 9, 13, 0.42);
+  pointer-events: none;
+}
+
+.navi-card.watched .navi-card-title {
+  color: rgba(250, 246, 251, 0.66);
+}
+
+.navi-card.watched .navi-card-meta {
+  color: rgba(239, 234, 240, 0.38);
+}
+
+/* 骨架卡：尺寸与真卡完全一致，只是填色，不做闪烁动画 */
+.navi-card-placeholder {
+  pointer-events: none;
+}
+
+.navi-card-placeholder .navi-card-poster {
+  box-shadow: none;
+  background: rgba(255, 255, 255, 0.035);
+  background-image: none;
+}
+
+.navi-card-placeholder .navi-card-title {
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.navi-card-placeholder .navi-card-meta {
+  width: 62%;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+/* ===== 演员页（2a 圆形密排） ===== */
+.navi-people {
+  width: 100%;
+  height: 100%;
+  overflow-y: auto;
+  padding: 18px 28px 24px;
+}
+
+.navi-people-actor {
+  background:
+    radial-gradient(120% 70% at 12% 0%, rgba(146, 84, 120, 0.3) 0%, rgba(146, 84, 120, 0) 58%),
+    radial-gradient(90% 60% at 88% 4%, rgba(72, 86, 146, 0.22) 0%, rgba(72, 86, 146, 0) 62%);
+}
+
+.navi-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  margin-bottom: 12px;
+}
+
+.navi-section-title {
+  color: var(--navi-primary);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.navi-section-count {
+  color: var(--navi-text-dim);
+  font: 500 11px ui-monospace, Menlo, monospace;
+}
+
+.navi-people-top {
+  display: flex;
+  gap: 14px;
+  margin-bottom: 24px;
+}
+
+.navi-people-top-card {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding: 11px 14px 11px 11px;
+  border-radius: 14px;
+  border: 1px solid var(--navi-fill-2);
+  background: var(--navi-fill-1);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.16s ease;
+}
+
+.navi-people-top-card:hover {
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.navi-people-top-avatar {
+  position: relative;
+  width: 52px;
+  height: 52px;
+  flex: none;
+  border-radius: 99px;
+  overflow: hidden;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.09);
+}
+
+.navi-people-top-copy {
+  min-width: 0;
+}
+
+.navi-people-top-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--navi-text-strong);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.navi-people-top-meta {
+  margin-top: 4px;
+  color: var(--navi-text-soft);
+  font: 500 10.5px ui-monospace, Menlo, monospace;
+}
+
+.navi-chip-row {
+  display: flex;
+  gap: 6px;
+  margin-left: 14px;
+}
+
+.navi-chip {
+  height: 24px;
+  padding: 0 11px;
+  display: inline-flex;
+  align-items: center;
+  border: 0;
+  border-radius: 99px;
+  background: var(--navi-fill-1);
+  color: var(--navi-text-mid);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease;
+}
+
+.navi-chip:hover {
+  background: var(--navi-fill-hover);
+  color: var(--navi-primary);
+}
+
+.navi-chip.active {
+  background: #e6d0ea;
+  color: #241726;
+  font-weight: 700;
+}
+
+.navi-people-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  column-gap: 16px;
+  row-gap: 24px;
+  align-content: start;
+}
+
+.navi-person {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 9px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  transition: transform 0.16s ease;
+}
+
+.navi-person:hover {
+  transform: translateY(-3px);
+}
+
+.navi-person-avatar {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1;
+  border-radius: 99px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08), 0 6px 16px rgba(0, 0, 0, 0.34);
+}
+
+.navi-person-avatar img,
+.navi-people-top-avatar img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.navi-person-initial {
+  font: 700 20px -apple-system, 'Segoe UI', sans-serif;
+}
+
+.navi-people-top-avatar .navi-person-initial {
+  font-size: 18px;
+}
+
+.navi-person-copy {
+  width: 100%;
+  min-width: 0;
+  text-align: center;
+}
+
+.navi-person-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--navi-text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.navi-person-count {
+  margin-top: 3px;
+  color: var(--navi-text-dim);
+  font: 500 10px ui-monospace, Menlo, monospace;
+}
+
+/* 演员列表视图：一行一人，头像退成 44px，适合快速翻找 */
+.navi-people-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.navi-person-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  min-height: 56px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.16s ease;
+}
+
+.navi-person-row:hover {
+  background: var(--navi-fill-1);
+}
+
+.navi-person-row-avatar {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  flex: none;
+  border-radius: 99px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.navi-person-row-avatar img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.navi-person-row-avatar .navi-person-initial {
+  font-size: 16px;
+}
+
+.navi-person-row-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--navi-text);
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.navi-person-row-count {
+  flex: none;
+  color: var(--navi-text-dim);
+  font: 500 11.5px ui-monospace, Menlo, monospace;
+}
+
+/* 类别页沿用同一套配色的方块网格 */
+.navi-genre-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 12px;
+  align-content: start;
+}
+
+.navi-genre-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 46px;
+  padding: 0 14px;
+  border: 1px solid var(--navi-fill-2);
+  border-radius: 12px;
+  background: var(--navi-fill-1);
+  color: var(--navi-text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.16s ease;
+}
+
+.navi-genre-card:hover {
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.navi-genre-card span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.navi-genre-count {
+  flex: none;
+  color: var(--navi-text-dim);
+  font: 500 11px ui-monospace, Menlo, monospace;
+}
+
+.navi-category-feedback {
+  padding: 48px 24px;
+  text-align: center;
+  color: var(--navi-text-soft);
+  font-size: 13px;
+}
+
+/* ===== 详情页（3b） ===== */
+.detail-overlay-shell {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+}
+
+.navi-detail {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--navi-surface);
+  text-align: left;
+}
+
+/* fanart 当氛围底：糊到认不出脸和日文，但颜色要透得出来。
+   四边各溢出 160px、底边伸到 70% 处，让 blur 的边缘衰减发生在可视区外
+   或不透明 scrim 之下——否则边缘自己就淡成透明，整块背景会发黑。 */
+.navi-detail-backdrop {
+  position: absolute;
+  top: -160px;
+  left: -160px;
+  right: -160px;
+  bottom: 30%;
+  background: #211f24;
+  background-image: var(--navi-poster-stripe);
+  background-size: cover;
+  background-position: center;
+  filter: blur(36px);
+  transform: scale(1.15);
+}
+
+.navi-detail-scrim {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    180deg,
+    var(--navi-scrim-top) 0%,
+    var(--navi-scrim-mid) 34%,
+    var(--navi-surface) 52%
+  );
+}
+
+.navi-detail-body {
+  position: relative;
+  z-index: 2;
+  height: 100%;
+  overflow-y: auto;
+}
+
+/* 吸顶栏：不占布局高度（负 margin），滚过首屏标题才淡入 */
+.navi-detail-sticky {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 60px;
+  margin-bottom: -60px;
+  padding: 0 26px;
+  background: var(--navi-sticky-bg);
+  backdrop-filter: blur(20px);
+  border-bottom: 1px solid var(--navi-sticky-line);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease;
+  --wails-draggable: drag;
+}
+
+.navi-detail-sticky > * {
+  --wails-draggable: no-drag;
+}
+
+.navi-detail-sticky.visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.navi-sticky-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  border: 0;
+  border-radius: 99px;
+  background: var(--navi-fill-soft);
+  color: var(--navi-primary);
+  cursor: pointer;
+  transition: background 0.16s ease;
+}
+
+.navi-sticky-back:hover {
+  background: var(--navi-fill-4);
+}
+
+.navi-sticky-poster {
+  position: relative;
+  width: 26px;
+  height: 39px;
+  flex: none;
+  border-radius: 5px;
+  overflow: hidden;
+  background: var(--navi-poster);
+  background-image: var(--navi-poster-stripe);
+}
+
+.navi-sticky-poster img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.navi-sticky-copy {
+  min-width: 0;
+}
+
+.navi-sticky-code {
+  color: var(--navi-text-weak);
+  font: 500 10.5px ui-monospace, Menlo, monospace;
+}
+
+.navi-sticky-title {
+  margin-top: 2px;
+  max-width: 520px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--navi-text-strong);
+  font-size: 13.5px;
+  font-weight: 700;
+}
+
+.navi-sticky-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  margin-left: auto;
+}
+
+.navi-sticky-play {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 15px;
+  border: 0;
+  border-radius: 99px;
+  background: var(--navi-play);
+  color: var(--navi-play-ink);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.navi-sticky-play:hover {
+  background: var(--navi-play-hover);
+}
+
+.navi-sticky-play span {
+  max-width: 132px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.navi-sticky-fav {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  border: 0;
+  border-radius: 99px;
+  background: var(--navi-fill-soft);
+  color: var(--navi-muted-bright);
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease;
+}
+
+.navi-sticky-fav:hover {
+  background: var(--navi-fill-4);
+  color: var(--navi-text-strong);
+}
+
+.navi-sticky-fav.on {
+  background: var(--navi-play);
+  color: var(--navi-play-ink);
+}
+
+.navi-detail-topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 28px 0;
+  --wails-draggable: drag;
+}
+
+.navi-detail-topbar > * {
+  --wails-draggable: no-drag;
+}
+
+.navi-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: var(--navi-text-dim);
+  font-size: 12.5px;
+}
+
+.navi-breadcrumb-link {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.navi-breadcrumb-link:hover {
+  color: var(--navi-primary);
+}
+
+.navi-breadcrumb-current {
+  color: rgba(239, 234, 240, 0.72);
+}
+
+.navi-detail-status {
+  margin-left: auto;
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--navi-muted-bright);
+  font-size: 12px;
+}
+
+.navi-detail-hero {
+  display: flex;
+  gap: 34px;
+  padding: 22px 28px 0;
+}
+
+.navi-detail-wide {
+  padding: 0 28px 28px;
+}
+
+.navi-detail-aside {
+  flex: 0 0 auto;
+  width: 264px;
+}
+
+.navi-detail-poster {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--navi-poster);
+  background-image: var(--navi-poster-stripe);
+  box-shadow: 0 26px 64px rgba(0, 0, 0, 0.72);
+}
+
+.navi-detail-poster img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.navi-detail-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.navi-detail-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 11px;
+}
+
+.navi-detail-progress-chip {
+  height: 22px;
+  padding: 0 8px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 5px;
+  background: var(--navi-fill-3);
+  color: var(--navi-play);
+  font: 700 10px ui-monospace, Menlo, monospace;
+  letter-spacing: 0.06em;
+}
+
+.navi-detail-code {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--navi-text-soft);
+  font: 600 11.5px ui-monospace, Menlo, monospace;
+  cursor: pointer;
+}
+
+.navi-detail-code:hover {
+  color: var(--navi-primary);
+}
+
+/* 技术规格并进番号行，不做 chip */
+.navi-detail-specs {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--navi-text-soft);
+  font: 500 11.5px ui-monospace, Menlo, monospace;
+}
+
+.navi-detail-title {
+  margin: 0;
+  max-width: 760px;
+  color: var(--navi-text-strong);
+  font: 800 30px/1.22 -apple-system, 'Segoe UI', sans-serif;
+  letter-spacing: -0.02em;
+}
+
+.navi-detail-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  margin-top: 20px;
+}
+
+.navi-detail-play-group {
+  display: inline-flex;
+  align-items: stretch;
+  height: 44px;
+  border-radius: 10px;
+  background: var(--navi-play);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+
+.navi-detail-play-group > .main {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 20px;
+  border: 0;
+  background: transparent;
+  color: var(--navi-play-ink);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.navi-detail-play-group > .restart {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid rgba(23, 21, 26, 0.16);
+  background: transparent;
+  color: rgba(23, 21, 26, 0.72);
+  cursor: pointer;
+}
+
+.navi-detail-play-group > .main:hover,
+.navi-detail-play-group > .restart:hover {
+  background: rgba(255, 255, 255, 1);
+}
+
+.navi-detail-play-group > .restart:hover {
+  color: var(--navi-play-ink);
+}
+
+.navi-outline-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 44px;
+  padding: 0 15px;
+  border: 1px solid rgba(255, 255, 255, 0.13);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--navi-text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.16s ease;
+}
+
+.navi-outline-btn:hover {
+  background: rgba(255, 255, 255, 0.13);
+}
+
+.navi-outline-btn.on {
+  background: var(--navi-play);
+  border-color: transparent;
+  color: var(--navi-play-ink);
+}
+
+/* 三个文件操作跟播放/收藏同排，中间一条竖线分档 */
+.navi-detail-actions-divider {
+  width: 1px;
+  height: 26px;
+  margin: 0 5px;
+  background: var(--navi-fill-4);
+}
+
+.navi-file-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--navi-muted);
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease;
+}
+
+.navi-file-btn:hover {
+  background: var(--navi-fill-hover);
+  color: var(--navi-text-strong);
+}
+
+.navi-file-btn.danger:hover {
+  background: var(--navi-danger-fill);
+  color: var(--navi-danger-text);
+}
+
+.navi-detail-file-block {
+  margin-top: 18px;
+  max-width: 900px;
+}
+
+.navi-detail-file {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 36px;
+  padding: 0 6px 0 13px;
+  border-radius: 9px;
+  background: var(--navi-fill-1);
+  border: 1px solid var(--navi-line-strong);
+}
+
+.navi-detail-file svg {
+  flex: none;
+  color: var(--navi-text-dim);
+}
+
+.navi-detail-file-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: rgba(239, 234, 240, 0.72);
+  font: 500 12px ui-monospace, Menlo, monospace;
+}
+
+.navi-detail-file-count {
+  flex: none;
+  color: var(--navi-text-dim);
+  font: 500 11px ui-monospace, Menlo, monospace;
+}
+
+.navi-detail-file-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border: 0;
+  border-radius: 7px;
+  background: var(--navi-fill-2);
+  color: var(--navi-muted-strong);
+  cursor: pointer;
+}
+
+.navi-detail-file-toggle:hover {
+  background: rgba(255, 255, 255, 0.18);
+  color: var(--navi-text-strong);
+}
+
+.navi-detail-file-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  left: 0;
+  z-index: 30;
+  padding: 6px;
+  border-radius: 10px;
+  border: 1px solid var(--navi-line-strong);
+  background: rgba(20, 17, 23, 0.98);
+  box-shadow: 0 18px 36px rgba(0, 0, 0, 0.5);
+}
+
+.navi-detail-file-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--navi-text);
+  font: 500 12px ui-monospace, Menlo, monospace;
+  text-align: left;
+  cursor: pointer;
+}
+
+.navi-detail-file-item:hover,
+.navi-detail-file-item.active {
+  background: var(--navi-fill-2);
+}
+
+.navi-detail-file-item span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.navi-detail-timeline {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.navi-detail-timeline span {
+  flex: none;
+  color: var(--navi-text-soft);
+  font: 500 11.5px ui-monospace, Menlo, monospace;
+}
+
+.navi-detail-timeline span:last-child {
+  color: var(--navi-text-dim);
+}
+
+.navi-detail-timeline-track {
+  flex: 1;
+  height: 4px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.navi-detail-timeline-track > span {
+  display: block;
+  height: 100%;
+  border-radius: 99px;
+  background: var(--navi-play);
+}
+
+.navi-detail-hint {
+  margin-top: 12px;
+  color: var(--navi-muted);
+  font-size: 12px;
+}
+
+.navi-detail-hint.failed {
+  color: #c99a9a;
+}
+
+/* 字段标签事实带：作品事实和文件事实只用一条竖线分组。 */
+.navi-detail-facts {
+  display: flex;
+  align-items: flex-start;
+  gap: 38px;
+  flex: none;
+  max-width: 900px;
+  margin-top: 22px;
+  padding-bottom: 22px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  text-align: left;
+}
+
+.navi-detail-fact {
+  min-width: 0;
+}
+
+.navi-detail-facts .k,
+.navi-detail-attr > .k {
+  margin-bottom: 7px;
+  color: rgba(239, 234, 240, 0.34);
+  font: 700 10px ui-monospace, Menlo, monospace;
+  letter-spacing: 0.12em;
+}
+
+.navi-detail-facts .v {
+  color: var(--navi-text);
+  font-size: 13.5px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.navi-detail-facts .sep {
+  width: 1px;
+  align-self: stretch;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.navi-detail-facts .k--file {
+  color: rgba(239, 234, 240, 0.28);
+}
+
+.navi-detail-facts .v--file {
+  color: rgba(239, 234, 240, 0.6);
+  font: 500 13px ui-monospace, Menlo, monospace;
+  white-space: nowrap;
+}
+
+.navi-detail-attr {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  max-width: 900px;
+  padding-top: 18px;
+  text-align: left;
+}
+
+.navi-detail-attr.is-tags {
+  align-items: flex-start;
+  padding-top: 16px;
+}
+
+.navi-detail-attr > .k {
+  width: 54px;
+  flex: none;
+  margin-bottom: 0;
+}
+
+.navi-detail-attr.is-tags > .k {
+  padding-top: 6px;
+}
+
+.navi-detail-attr-values {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  min-width: 0;
+}
+
+.navi-detail-attr-empty {
+  color: rgba(239, 234, 240, 0.34);
+  font-size: 12.5px;
+}
+
+.navi-actor-pill {
+  height: 28px;
+  padding: 0 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 0;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.09);
+  color: #f2efef;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.navi-actor-pill:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.navi-tag-pill {
+  height: 26px;
+  padding: 0 11px;
+  display: inline-flex;
+  align-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(239, 234, 240, 0.72);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease;
+}
+
+.navi-tag-pill:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--navi-text-strong);
+}
+
+.navi-tag-pill.is-static {
+  cursor: default;
+}
+
+.navi-detail-overview {
+  position: relative;
+  flex: none;
+  max-width: 880px;
+  margin-top: 22px;
+  color: rgba(239, 234, 240, 0.78);
+  font-size: 14px;
+  line-height: 1.7;
+  text-align: left;
+  white-space: pre-wrap;
+}
+
+.navi-detail-overview.collapsed {
+  max-height: 76px;
+  overflow: hidden;
+}
+
+.navi-detail-overview-toggle {
+  border: 0;
+  padding: 0 0 0 6px;
+  background: transparent;
+  color: var(--navi-play);
+  font: inherit;
+  font-size: 13.5px;
+  cursor: pointer;
+}
+
+.navi-detail-overview.collapsed .navi-detail-overview-toggle {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  padding-left: 24px;
+  background: linear-gradient(90deg, rgba(11, 9, 13, 0), rgba(11, 9, 13, 0.92) 40%);
+}
+
+/* 剧照 / 继续看是页面级全宽区块，不再挤在右栏里 */
+.navi-detail-block {
+  margin-top: 26px;
+}
+
+.navi-detail-block-head {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  margin-bottom: 10px;
+}
+
+.navi-detail-block-title {
+  color: var(--navi-primary);
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.navi-detail-block-meta {
+  color: var(--navi-text-faint);
+  font: 500 11.5px ui-monospace, Menlo, monospace;
+}
+
+.navi-stills-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.navi-still {
+  position: relative;
+  aspect-ratio: 16 / 10;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 0;
+  padding: 0;
+  background: var(--navi-poster);
+  background-image: var(--navi-poster-stripe);
+  cursor: pointer;
+}
+
+.navi-still:hover {
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.45);
+}
+
+.navi-still img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* 继续看：沿用 RecommendationRail，重绘为 6 列（超出可横向滚动） */
+.recommendation-rail-section {
+  margin-top: 26px;
+}
+
+.recommendation-rail-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 9px;
+  margin-bottom: 10px;
+}
+
+.recommendation-rail-title {
+  margin: 0;
+  color: var(--navi-primary);
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.recommendation-rail-subtitle {
+  margin: 0;
+  color: var(--navi-text-dim);
+  font-size: 11.5px;
+}
+
+.recommendation-rail-loading {
+  color: var(--navi-text-dim);
+  font-size: 11.5px;
+}
+
+.recommendation-rail {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding-bottom: 2px;
+}
+
+.recommendation-rail::-webkit-scrollbar {
+  display: none;
+}
+
+/* App.css 的推荐卡是「带边框+内边距+渐变底」的卡片，这里要还原成裸海报 */
+.recommendation-card {
+  flex: 0 0 calc((100% - 60px) / 6);
+  min-width: 0;
+  display: block;
+  gap: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  cursor: pointer;
+  outline: none;
+}
+
+.recommendation-card:hover {
+  transform: none;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+
+.recommendation-card-media {
+  position: relative;
+  aspect-ratio: 2 / 3;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--navi-poster);
+  background-image: var(--navi-poster-stripe);
+}
+
+.recommendation-card:hover .recommendation-card-media {
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.36);
+}
+
+.recommendation-card-image {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.recommendation-card-image-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--navi-text-dim);
+  font-size: 10px;
+}
+
+.recommendation-reason {
+  position: absolute;
+  left: 6px;
+  top: 6px;
+  z-index: 2;
+  max-width: calc(100% - 12px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  height: 18px;
+  padding: 0 7px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 99px;
+  background: rgba(11, 9, 13, 0.72);
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 9.5px;
+}
+
+/* 推荐卡沿用媒体卡那一套：播放键居中，静止时海报干净，hover 不压暗 */
+.recommendation-card-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  opacity: 0;
+  /* App.css 这里是 pointer-events:none，会让推荐卡的播放按钮点不动 */
+  pointer-events: none;
+  transition: opacity 0.16s ease;
+}
+
+.recommendation-card:hover .recommendation-card-overlay,
+.recommendation-card:focus-within .recommendation-card-overlay {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.recommendation-card-play {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding-left: 2px;
+  border: 0;
+  border-radius: 99px;
+  background: rgba(250, 246, 251, 0.94);
+  color: var(--navi-play-ink);
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.55);
+  cursor: pointer;
+}
+
+.recommendation-card-play:hover {
+  background: #fff;
+}
+
+.recommendation-card-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 4;
+  height: 4px;
+  background: rgba(11, 9, 13, 0.55);
+}
+
+.recommendation-card-progress .playback-progress-value {
+  display: block;
+  height: 100%;
+  background: #e0a05a;
+}
+
+.recommendation-card-copy {
+  margin-top: 7px;
+}
+
+.recommendation-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--navi-text);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.recommendation-meta {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+  color: var(--navi-text-dim);
+  font: 500 9.5px ui-monospace, Menlo, monospace;
+}
+
+.recommendation-card-skeleton {
+  height: 0;
+  padding-bottom: calc(150% + 30px);
+  border-radius: 8px;
+  background: var(--navi-fill-1);
+}
+
+/* 剧照灯箱 */
+/* 剧照灯箱：App.css 里还留着一套旧规则（absolute + top:50% + left/right），
+   这里必须把 position/top/left/right/transform 全部显式写死，否则两套会串在一起，
+   翻页按钮会被 top:50% 推到屏幕底部。 */
+.detail-preview-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 130;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.detail-preview-viewer-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(6, 5, 8, 0.9);
+}
+
+.detail-preview-viewer-content {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.detail-preview-viewer-image-shell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  max-width: 82vw;
+  max-height: 86vh;
+  pointer-events: auto;
+}
+
+.detail-preview-viewer-image {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 86vh;
+  object-fit: contain;
+  border-radius: 12px;
+  box-shadow: 0 30px 70px rgba(0, 0, 0, 0.7);
+}
+
+.detail-preview-viewer-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border: 0;
+  border-radius: 99px;
+  background: rgba(20, 17, 23, 0.82);
+  color: var(--navi-primary);
+  cursor: pointer;
+  transition: background 0.16s ease;
+}
+
+.detail-preview-viewer-nav:hover:not(:disabled) {
+  background: rgba(38, 33, 42, 0.95);
+}
+
+.detail-preview-viewer-nav.prev {
+  left: 28px;
+  right: auto;
+}
+
+.detail-preview-viewer-nav.next {
+  right: 28px;
+  left: auto;
+}
+
+.detail-preview-viewer-nav:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.meta-copy-feedback {
+  position: fixed;
+  z-index: 140;
+  /* 传进来的 y 是鼠标位置，靠这个 transform 让气泡竖直居中（沿用 App.css 的算法） */
+  transform: translateY(-50%);
+  padding: 4px 9px;
+  border: 0;
+  border-radius: 7px;
+  background: rgba(20, 17, 23, 0.96);
+  color: var(--navi-primary);
+  font-size: 11.5px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* ===== 空状态 / 提示 ===== */
+.workspace-empty-state-inner {
+  border-radius: 20px;
+  border-color: var(--navi-line-strong);
+  background: var(--navi-fill-1);
+  box-shadow: none;
+}
+
+.workspace-empty-eyebrow {
+  color: var(--navi-text-dim);
+}
+
+.workspace-empty-state-inner h2 {
+  color: var(--navi-text-strong);
+}
+
+.workspace-empty-state-inner p {
+  color: var(--navi-text-soft);
+}
+
+.workspace-empty-action {
+  border: 0;
+  border-radius: 99px;
+  background: var(--navi-primary);
+  color: var(--navi-primary-ink);
+}
+
+/* ===== 右下角提示：扫描卡 + 普通提示条共用一套盒子 ===== */
+.status-toast,
+.scan-progress-panel {
+  position: fixed;
+  right: 28px;
+  bottom: 24px;
+  z-index: 90;
+  width: 300px;
+  padding: 13px 14px;
+  border-radius: 12px;
+  background: rgba(23, 22, 27, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.55);
+  text-align: left;
+  backdrop-filter: blur(20px);
+}
+
+.status-toast {
+  box-sizing: border-box;
+  height: 46px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: rgba(239, 234, 240, 0.82);
+  font-size: 12.5px;
+}
+
+.status-toast svg {
+  flex: none;
+  color: rgba(239, 234, 240, 0.62);
+}
+
+.status-toast-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.status-toast-action {
+  flex: none;
+  height: 24px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--navi-text);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.status-toast-action:hover {
+  background: var(--navi-fill-hover);
+}
+
+.status-toast.error {
+  border-color: rgba(201, 90, 90, 0.28);
+}
+
+.status-toast.error > svg {
+  color: #e08a8a;
+}
+
+/* 提示条压在扫描卡上方，不再是「有提示就把扫描卡整个藏掉」。
+   toast 固定 46px 高，扫描卡就往上顶 46 + 10 的间距。 */
+.scan-progress-panel.stacked {
+  bottom: calc(24px + 46px + 10px);
+}
+
+.scan-progress-panel.terminal {
+  transition: opacity 0.28s ease;
+}
+
+.scan-progress-panel.terminal.failed {
+  border-color: rgba(201, 90, 90, 0.28);
+}
+
+.scan-progress-panel.terminal.leaving {
+  opacity: 0;
+}
+
+.scan-progress-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.scan-progress-spinner {
+  flex: none;
+  color: rgba(239, 234, 240, 0.62);
+  animation: navi-scan-spin 2s linear infinite;
+}
+
+@keyframes navi-scan-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.scan-progress-icon-ok {
+  flex: none;
+  color: #7fc79a;
+}
+
+.scan-progress-icon-bad {
+  flex: none;
+  color: #e08a8a;
+}
+
+/* 取消是用户自己点的，不该染成失败的红 */
+.scan-progress-icon-muted {
+  flex: none;
+  color: rgba(239, 234, 240, 0.62);
+}
+
+/* 收起态只剩头行：10 + 22 按钮 + 10 + 2 边框 = 44px */
+.scan-progress-panel.collapsed {
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.scan-progress-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: #faf6fb;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.scan-progress-count {
+  flex: none;
+  color: rgba(239, 234, 240, 0.5);
+  font: 500 11.5px ui-monospace, Menlo, monospace;
+}
+
+.scan-progress-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: rgba(239, 234, 240, 0.62);
+  cursor: pointer;
+}
+
+.scan-progress-toggle:hover {
+  background: var(--navi-fill-hover);
+}
+
+.scan-progress-track {
+  position: relative;
+  overflow: hidden;
+  margin-top: 11px;
+  height: 3px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.scan-progress-track > span {
+  display: block;
+  height: 100%;
+  border-radius: 99px;
+  background: var(--navi-play);
+  transition: width 0.3s ease;
+}
+
+/* 总数未知时用一条 30% 宽的往返动画条 */
+.scan-progress-track.indeterminate > span {
+  width: 30%;
+  transition: none;
+  animation: navi-scan-sweep 1.4s ease-in-out infinite;
+}
+
+@keyframes navi-scan-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(333%);
+  }
+}
+
+.scan-progress-file {
+  margin-top: 9px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: rgba(239, 234, 240, 0.38);
+  font: 500 11px ui-monospace, Menlo, monospace;
+}

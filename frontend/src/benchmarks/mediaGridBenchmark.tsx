@@ -201,7 +201,7 @@ const Benchmark = () => {
     return (
         <div className="benchmark-shell">
             {controls}
-            <ScanTaskPanel hidden={false} libraryId={libraryId} />
+            <ScanTaskPanel stacked={false} libraryId={libraryId} />
             <Profiler id="MediaGrid" onRender={(_id, _phase, actualDuration) => {
                 commitsRef.current += 1;
                 durationRef.current += actualDuration;

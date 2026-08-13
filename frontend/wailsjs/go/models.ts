@@ -257,6 +257,7 @@ export namespace model {
 	    title_field?: string;
 	    subtitle_field?: string;
 	    media_count?: number;
+	    total_size?: number;
 	    prefer_local_nfo: boolean;
 	    min_file_size: number;
 	    enable_file_filter: boolean;
@@ -286,6 +287,7 @@ export namespace model {
 	        this.title_field = source["title_field"];
 	        this.subtitle_field = source["subtitle_field"];
 	        this.media_count = source["media_count"];
+	        this.total_size = source["total_size"];
 	        this.prefer_local_nfo = source["prefer_local_nfo"];
 	        this.min_file_size = source["min_file_size"];
 	        this.enable_file_filter = source["enable_file_filter"];
