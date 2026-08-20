@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
     DeleteMedia,
     GetDetailRecommendations,
@@ -8,6 +8,7 @@ import {
     PlayMedia,
     RestartMedia,
     SaveNFOEditorData,
+    SetMyRating,
     ToggleFavorite,
     ToggleWatched,
 } from "../../wailsjs/go/main/App";
@@ -24,14 +25,25 @@ import {
     FilePenLine,
     FileVideo,
     FolderOpen,
+    Heart,
     Play,
+    Plus,
     RotateCcw,
-    Star,
     Trash2,
     UserRound,
 } from 'lucide-react';
 import NFOEditModal from './NFOEditModal';
 import RecommendationRail from './RecommendationRail';
+import StarRating from './StarRating';
+import TagPicker from './TagPicker';
+import {
+    buildCategoryColorMap,
+    categoryColor,
+    getUserTagsSnapshot,
+    invalidateUserTags,
+    loadUserTags,
+    subscribeUserTags,
+} from '../utils/userTags';
 import type {
     AppMedia,
     MediaFilter,
@@ -39,7 +51,10 @@ import type {
     RecommendationGroups,
     RecommendationItem,
 } from '../types/wails';
+import type { StatusKind } from '../types/status';
 import { formatError, toLocalAssetUrl } from '../utils/media';
+import { createAssetPrefetcher } from '../utils/assetPrefetch';
+import { loadTrailerVolume, persistTrailerVolume } from '../utils/trailerVolume';
 import {
     fetchMediaDetailCacheEntry,
     getMediaDetailCacheEntry,
@@ -59,6 +74,8 @@ interface MediaDetailProps {
     mediaStateUpdate?: MediaStateUpdate | null;
     libraryName?: string;
     onClose: () => void;
+    onStatus?: (message: string, kind?: StatusKind) => void;
+    onSelectLibrary?: () => void;
     onSelectMedia: (media: AppMedia) => void;
     onSelectFilter: (filter: MediaFilter) => void;
     onMediaChange?: (media: AppMedia) => void;
@@ -410,6 +427,8 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     mediaStateUpdate,
     libraryName,
     onClose,
+    onStatus,
+    onSelectLibrary,
     onSelectMedia,
     onSelectFilter,
     onMediaChange,
@@ -417,9 +436,10 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
 }) => {
     const [detail, setDetail] = useState(media);
     const [isOverviewExpanded, setIsOverviewExpanded] = useState(false);
-    const [msg, setMsg] = useState('');
     const [files, setFiles] = useState<string[]>([]);
     const [previews, setPreviews] = useState<string[]>([]);
+    const [trailer, setTrailer] = useState('');
+    const prefetchTrailerRef = useRef(createAssetPrefetcher());
     const [recommendations, setRecommendations] = useState<RecommendationGroups>(emptyRecommendations);
     const [recommendationLoading, setRecommendationLoading] = useState(false);
     const [currFilePath, setCurrFilePath] = useState(media.file_path || '');
@@ -429,6 +449,11 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     const [nfoLoading, setNfoLoading] = useState(false);
     const [nfoSaving, setNfoSaving] = useState(false);
     const [previewViewerIndex, setPreviewViewerIndex] = useState<number | null>(null);
+    const [ratingFlash, setRatingFlash] = useState(false);
+    const [tagPickerRect, setTagPickerRect] = useState<DOMRect | null>(null);
+    const myTagsRowRef = useRef<HTMLDivElement | null>(null);
+    const userTags = useSyncExternalStore(subscribeUserTags, getUserTagsSnapshot);
+    const categoryColors = useMemo(() => buildCategoryColorMap(userTags), [userTags]);
     const [codeCopyFeedback, setCodeCopyFeedback] = useState<CopyFeedback | null>(null);
     const [isStickyBarVisible, setIsStickyBarVisible] = useState(false);
     const fileDropdownRef = useRef<HTMLDivElement | null>(null);
@@ -438,9 +463,10 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     const titleRef = useRef<HTMLHeadingElement | null>(null);
     const mediaStateByIDRef = useRef(new Map<string, MediaStateUpdate>());
 
-    const showMsg = (message: string) => {
-        setMsg(message);
-        window.setTimeout(() => setMsg(''), 4000);
+    // 提示条统一交给 App 渲染。详情页自己渲染的话会被关进 .detail-overlay-shell
+    // 的层叠上下文里，扫描卡和 NFO 弹窗都压在它上面，保存失败根本看不见。
+    const showMsg = (message: string, kind: StatusKind = 'info') => {
+        onStatus?.(message, kind);
     };
 
     const clearCodeCopyFeedbackTimer = () => {
@@ -492,6 +518,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
             ? cachedEntry.files
             : (typeof media.file_path === 'string' && media.file_path.trim() ? [media.file_path.trim()] : []);
         const fallbackPreviews = cachedEntry?.previews || [];
+        const fallbackTrailer = cachedEntry?.trailer || '';
         const initialDetail = cachedEntry?.detail || media;
         const knownInitialState = mediaStateByIDRef.current.get(media.id);
         const resolvedInitialDetail = knownInitialState
@@ -502,6 +529,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
         setDetail(resolvedInitialDetail);
         setFiles(fallbackFiles);
         setPreviews(fallbackPreviews);
+        setTrailer(fallbackTrailer);
         setCurrFilePath((cachedEntry?.detail?.file_path || fallbackFiles[0] || media.file_path || '').trim());
         setRecommendations(emptyRecommendations);
         setRecommendationLoading(true);
@@ -552,6 +580,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                 setDetail(resolvedDetail);
                 setFiles(nextEntry.files);
                 setPreviews(nextEntry.previews);
+                setTrailer(nextEntry.trailer);
                 setCurrFilePath((resolvedDetail?.file_path || nextEntry.files[0] || media.file_path || '').trim());
                 onMediaChange?.(resolvedDetail);
             } catch (error) {
@@ -559,7 +588,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                 if (!active) {
                     return;
                 }
-                showMsg(`加载详情失败：${formatError(error)}`);
+                showMsg(`加载详情失败：${formatError(error)}`, 'error');
             }
         };
 
@@ -609,6 +638,12 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
         };
     }, []);
 
+    // 预告片排在剧照前面：它跟剧照同属一组「预览」，但要用 video 播放。
+    const previewItems = useMemo(() => {
+        const stills = previews.map((path) => ({ path, isVideo: false }));
+        return trailer ? [{ path: trailer, isVideo: true }, ...stills] : stills;
+    }, [previews, trailer]);
+
     useEffect(() => {
         if (previewViewerIndex === null) {
             return;
@@ -632,7 +667,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
 
             if (event.key === 'ArrowRight') {
                 setPreviewViewerIndex((currentIndex) => {
-                    if (currentIndex === null || currentIndex >= previews.length - 1) {
+                    if (currentIndex === null || currentIndex >= previewItems.length - 1) {
                         return currentIndex;
                     }
                     return currentIndex + 1;
@@ -644,13 +679,13 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
         return () => {
             document.removeEventListener('keydown', onKeyDown);
         };
-    }, [previewViewerIndex, previews.length]);
+    }, [previewViewerIndex, previewItems.length]);
 
     useEffect(() => {
-        if (previewViewerIndex !== null && previewViewerIndex >= previews.length) {
-            setPreviewViewerIndex(previews.length > 0 ? previews.length - 1 : null);
+        if (previewViewerIndex !== null && previewViewerIndex >= previewItems.length) {
+            setPreviewViewerIndex(previewItems.length > 0 ? previewItems.length - 1 : null);
         }
-    }, [previewViewerIndex, previews.length]);
+    }, [previewViewerIndex, previewItems.length]);
 
     useEffect(() => {
         return () => {
@@ -684,6 +719,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
         setDetail(nextEntry.detail);
         setFiles(nextEntry.files);
         setPreviews(nextEntry.previews);
+        setTrailer(nextEntry.trailer);
         setCurrFilePath((prev) => (prev || nextEntry.detail.file_path || media.file_path || '').trim());
         onMediaChange?.(nextEntry.detail);
     };
@@ -696,7 +732,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
         } catch (error) {
             console.error(error);
             setRecommendations(emptyRecommendations);
-            showMsg(`加载推荐失败：${formatError(error)}`);
+            showMsg(`加载推荐失败：${formatError(error)}`, 'error');
         } finally {
             setRecommendationLoading(false);
         }
@@ -705,29 +741,29 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     const handlePlay = async () => {
         const targetPath = (currFilePath || detail.file_path || media.file_path || '').trim();
         if (!targetPath) {
-            showMsg('播放失败：当前没有可播放文件');
+            showMsg('播放失败：当前没有可播放文件', 'error');
             return;
         }
 
         try {
-            showMsg(`正在启动播放器：${targetPath.split(/[\\/]/).pop()}`);
+            showMsg(`正在启动播放器：${targetPath.split(/[\\/]/).pop()}`, 'play');
             await PlayMedia(detail.id, targetPath);
             await refreshDetail();
         } catch (error) {
             console.error(error);
-            showMsg(`播放失败：${formatError(error)}`);
+            showMsg(`播放失败：${formatError(error)}`, 'error');
         }
     };
 
     const handleRestart = async () => {
         const targetPath = (currFilePath || detail.file_path || media.file_path || '').trim();
         if (!targetPath) {
-            showMsg('播放失败：当前没有可播放文件');
+            showMsg('播放失败：当前没有可播放文件', 'error');
             return;
         }
 
         try {
-            showMsg(`正在从头播放：${targetPath.split(/[\\/]/).pop()}`);
+            showMsg(`正在从头播放：${targetPath.split(/[\\/]/).pop()}`, 'play');
             await RestartMedia(detail.id, targetPath);
             setDetail((currentDetail) => {
                 const nextDetail = {
@@ -742,7 +778,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
             });
         } catch (error) {
             console.error(error);
-            showMsg(`从头播放失败：${formatError(error)}`);
+            showMsg(`从头播放失败：${formatError(error)}`, 'error');
         }
     };
 
@@ -751,7 +787,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
             await OpenMediaFolder(detail.id);
         } catch (error) {
             console.error(error);
-            showMsg(`打开目录失败：${formatError(error)}`);
+            showMsg(`打开目录失败：${formatError(error)}`, 'error');
         }
     };
 
@@ -764,7 +800,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
         } catch (error) {
             console.error(error);
             setShowNFOEditor(false);
-            showMsg(`打开 NFO 失败：${formatError(error)}`);
+            showMsg(`打开 NFO 失败：${formatError(error)}`, 'error');
         } finally {
             setNfoLoading(false);
         }
@@ -783,9 +819,9 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
             console.error(error);
             const message = formatError(error);
             if (message.includes('UnsupportedNFOLayout')) {
-                showMsg('为避免数据丢失，此 NFO 结构暂不支持编辑');
+                showMsg('为避免数据丢失，此 NFO 结构暂不支持编辑', 'error');
             } else {
-                showMsg(`保存 NFO 失败：${message}`);
+                showMsg(`保存 NFO 失败：${message}`, 'error');
             }
         } finally {
             setNfoSaving(false);
@@ -804,9 +840,78 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
             onClose();
         } catch (error) {
             console.error(error);
-            showMsg(`删除失败：${formatError(error)}`);
+            showMsg(`删除失败：${formatError(error)}`, 'error');
         }
     };
+
+    const myRating = Number.isFinite(Number(detail?.my_rating)) ? Math.max(0, Number(detail.my_rating)) : 0;
+    const myTags: any[] = Array.isArray((detail as any)?.my_tags) ? (detail as any).my_tags : [];
+    const myTagAssignment = useMemo(() => {
+        const counts: Record<string, number> = {};
+        myTags.forEach((tag: any) => {
+            if (tag?.id) {
+                counts[tag.id] = 1;
+            }
+        });
+        return counts;
+    }, [myTags]);
+
+    const handleRate = async (score: number) => {
+        try {
+            await SetMyRating(detail.id, score);
+            const nextScore = myRating === score ? 0 : score;
+            setDetail((prev) => {
+                const nextDetail = { ...prev, my_rating: nextScore };
+                mergeMediaDetailCacheEntry(nextDetail);
+                onMediaChange?.(nextDetail);
+                return nextDetail;
+            });
+            // 数字从灰闪一下到亮再回落，代替确认弹窗
+            setRatingFlash(true);
+            window.setTimeout(() => setRatingFlash(false), 260);
+        } catch (error) {
+            console.error(error);
+            showMsg(`打分失败：${formatError(error)}`, 'error');
+        }
+    };
+
+    useEffect(() => {
+        void loadUserTags();
+    }, []);
+
+    // 1–5 打分、0 清空、T 开标签 popover；输入框聚焦或有弹层时不响应
+    useEffect(() => {
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.ctrlKey || event.metaKey || event.altKey) {
+                return;
+            }
+            const target = event.target as HTMLElement | null;
+            if (target && (
+                target.isContentEditable
+                || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)
+            )) {
+                return;
+            }
+            if (previewViewerIndex !== null || showNFOEditor || tagPickerRect) {
+                return;
+            }
+            if (event.key >= '0' && event.key <= '5') {
+                event.preventDefault();
+                void handleRate(Number(event.key));
+                return;
+            }
+            if (event.key === 't' || event.key === 'T') {
+                event.preventDefault();
+                const anchor = myTagsRowRef.current?.querySelector('.navi-my-tag-add');
+                if (anchor) {
+                    setTagPickerRect(anchor.getBoundingClientRect());
+                }
+            }
+        };
+
+        document.addEventListener('keydown', onKeyDown);
+        return () => document.removeEventListener('keydown', onKeyDown);
+    });
 
     const handleFav = async () => {
         try {
@@ -819,7 +924,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
             });
         } catch (error) {
             console.error(error);
-            showMsg(`收藏失败：${formatError(error)}`);
+            showMsg(`收藏失败：${formatError(error)}`, 'error');
         }
     };
 
@@ -834,8 +939,26 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
             });
         } catch (error) {
             console.error(error);
-            showMsg(`更新观看状态失败：${formatError(error)}`);
+            showMsg(`更新观看状态失败：${formatError(error)}`, 'error');
         }
+    };
+
+    // 预告片音量记在 localStorage 里：每个 <video> 都是新元素，不接管的话
+    // 每次点开都回到满音量，换一部片子也一样。
+    const applyTrailerVolume = (video: HTMLVideoElement | null) => {
+        if (!video) {
+            return;
+        }
+        const preference = loadTrailerVolume();
+        video.volume = preference.volume;
+        video.muted = preference.muted;
+    };
+
+    const handleTrailerVolumeChange = (event: React.SyntheticEvent<HTMLVideoElement>) => {
+        persistTrailerVolume({
+            volume: event.currentTarget.volume,
+            muted: event.currentTarget.muted,
+        });
     };
 
     const handleOpenPreviewViewer = (index: number) => {
@@ -857,7 +980,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
 
     const handlePreviewViewerNext = () => {
         setPreviewViewerIndex((currentIndex) => {
-            if (currentIndex === null || currentIndex >= previews.length - 1) {
+            if (currentIndex === null || currentIndex >= previewItems.length - 1) {
                 return currentIndex;
             }
             return currentIndex + 1;
@@ -899,6 +1022,8 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     const immediateBackdropPath = deriveImmediateFanartPath(currFilePath || media.file_path || '');
     const backdropPath = pickBackdropImagePath(detail) || immediateBackdropPath || posterPath;
     const posterUrl = posterPath ? toLocalAssetUrl(posterPath) : '';
+    const trailerThumbPath = backdropPath || previews[0] || '';
+    const trailerThumbUrl = trailerThumbPath ? toLocalAssetUrl(trailerThumbPath) : '';
     const backdropUrl = backdropPath ? toLocalAssetUrl(backdropPath) : '';
     const actors = normalizeActors(detail);
     const { technical: technicalTags, content: contentTags } = splitDetailTags(detail);
@@ -918,10 +1043,11 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
             : '';
     const overviewText = cleanOverview(detail.overview);
     const isPreviewViewerOpen = previewViewerIndex !== null;
-    const currentPreviewPath = previewViewerIndex !== null ? previews[previewViewerIndex] : '';
-    const hasPreviewNavigation = previews.length > 1;
+    const currentPreviewItem = previewViewerIndex !== null ? previewItems[previewViewerIndex] : null;
+    const currentPreviewPath = currentPreviewItem?.path || '';
+    const hasPreviewNavigation = previewItems.length > 1;
     const canViewPrevPreview = previewViewerIndex !== null && previewViewerIndex > 0;
-    const canViewNextPreview = previewViewerIndex !== null && previewViewerIndex < previews.length - 1;
+    const canViewNextPreview = previewViewerIndex !== null && previewViewerIndex < previewItems.length - 1;
     const mergedRecommendations = mergeRecommendationItems(recommendations);
     const playbackProgress = getMediaProgressPercent(detail);
     const playbackDuration = detail.watch_duration || detail.duration;
@@ -958,46 +1084,6 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                 <div className="navi-detail-scrim" aria-hidden="true" />
 
                 <div className="navi-detail-body" ref={scrollRef}>
-                    <div
-                        className={`navi-detail-sticky ${isStickyBarVisible ? 'visible' : ''}`.trim()}
-                        onDoubleClick={WindowToggleMaximise}
-                    >
-                        <button
-                            type="button"
-                            className="navi-sticky-back"
-                            onClick={onClose}
-                            title="返回列表"
-                            aria-label="返回列表"
-                        >
-                            <ArrowLeft size={16} />
-                        </button>
-
-                        <div className="navi-sticky-poster" aria-hidden="true">
-                            {posterUrl && <img src={posterUrl} alt="" />}
-                        </div>
-
-                        <div className="navi-sticky-copy">
-                            <div className="navi-sticky-code">{mediaCode}</div>
-                            <div className="navi-sticky-title" title={detail.title}>{detail.title}</div>
-                        </div>
-
-                        <div className="navi-sticky-actions">
-                            <button type="button" className="navi-sticky-play" onClick={handlePlay}>
-                                <Play size={14} fill="currentColor" />
-                                <span>{playLabel}</span>
-                            </button>
-                            <button
-                                type="button"
-                                className={`navi-sticky-fav ${detail.is_favorite ? 'on' : ''}`.trim()}
-                                onClick={handleFav}
-                                title={detail.is_favorite ? '已收藏' : '收藏'}
-                                aria-label={detail.is_favorite ? '已收藏' : '收藏'}
-                            >
-                                <Star size={15} fill={detail.is_favorite ? 'currentColor' : 'none'} />
-                            </button>
-                        </div>
-                    </div>
-
                     <div className="navi-detail-topbar" onDoubleClick={WindowToggleMaximise}>
                         <button type="button" className="navi-back-btn" onClick={onClose} title="返回列表" aria-label="返回列表">
                             <ArrowLeft size={15} />
@@ -1006,7 +1092,14 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                         <div className="navi-breadcrumb">
                             {libraryName && (
                                 <>
-                                    <span className="navi-breadcrumb-link" title={libraryName}>{libraryName}</span>
+                                    <button
+                                        type="button"
+                                        className="navi-breadcrumb-link"
+                                        title={libraryName}
+                                        onClick={onSelectLibrary || onClose}
+                                    >
+                                        {libraryName}
+                                    </button>
                                     <span>/</span>
                                 </>
                             )}
@@ -1028,8 +1121,6 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                             )}
                             <span className="navi-breadcrumb-current">{mediaCode}</span>
                         </div>
-
-                        {msg && <span className="navi-detail-status">{msg}</span>}
                     </div>
 
                     <div className="navi-detail-hero">
@@ -1083,7 +1174,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                                     className={`navi-outline-btn ${detail.is_favorite ? 'on' : ''}`.trim()}
                                     onClick={handleFav}
                                 >
-                                    <Star size={16} fill={detail.is_favorite ? 'currentColor' : 'none'} />
+                                    <Heart size={16} fill={detail.is_favorite ? 'currentColor' : 'none'} />
                                     <span>{detail.is_favorite ? '已收藏' : '收藏'}</span>
                                 </button>
                                 <button
@@ -1094,6 +1185,19 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                                     {detail.is_watched ? <EyeOff size={16} /> : <Eye size={16} />}
                                     <span>{detail.is_watched ? '标记未看' : '标记已看'}</span>
                                 </button>
+
+                                <span className="navi-detail-rating-divider" aria-hidden="true" />
+
+                                <StarRating
+                                    value={myRating}
+                                    size={19}
+                                    onChange={(score) => void handleRate(score)}
+                                />
+                                {myRating > 0 && (
+                                    <span className={`navi-detail-rating-score ${ratingFlash ? 'flash' : ''}`.trim()}>
+                                        {myRating}
+                                    </span>
+                                )}
 
                                 <span className="navi-detail-actions-divider" aria-hidden="true" />
 
@@ -1277,6 +1381,30 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                                 </div>
                             </div>
 
+                            {/* 我的标签是信息表的最后一行；为空时也要显示，否则用户不知道有这功能 */}
+                            <div className="navi-detail-attr is-tags" ref={myTagsRowRef}>
+                                <div className="k">我的标签</div>
+                                <div className="navi-detail-attr-values">
+                                    {myTags.map((tag: any) => (
+                                        <span className="navi-my-tag-pill" key={tag.id}>
+                                            <span
+                                                className="navi-tag-dot"
+                                                style={{ background: categoryColor(categoryColors, typeof tag.category === 'string' ? tag.category : '') }}
+                                            />
+                                            {tag.name}
+                                        </span>
+                                    ))}
+                                    <button
+                                        type="button"
+                                        className="navi-my-tag-add"
+                                        onClick={(event) => setTagPickerRect(event.currentTarget.getBoundingClientRect())}
+                                    >
+                                        <Plus size={13} />
+                                        <span>标签</span>
+                                    </button>
+                                </div>
+                            </div>
+
                             <div className={`navi-detail-overview ${isOverviewExpanded ? '' : 'collapsed'}`.trim()}>
                                 {overviewText || getMetadataFallback(detail, '暂无简介')}
                                 {isOverviewCollapsible && (
@@ -1293,21 +1421,37 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                     </div>
 
                     <div className="navi-detail-wide">
-                        {previews.length > 0 && (
+                        {previewItems.length > 0 && (
                             <div className="navi-detail-block">
                                 <div className="navi-detail-block-head">
                                     <span className="navi-detail-block-title">预览剧照</span>
-                                    <span className="navi-detail-block-meta">{previews.length}</span>
+                                    <span className="navi-detail-block-meta">{previewItems.length}</span>
                                 </div>
                                 <div className="navi-stills-grid">
-                                    {previews.map((preview, index) => (
+                                    {previewItems.map((item, index) => (
                                         <button
-                                            key={`${preview}-${index}`}
+                                            key={`${item.path}-${index}`}
                                             type="button"
-                                            className="navi-still"
+                                            className={`navi-still ${item.isVideo ? 'is-trailer' : ''}`.trim()}
+                                            title={item.isVideo ? '播放预告片' : undefined}
+                                            onPointerEnter={item.isVideo
+                                                ? () => prefetchTrailerRef.current(toLocalAssetUrl(item.path))
+                                                : undefined}
                                             onClick={() => handleOpenPreviewViewer(index)}
                                         >
-                                            <img src={toLocalAssetUrl(preview)} alt="preview" loading="lazy" />
+                                            {item.isVideo ? (
+                                                <>
+                                                    {trailerThumbUrl && (
+                                                        <img src={trailerThumbUrl} alt="trailer" loading="lazy" />
+                                                    )}
+                                                    <span className="navi-still-play">
+                                                        <Play size={18} fill="currentColor" />
+                                                    </span>
+                                                    <span className="navi-still-badge">预告片</span>
+                                                </>
+                                            ) : (
+                                                <img src={toLocalAssetUrl(item.path)} alt="preview" loading="lazy" />
+                                            )}
                                         </button>
                                     ))}
                                 </div>
@@ -1324,6 +1468,48 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                                 onStatus={showMsg}
                             />
                         )}
+                    </div>
+                </div>
+
+                {/* 吸顶栏放在滚动容器外面：留在里面的话宽度会被滚动条让出的 10px 截断，
+                    右上角露出一条没被模糊的 fanart，看起来像断层。 */}
+                <div
+                    className={`navi-detail-sticky ${isStickyBarVisible ? 'visible' : ''}`.trim()}
+                    onDoubleClick={WindowToggleMaximise}
+                >
+                    <button
+                        type="button"
+                        className="navi-sticky-back"
+                        onClick={onClose}
+                        title="返回列表"
+                        aria-label="返回列表"
+                    >
+                        <ArrowLeft size={16} />
+                    </button>
+
+                    <div className="navi-sticky-poster" aria-hidden="true">
+                        {posterUrl && <img src={posterUrl} alt="" />}
+                    </div>
+
+                    <div className="navi-sticky-copy">
+                        <div className="navi-sticky-code">{mediaCode}</div>
+                        <div className="navi-sticky-title" title={detail.title}>{detail.title}</div>
+                    </div>
+
+                    <div className="navi-sticky-actions">
+                        <button type="button" className="navi-sticky-play" onClick={handlePlay}>
+                            <Play size={14} fill="currentColor" />
+                            <span>{playLabel}</span>
+                        </button>
+                        <button
+                            type="button"
+                            className={`navi-sticky-fav ${detail.is_favorite ? 'on' : ''}`.trim()}
+                            onClick={handleFav}
+                            title={detail.is_favorite ? '已收藏' : '收藏'}
+                            aria-label={detail.is_favorite ? '已收藏' : '收藏'}
+                        >
+                            <Heart size={15} fill={detail.is_favorite ? 'currentColor' : 'none'} />
+                        </button>
                     </div>
                 </div>
 
@@ -1346,11 +1532,24 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                         )}
                         <div className="detail-preview-viewer-content">
                             <div className="detail-preview-viewer-image-shell" onClick={(event) => event.stopPropagation()}>
-                                <img
-                                    src={toLocalAssetUrl(currentPreviewPath)}
-                                    className="detail-preview-viewer-image"
-                                    alt="preview enlarged"
-                                />
+                                {currentPreviewItem?.isVideo ? (
+                                    <video
+                                        key={currentPreviewPath}
+                                        ref={applyTrailerVolume}
+                                        src={toLocalAssetUrl(currentPreviewPath)}
+                                        className="detail-preview-viewer-video"
+                                        poster={trailerThumbUrl || undefined}
+                                        controls
+                                        autoPlay
+                                        onVolumeChange={handleTrailerVolumeChange}
+                                    />
+                                ) : (
+                                    <img
+                                        src={toLocalAssetUrl(currentPreviewPath)}
+                                        className="detail-preview-viewer-image"
+                                        alt="preview enlarged"
+                                    />
+                                )}
                             </div>
                         </div>
                         {hasPreviewNavigation && (
@@ -1381,6 +1580,33 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                 >
                     {'\u5df2\u590d\u5236'}
                 </div>
+            )}
+
+            {tagPickerRect && (
+                <TagPicker
+                    mediaIDs={[detail.id]}
+                    assigned={myTagAssignment}
+                    targetLabel={detail.title || detail.code || '这部影片'}
+                    style={{
+                        position: 'fixed',
+                        left: Math.max(12, Math.min(tagPickerRect.left, window.innerWidth - 302)),
+                        top: Math.min(tagPickerRect.bottom + 6, window.innerHeight - 320),
+                    }}
+                    onClose={() => setTagPickerRect(null)}
+                    onChanged={() => {
+                        invalidateUserTags();
+                        // 标签变化后重新拉一次详情，my_tags 才会跟上
+                        GetMediaDetail(detail.id).then((fresh: any) => {
+                            if (!fresh) {
+                                return;
+                            }
+                            const nextDetail = { ...detail, my_tags: fresh.my_tags || [] } as AppMedia;
+                            setDetail(nextDetail);
+                            mergeMediaDetailCacheEntry(nextDetail);
+                            onMediaChange?.(nextDetail);
+                        }).catch((error: unknown) => console.error(error));
+                    }}
+                />
             )}
 
             {showNFOEditor && (

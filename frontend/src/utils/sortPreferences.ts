@@ -1,5 +1,5 @@
 export type SortOrder = 'asc' | 'desc';
-export type SortField = 'created_at' | 'release_date' | 'video_codec' | 'last_watched' | 'favorite_at' | 'rating';
+export type SortField = 'created_at' | 'release_date' | 'video_codec' | 'last_watched' | 'favorite_at' | 'rating' | 'my_rating' | 'rated_at';
 export type SortViewName = 'libs' | 'watched' | 'favorite';
 export type SortConfig = { field: SortField; order: SortOrder };
 export type SortPreferences = Record<SortViewName, SortConfig>;
@@ -15,9 +15,9 @@ export const DEFAULT_SORTS: SortPreferences = {
 };
 
 const ALLOWED_FIELDS: Record<SortViewName, ReadonlySet<SortField>> = {
-    libs: new Set(['created_at', 'release_date', 'video_codec', 'last_watched']),
-    watched: new Set(['last_watched', 'created_at', 'rating']),
-    favorite: new Set(['favorite_at', 'created_at', 'rating']),
+    libs: new Set(['created_at', 'release_date', 'video_codec', 'last_watched', 'my_rating', 'rated_at']),
+    watched: new Set(['last_watched', 'created_at', 'rating', 'my_rating', 'rated_at']),
+    favorite: new Set(['favorite_at', 'created_at', 'rating', 'my_rating', 'rated_at']),
 };
 
 const resolveStorage = (): SortPreferenceStorage | null => {

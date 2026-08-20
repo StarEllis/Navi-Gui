@@ -467,6 +467,21 @@ func sanitizeMalformedNFOXML(data []byte) ([]byte, bool) {
 			continue
 		}
 
+		// 刮削器会写出 <7mmtvid> 这种数字开头的标签，XML 不认，补个下划线让解析继续。
+		if !inCDATA && raw[i] == '<' {
+			nameStart := i + 1
+			if nameStart < len(raw) && raw[nameStart] == '/' {
+				nameStart++
+			}
+			if nameStart < len(raw) && raw[nameStart] >= '0' && raw[nameStart] <= '9' {
+				builder.WriteString(raw[i:nameStart])
+				builder.WriteByte('_')
+				i = nameStart - 1
+				changed = true
+				continue
+			}
+		}
+
 		builder.WriteByte(raw[i])
 	}
 

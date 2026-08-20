@@ -69,15 +69,22 @@ func TestNewDatabaseMigratesSequentiallyAndReopenIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open(new) error = %v", err)
 	}
+	// 新库应该一路迁到最新版，并且每一版都留下记录，不能跳号。
+	migrations := DefaultMigrations()
+	wantVersion := migrations[len(migrations)-1].Version
 	version, err := manager.SchemaVersion()
-	if err != nil || version != 5 {
-		t.Fatalf("SchemaVersion() = %d, %v; want 5", version, err)
+	if err != nil || version != wantVersion {
+		t.Fatalf("SchemaVersion() = %d, %v; want %d", version, err, wantVersion)
 	}
 	var versions []int
 	if err := manager.DB().Model(&SchemaMigration{}).Order("version").Pluck("version", &versions).Error; err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(versions) != "[1 2 3 4 5]" {
+	wantVersions := make([]int, 0, len(migrations))
+	for _, migration := range migrations {
+		wantVersions = append(wantVersions, migration.Version)
+	}
+	if fmt.Sprint(versions) != fmt.Sprint(wantVersions) {
 		t.Fatalf("migration versions = %v", versions)
 	}
 	before, err := os.ReadDir(manager.BackupDir())
@@ -214,7 +221,9 @@ func TestHigherDatabaseVersionRejectsWriteOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.DB().Create(&SchemaMigration{Version: 6, Name: "future", AppliedAt: time.Now()}).Error; err != nil {
+	migrations := DefaultMigrations()
+	futureVersion := migrations[len(migrations)-1].Version + 1
+	if err := manager.DB().Create(&SchemaMigration{Version: futureVersion, Name: "future", AppliedAt: time.Now()}).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.Close(); err != nil {
@@ -864,7 +873,10 @@ func TestRestoreRejectsNewerNaviDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := candidate.DB().Create(&SchemaMigration{Version: 6, Name: "future", AppliedAt: time.Now().UTC()}).Error; err != nil {
+	// 比当前最高版本再高一级才算「来自更新的程序」，写死版本号会在每次加迁移时失效。
+	migrations := DefaultMigrations()
+	futureVersion := migrations[len(migrations)-1].Version + 1
+	if err := candidate.DB().Create(&SchemaMigration{Version: futureVersion, Name: "future", AppliedAt: time.Now().UTC()}).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := candidate.Close(); err != nil {

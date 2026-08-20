@@ -4,14 +4,23 @@ import './App.css';
 import './library-refine.css';
 import './navi-redesign.css';
 import {
+    BackfillActorAvatars,
+    ClearActorAvatar,
+    CycleActorAvatar,
     GetActorStats,
     GetDesktopSettings,
     GetGenreStats,
+    CountTaggedMedia,
+    GetFilterFacets,
     GetLibraries,
     PlayRandomLibraryMedia,
     ScanLibraryWithMode,
+    SelectActorAvatarFile,
+    SetActorAvatarFromFile,
+    SetActorAvatarFromURL,
 } from "../wailsjs/go/main/App";
 import { EventsOn, WindowSetDarkTheme, WindowSetTitle } from "../wailsjs/runtime/runtime";
+import ActorAvatarURLModal from './components/ActorAvatarURLModal';
 import Sidebar from './components/Sidebar';
 import TopBar from './components/TopBar';
 import MediaGrid, { getMediaListCacheKey, type MediaGridMutation } from './components/MediaGrid';
@@ -21,6 +30,8 @@ import CategoryGrid, {
     type CategoryViewMode,
 } from './components/CategoryGrid';
 import SettingsPage from './components/SettingsPage';
+import TagsPage from './components/TagsPage';
+import { FilterConditionBar, FilterPanel, type FilterFacets } from './components/FilterPanel';
 import LibraryModal from './components/LibraryModal';
 import LibraryEditModal from './components/LibraryEditModal';
 import MediaDetail from './components/MediaDetail';
@@ -41,6 +52,18 @@ import { markComponentRender } from './utils/performanceDiagnostics';
 import type { StatusKind } from './types/status';
 import { putBoundedScrollState } from './utils/listViewState';
 import { getTopBarBackLabel } from './utils/filterNavigation';
+import {
+    countUserFilterConditions,
+    EMPTY_USER_FILTER,
+    getUserTagsSnapshot,
+    isUserFilterEmpty,
+    loadSavedFilters,
+    loadUserTags,
+    persistSavedFilters,
+    subscribeUserTags,
+    type SavedFilter,
+    type UserFilter,
+} from './utils/userTags';
 import { formatLastScanLabel, formatLibrarySize } from './utils/library';
 import { shouldReplaceActorFilterOnSearchChange } from './utils/mediaSearch';
 import {
@@ -65,7 +88,7 @@ import {
     scanEventIdentity,
 } from './utils/scanTaskEvents';
 
-type ViewName = 'libs' | 'settings' | 'actor' | 'genre' | 'watched' | 'favorite';
+type ViewName = 'libs' | 'settings' | 'actor' | 'genre' | 'watched' | 'favorite' | 'tags';
 type StatusAction = { label: string; onClick: () => void };
 type StatusToast = { text: string; kind: StatusKind; action?: StatusAction } | null;
 type SortOption = { field: SortField; label: string };
@@ -80,10 +103,13 @@ const APP_TITLE = 'Navi';
 
 // 刮削事件是成串来的：先攒 1.2s，且两次真正的刷新之间至少隔 2s。
 const METADATA_REFRESH_DEBOUNCE_MS = 1200;
-const METADATA_REFRESH_MIN_INTERVAL_MS = 2000;
+// 补全一整个库要跑几分钟，每 2 秒重排一次网格纯属噪音：卡片会在眼前跳。
+// 拉到 15 秒，既不至于让新补好的信息迟迟不出现，也不会一直动。
+const METADATA_REFRESH_MIN_INTERVAL_MS = 15000;
 
 const VIEW_LABELS: Record<Exclude<ViewName, 'libs'>, string> = {
     settings: '设置',
+    tags: '我的标签',
     actor: '演员',
     genre: '类别',
     watched: '已看',
@@ -114,18 +140,24 @@ const LIBRARY_SORT_OPTIONS: SortOption[] = [
     { field: 'release_date', label: '发行日期' },
     { field: 'video_codec', label: '视频编码' },
     { field: 'last_watched', label: '观看时间' },
+    { field: 'my_rating', label: '我的评分' },
+    { field: 'rated_at', label: '打分时间' },
 ];
 
 const WATCHED_SORT_OPTIONS: SortOption[] = [
     { field: 'last_watched', label: '观看时间' },
     { field: 'created_at', label: '加入日期' },
     { field: 'rating', label: '评分' },
+    { field: 'my_rating', label: '我的评分' },
+    { field: 'rated_at', label: '打分时间' },
 ];
 
 const FAVORITE_SORT_OPTIONS: SortOption[] = [
     { field: 'favorite_at', label: '收藏时间' },
     { field: 'created_at', label: '加入日期' },
     { field: 'rating', label: '评分' },
+    { field: 'my_rating', label: '我的评分' },
+    { field: 'rated_at', label: '打分时间' },
 ];
 
 const formatError = (error: unknown) => {
@@ -145,6 +177,7 @@ const getMediaGridScrollKey = (
     sortField: SortField,
     sortOrder: SortOrder,
     filter: FilterState,
+    userFilter: UserFilter,
 ) => {
     const normalizedLibraryID = typeof libraryId === 'string' ? libraryId.trim() : '';
     if (!normalizedLibraryID) {
@@ -152,11 +185,11 @@ const getMediaGridScrollKey = (
     }
 
     if (view === 'watched') {
-        return getMediaListCacheKey(normalizedLibraryID, keyword, sortField, sortOrder, 'watched', 'true');
+        return getMediaListCacheKey(normalizedLibraryID, keyword, sortField, sortOrder, 'watched', 'true', userFilter);
     }
 
     if (view === 'favorite') {
-        return getMediaListCacheKey(normalizedLibraryID, keyword, sortField, sortOrder, 'favorite', 'true');
+        return getMediaListCacheKey(normalizedLibraryID, keyword, sortField, sortOrder, 'favorite', 'true', userFilter);
     }
 
     if (view !== 'libs') {
@@ -170,6 +203,7 @@ const getMediaGridScrollKey = (
         sortOrder,
         filter?.type || '',
         filter?.value || '',
+        userFilter,
     );
 };
 
@@ -182,6 +216,9 @@ function App() {
     const initialLibraryState = initialLibraryStateRef.current;
     const [layoutVersion, setLayoutVersion] = useState(0);
     const [contentRefreshVersion, setContentRefreshVersion] = useState(0);
+    const [backfillingAvatars, setBackfillingAvatars] = useState(false);
+    const [avatarURLTarget, setAvatarURLTarget] = useState<{ personID: string; name: string } | null>(null);
+    const [avatarURLSubmitting, setAvatarURLSubmitting] = useState(false);
     const [view, setView] = useState<ViewName>('libs');
     const [libraries, setLibraries] = useState<any[]>(() => initialLibraryState.libraries);
     const [currentLib, setCurrentLib] = useState<any>(() => initialLibraryState.currentLibrary);
@@ -212,6 +249,13 @@ function App() {
     const [gridScrollTops, setGridScrollTops] = useState<Record<string, number>>({});
     const [listMutation, setListMutation] = useState<MediaGridMutation | null>(null);
     const [latestMediaStateUpdate, setLatestMediaStateUpdate] = useState<MediaStateUpdate | null>(null);
+    // 「我的评分 / 我的标签」筛选：每个库各一套条件，切库清空、切页保留
+    const [userFilter, setUserFilter] = useState<UserFilter>(EMPTY_USER_FILTER);
+    const [filterPanelOpen, setFilterPanelOpen] = useState(false);
+    const [filterFacets, setFilterFacets] = useState<FilterFacets | null>(null);
+    const [savedFilters, setSavedFilters] = useState<SavedFilter[]>(() => loadSavedFilters());
+    const [taggedMediaCount, setTaggedMediaCount] = useState(0);
+    const userTags = useSyncExternalStore(subscribeUserTags, getUserTagsSnapshot);
     const scanStartedAtRef = useRef<number | null>(null);
     const scanModeRef = useRef<string>('');
     const scanRequestPendingRef = useRef(new Set<string>());
@@ -242,6 +286,7 @@ function App() {
         sortField,
         sortOrder,
         activeFilter,
+        userFilter,
     );
     const currentGridScrollTop = currentGridScrollKey ? (gridScrollTops[currentGridScrollKey] || 0) : 0;
 
@@ -259,6 +304,77 @@ function App() {
             return putBoundedScrollState(prev, currentGridScrollKey, normalizedScrollTop);
         });
     }, [currentGridScrollKey]);
+
+    // 筛选面板在媒体库页，已看 / 收藏 / 演员 / 类别页复用同一个按钮，条件叠在该页范围之上
+    const listFilterType = view === 'watched' ? 'watched' : view === 'favorite' ? 'favorite' : (activeFilter?.type || '');
+    const listFilterValue = view === 'watched' || view === 'favorite' ? 'true' : (activeFilter?.value || '');
+    const showFilterButton = view === 'libs' || view === 'watched' || view === 'favorite';
+    const userFilterConditionCount = countUserFilterConditions(userFilter);
+
+    useEffect(() => {
+        void loadUserTags();
+    }, []);
+
+    // 标签页的顶栏计数：标签数来自缓存，覆盖部数要问后端。
+    // contentRefreshVersion 在标签增删改之后会 +1，跟着重算。
+    useEffect(() => {
+        if (view !== 'tags') {
+            return;
+        }
+        void loadUserTags(true);
+        CountTaggedMedia().then(setTaggedMediaCount).catch((error: unknown) => console.error(error));
+    }, [view, contentRefreshVersion]);
+
+    // 切库时清空条件（不同库的标签命中完全不同，留着只会莫名其妙筛出 0 部）
+    useEffect(() => {
+        setUserFilter(EMPTY_USER_FILTER);
+        setFilterPanelOpen(false);
+    }, [currentLib?.id]);
+
+    // 面板开着或已经有条件时才算 facet：这是几条聚合查询，不该在没人看的时候跑
+    useEffect(() => {
+        if (!currentLib?.id || (!filterPanelOpen && isUserFilterEmpty(userFilter))) {
+            setFilterFacets(null);
+            return;
+        }
+        let cancelled = false;
+        GetFilterFacets(currentLib.id, mediaSearchKeyword, listFilterType, listFilterValue, userFilter as any)
+            .then((facets: any) => {
+                if (!cancelled) {
+                    setFilterFacets({
+                        tags: facets?.tags || {},
+                        ratings: facets?.ratings || {},
+                        total: Number(facets?.total) || 0,
+                    });
+                }
+            })
+            .catch((error: unknown) => console.error(error));
+        return () => {
+            cancelled = true;
+        };
+    }, [currentLib?.id, filterPanelOpen, listFilterType, listFilterValue, mediaSearchKeyword, userFilter]);
+
+    const handleSaveCurrentFilter = useCallback((name: string) => {
+        const next: SavedFilter = {
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            name,
+            libraryID: currentLib?.id || '',
+            filter: userFilter,
+        };
+        setSavedFilters((current) => {
+            const updated = [...current, next];
+            persistSavedFilters(updated);
+            return updated;
+        });
+    }, [currentLib?.id, userFilter]);
+
+    const handleDeleteSavedFilter = useCallback((id: string) => {
+        setSavedFilters((current) => {
+            const updated = current.filter((saved) => saved.id !== id);
+            persistSavedFilters(updated);
+            return updated;
+        });
+    }, []);
 
     useEffect(() => {
         const timer = window.setTimeout(() => setDebouncedMediaSearch(searchKeyword.trim()), searchKeyword.trim() ? 250 : 0);
@@ -636,6 +752,15 @@ function App() {
         }
     };
 
+    // 详情页面包屑点击媒体库名：回到该媒体库的完整列表，清掉筛选和搜索。
+    const backToLibraryFromDetail = () => {
+        setActiveFilter(null);
+        setSearchKeyword('');
+        setFilterReturnContext(null);
+        setSelectedMedia(null);
+        setView('libs');
+    };
+
     const returnToFilterSource = () => {
         if (!filterReturnContext) {
             return;
@@ -710,6 +835,10 @@ function App() {
         setActiveFilter(null);
         setFilterReturnContext(null);
         setSearchKeyword('');
+        // 条件条只描述当前这一页：换页面就得清掉，否则侧栏高亮已经跳走了、
+        // 「1 星以上」还挂在上面。切库另有一条 effect 也会清。
+        setUserFilter(EMPTY_USER_FILTER);
+        setFilterPanelOpen(false);
     };
 
     const handleSelectLibrary = (lib: any) => {
@@ -721,6 +850,21 @@ function App() {
     const handleOpenSettings = () => {
         resetWorkspaceState();
         setView('settings');
+    };
+
+    // 标签管理页只从筛选面板进。这里不能走 resetWorkspaceState——它会把
+    // filterReturnContext 一起清掉，返回键就没得回了。
+    const handleOpenTagsPage = () => {
+        setFilterPanelOpen(false);
+        setUserFilter(EMPTY_USER_FILTER);
+        setSelectedMedia(null);
+        setFilterReturnContext({
+            view,
+            media: null,
+            searchKeyword,
+            filter: activeFilter,
+        });
+        setView('tags');
     };
 
     const handleSelectView = (nextView: ViewName) => {
@@ -797,6 +941,88 @@ function App() {
         }
     };
 
+    // 手动设置头像：导入的图会缩放后存进本地库，原文件之后可以删。
+    const handlePickAvatarFile = async (personID: string, name: string) => {
+        try {
+            const sourcePath = await SelectActorAvatarFile();
+            if (!sourcePath) {
+                return;
+            }
+            await SetActorAvatarFromFile(personID, sourcePath);
+            showStatus(`已设置「${name}」的头像`);
+            setContentRefreshVersion((version) => version + 1);
+        } catch (error) {
+            showStatus(`设置头像失败：${formatError(error)}`, 'error');
+        }
+    };
+
+    const handleSubmitAvatarURL = async (imageURL: string) => {
+        if (!avatarURLTarget) {
+            return;
+        }
+        setAvatarURLSubmitting(true);
+        try {
+            await SetActorAvatarFromURL(avatarURLTarget.personID, imageURL);
+            showStatus(`已设置「${avatarURLTarget.name}」的头像`);
+            setAvatarURLTarget(null);
+            setContentRefreshVersion((version) => version + 1);
+        } catch (error) {
+            showStatus(`设置头像失败：${formatError(error)}`, 'error');
+        } finally {
+            setAvatarURLSubmitting(false);
+        }
+    };
+
+    const handleClearAvatar = async (personID: string, name: string) => {
+        try {
+            await ClearActorAvatar(personID);
+            showStatus(`已移除「${name}」的头像`);
+            setContentRefreshVersion((version) => version + 1);
+        } catch (error) {
+            showStatus(`移除头像失败：${formatError(error)}`, 'error');
+        }
+    };
+
+    // 图源对同一个演员常有多张（不同片商各存一版），换一张就是往后挪一格。
+    const handleCycleAvatar = async (personID: string, name: string) => {
+        try {
+            const result = await CycleActorAvatar(personID);
+            showStatus(`已换成「${name}」的第 ${result.index} / ${result.total} 张头像`);
+            setContentRefreshVersion((version) => version + 1);
+        } catch (error) {
+            showStatus(`换头像失败：${formatError(error)}`, 'error');
+        }
+    };
+
+    // 补全头像是分钟级的联网操作：按钮期间禁用，跑完再刷新一次演员页。
+    const handleBackfillAvatars = async () => {
+        if (!currentLib || backfillingAvatars) {
+            return;
+        }
+        setBackfillingAvatars(true);
+        try {
+            const result = await BackfillActorAvatars(currentLib.id);
+            const filled = result?.filled || 0;
+            const pending = result?.pending || 0;
+            if (filled > 0) {
+                showStatus(`已补全 ${filled} 张演员头像`);
+            } else if (pending === 0) {
+                // 打开演员页就会触发后台补全，点按钮时往往已经补完了。
+                // 这时候说「没补到」会让人以为失败，其实只是界面还没刷新。
+                showStatus('所有演员都已有头像');
+            } else {
+                // 补不到的多半是图源没收录，顺手把手动入口告诉用户。
+                showStatus(`还有 ${pending} 位演员没有头像，可在演员上右键手动设置`);
+            }
+        } catch (error) {
+            showStatus(`补全头像失败：${formatError(error)}`, 'error');
+        } finally {
+            // 后台补全的成果同样要反映出来，所以补没补到都刷一次。
+            setContentRefreshVersion((version) => version + 1);
+            setBackfillingAvatars(false);
+        }
+    };
+
     const handleSortSelect = (field: string) => {
         const nextField = field as SortField;
         setSortStateByView((prev) => {
@@ -850,9 +1076,11 @@ function App() {
             : view === 'libs'
                 ? currentLibraryName
                 : VIEW_LABELS[view];
-    // 媒体库概览：部数 · 容量 · 上次扫描；筛选态下只说明当前结果条数。
+    // 媒体库概览：部数 · 容量 · 上次扫描。这里的部数永远是库自己的总数，
+    // 不随筛选变——筛出几部只在条件条右侧的「→ N 部」说，否则会出现
+    // 「0 部 · 23.4 TB · 13 小时前扫描」这种自相矛盾的一行。
     const libraryOverview = [
-        `${(headerCount || 0).toLocaleString()} 部`,
+        `${(baseCount || 0).toLocaleString()} 部`,
         formatLibrarySize(currentLib?.total_size),
         formatLastScanLabel(currentLib?.last_scan),
     ].filter(Boolean).join(' · ');
@@ -862,9 +1090,11 @@ function App() {
             ? `${categoryStats.total} 个类别`
             : view === 'settings'
                 ? 'Navi 1.4.0 · 配置已同步'
-                : (view === 'libs' && !activeFilter && !searchKeyword.trim())
-                    ? libraryOverview
-                    : `${(headerCount || 0).toLocaleString()} 部`;
+                : view === 'tags'
+                    ? `${userTags.length} 个 · 覆盖 ${taggedMediaCount.toLocaleString()} 部`
+                    : (view === 'libs' && !activeFilter && !searchKeyword.trim())
+                        ? libraryOverview
+                        : `${(headerCount || 0).toLocaleString()} 部`;
     const topBarBackLabel = view === 'settings' ? '返回媒体库' : getTopBarBackLabel(filterReturnContext, view);
     const topBarBackAction = view === 'settings'
         ? handleNavigateHome
@@ -915,6 +1145,8 @@ function App() {
                         layoutVersion={layoutVersion}
                         refreshVersion={contentRefreshVersion}
                         filter={{ type: 'watched', value: 'true', label: '已看' }}
+                        userFilter={userFilter}
+                        onClearUserFilter={() => setUserFilter(EMPTY_USER_FILTER)}
                         onSelectMedia={handleSelectMedia}
                         onCountChange={setMediaCount}
                         onQuickPlayStatus={showStatus}
@@ -934,6 +1166,8 @@ function App() {
                         layoutVersion={layoutVersion}
                         refreshVersion={contentRefreshVersion}
                         filter={{ type: 'favorite', value: 'true', label: '收藏' }}
+                        userFilter={userFilter}
+                        onClearUserFilter={() => setUserFilter(EMPTY_USER_FILTER)}
                         onSelectMedia={handleSelectMedia}
                         onCountChange={setMediaCount}
                         onQuickPlayStatus={showStatus}
@@ -956,6 +1190,10 @@ function App() {
                         fetchFn={GetActorStats}
                         onSelect={(value, label) => applyFilterFromView('actor', { type: 'actor', value, label })}
                         onStatsChange={handleCategoryStatsChange}
+                        onCycleAvatar={handleCycleAvatar}
+                        onPickAvatarFile={handlePickAvatarFile}
+                        onPickAvatarURL={(personID, name) => setAvatarURLTarget({ personID, name })}
+                        onClearAvatar={handleClearAvatar}
                     />
                 );
             case 'genre':
@@ -972,6 +1210,13 @@ function App() {
                         onStatsChange={handleCategoryStatsChange}
                     />
                 );
+            case 'tags':
+                return (
+                    <TagsPage
+                        onStatus={showStatus}
+                        onTagsMutated={() => setContentRefreshVersion((version) => version + 1)}
+                    />
+                );
             case 'settings':
                 return <SettingsPage />;
             case 'libs':
@@ -985,6 +1230,8 @@ function App() {
                         layoutVersion={layoutVersion}
                         refreshVersion={contentRefreshVersion}
                         filter={activeFilter}
+                        userFilter={userFilter}
+                        onClearUserFilter={() => setUserFilter(EMPTY_USER_FILTER)}
                         onSelectMedia={handleSelectMedia}
                         onCountChange={setMediaCount}
                         onQuickPlayStatus={showStatus}
@@ -1020,7 +1267,7 @@ function App() {
                             stats={headerStats}
                             filterKind={activeFilter ? (FILTER_KIND_LABELS[activeFilter.type] || '筛选') : undefined}
                             filterValue={activeFilter?.label}
-                            showSearch={view !== 'settings'}
+                            showSearch={view !== 'settings' && view !== 'tags'}
                             searchValue={searchKeyword}
                             onSearch={handleSearchChange}
                             searchPlaceholder={searchPlaceholder}
@@ -1034,6 +1281,38 @@ function App() {
                                     ? handleCategorySortSelect
                                     : showListActions ? handleSortSelect : undefined
                             }
+                            onToggleFilterPanel={
+                                showFilterButton && currentLib
+                                    ? () => setFilterPanelOpen((open) => !open)
+                                    : undefined
+                            }
+                            filterPanelOpen={filterPanelOpen}
+                            filterConditionCount={userFilterConditionCount}
+                            filterPanel={(
+                                <FilterPanel
+                                    filter={userFilter}
+                                    tags={userTags}
+                                    facets={filterFacets}
+                                    savedFilters={savedFilters}
+                                    onChange={setUserFilter}
+                                    onSaveCurrent={handleSaveCurrentFilter}
+                                    onApplySaved={(saved) => setUserFilter(saved.filter)}
+                                    onDeleteSaved={handleDeleteSavedFilter}
+                                    onOpenTagsPage={handleOpenTagsPage}
+                                />
+                            )}
+                            filterConditionBar={
+                                showFilterButton && userFilterConditionCount > 0 ? (
+                                    <FilterConditionBar
+                                        filter={userFilter}
+                                        tags={userTags}
+                                        total={filterFacets ? filterFacets.total : null}
+                                        onChange={setUserFilter}
+                                    />
+                                ) : null
+                            }
+                            onBackfillAvatars={currentLib && view === 'actor' ? handleBackfillAvatars : undefined}
+                            backfillingAvatars={backfillingAvatars}
                             viewMode={categoryViewMode}
                             onToggleViewMode={
                                 currentLib && view === 'actor'
@@ -1066,6 +1345,8 @@ function App() {
                                     mediaStateUpdate={latestMediaStateUpdate}
                                     libraryName={currentLib?.name || ''}
                                     onClose={() => setSelectedMedia(null)}
+                                    onStatus={showStatus}
+                                    onSelectLibrary={backToLibraryFromDetail}
                                     onSelectMedia={handleSelectMedia}
                                     onSelectFilter={applyFilterFromDetail}
                                     onMediaChange={handleDetailMediaChange}
@@ -1087,6 +1368,15 @@ function App() {
                     onClose={() => setEditingLib(null)}
                     onSaved={handleLibSaved}
                     onDeleted={handleLibDeleted}
+                />
+            )}
+
+            {avatarURLTarget && (
+                <ActorAvatarURLModal
+                    actorName={avatarURLTarget.name}
+                    submitting={avatarURLSubmitting}
+                    onSubmit={handleSubmitAvatarURL}
+                    onClose={() => setAvatarURLTarget(null)}
                 />
             )}
 

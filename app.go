@@ -45,6 +45,8 @@ type App struct {
 	logFile            *os.File
 	removeMediaCache   func(string) error
 	avatarService      *service.GfriendsAvatarService
+	avatarStore        *service.ActorAvatarStore
+	avatarBackfilling  atomic.Bool
 	logger             *zap.SugaredLogger
 	remote             *remoteAccessState
 	desktop            *desktopIntegration
@@ -236,6 +238,8 @@ func (a *App) startup(ctx context.Context) {
 		ArtworkCache: a.artworkCache,
 		Logger:       a.logger,
 	})
+	a.avatarStore = service.NewActorAvatarStore(cfg.Cache.CacheDir, a.logger)
+	a.adoptLegacyActorAvatars()
 	thumbnailSettingsProvider := func() service.ThumbnailSettings {
 		settings, err := a.GetDesktopSettings()
 		if err != nil || settings == nil {
@@ -948,16 +952,23 @@ func (a *App) hydrateMediaState(media *model.Media) {
 		return
 	}
 	favoriteSet, watchedSet := a.loadMediaStateSets([]string{media.ID})
+	ratingSet, tagSet := a.loadMediaUserSets([]string{media.ID})
 	media.IsFavorite = favoriteSet[media.ID]
 	media.IsWatched = watchedSet[media.ID]
+	media.MyRating = ratingSet[media.ID]
+	media.MyTags = emptyTagsIfNil(tagSet[media.ID])
 	a.hydrateMediaProgress(media)
 }
 
 func (a *App) hydrateMediaSliceStates(mediaItems []model.Media) {
-	favoriteSet, watchedSet := a.loadMediaStateSets(collectMediaIDs(mediaItems))
+	mediaIDs := collectMediaIDs(mediaItems)
+	favoriteSet, watchedSet := a.loadMediaStateSets(mediaIDs)
+	ratingSet, tagSet := a.loadMediaUserSets(mediaIDs)
 	for i := range mediaItems {
 		mediaItems[i].IsFavorite = favoriteSet[mediaItems[i].ID]
 		mediaItems[i].IsWatched = watchedSet[mediaItems[i].ID]
+		mediaItems[i].MyRating = ratingSet[mediaItems[i].ID]
+		mediaItems[i].MyTags = emptyTagsIfNil(tagSet[mediaItems[i].ID])
 	}
 	a.hydrateMediaSliceProgress(mediaItems)
 }
@@ -1167,13 +1178,9 @@ func isBrowsableGenre(token string, actorKeys map[string]bool) bool {
 	return true
 }
 
-func (a *App) GetMediaList(libraryID string, page, size int, sortBy, sortOrder, keyword string, filterType, filterValue string) (interface{}, error) {
-	if err := a.waitForStartup(); err != nil {
-		return nil, err
-	}
-	if a.db == nil {
-		return nil, errors.New("application database is not initialized")
-	}
+// buildMediaQuery 组装媒体列表的检索条件（库 / 关键词 / 统计过滤 / 排序用的 JOIN），
+// 不含排序、分页和用户条件，供 GetMediaListFiltered 和 GetFilterFacets 共用。
+func (a *App) buildMediaQuery(libraryID, sortBy, keyword, filterType, filterValue string) *gorm.DB {
 	// 扩展原生后端的检索逻辑，增加分类过滤支持
 	query := a.db.Model(&model.Media{})
 	if sortBy == "last_watched" {
@@ -1190,6 +1197,12 @@ func (a *App) GetMediaList(libraryID string, page, size int, sortBy, sortOrder, 
 			Group("media_id")
 		query = query.Joins("LEFT JOIN (?) AS favorite_sort ON favorite_sort.media_id = media.id", favoriteSubQuery)
 	}
+	if sortBy == "my_rating" || sortBy == "rated_at" {
+		myRatingSubQuery := a.db.Table("media_ratings").
+			Select("media_id, score, updated_at AS rated_at").
+			Where("user_id = ?", desktopUserID)
+		query = query.Joins("LEFT JOIN (?) AS my_rating_sort ON my_rating_sort.media_id = media.id", myRatingSubQuery)
+	}
 	if libraryID != "" {
 		query = query.Where("library_id = ?", libraryID)
 	}
@@ -1205,10 +1218,30 @@ func (a *App) GetMediaList(libraryID string, page, size int, sortBy, sortOrder, 
 	if applyKeyword {
 		for _, token := range model.TokenizeMediaSearchQuery(keyword) {
 			keywordLike := "%" + token + "%"
-			query = query.Where(
-				"(media.search_text LIKE ? OR media.search_pinyin LIKE ? OR media.search_initials LIKE ?)",
-				keywordLike, keywordLike, keywordLike,
-			)
+			if model.ContainsHan(token) {
+				// 拼音两列都是纯 ASCII，汉字 token 查了也命中不了
+				query = query.Where("media.search_text LIKE ?", keywordLike)
+				continue
+			}
+			// 纯数字 token 在 search_text 里也只认单元开头，理由和拼音列一样：
+			// 做任意位置子串的话，"025" 会撞进发行日期的 "2025"，一搜就是整个库。
+			// 拼音两列全是字母，数字 token 查了也白查。
+			if model.IsDigitsOnly(token) {
+				query = query.Where(
+					"(media.search_text LIKE ? OR media.search_text LIKE ?)",
+					token+"%", "% "+token+"%",
+				)
+				continue
+			}
+			// 拼音和首字母只认单元开头。做任意位置子串的话，"ai" 会在
+			// bai/cai/dai… 里处处命中，一搜就是整个库。
+			conditions := "media.search_text LIKE ? OR media.search_pinyin LIKE ? OR media.search_pinyin LIKE ?"
+			args := []interface{}{keywordLike, token + "%", "% " + token + "%"}
+			if len(token) >= 2 {
+				conditions += " OR media.search_initials LIKE ? OR media.search_initials LIKE ?"
+				args = append(args, token+"%", "% "+token+"%")
+			}
+			query = query.Where("("+conditions+")", args...)
 		}
 	}
 
@@ -1249,6 +1282,25 @@ func (a *App) GetMediaList(libraryID string, page, size int, sortBy, sortOrder, 
 		}
 	}
 
+	return query
+}
+
+func (a *App) GetMediaList(libraryID string, page, size int, sortBy, sortOrder, keyword string, filterType, filterValue string) (interface{}, error) {
+	return a.GetMediaListFiltered(libraryID, page, size, sortBy, sortOrder, keyword, filterType, filterValue, UserFilter{})
+}
+
+// GetMediaListFiltered 与 GetMediaList 相同，额外叠加「我的评分 / 我的标签」条件。
+// 用户条件和 keyword、filterType 是叠加关系：先筛出范围，再在范围内搜索。
+func (a *App) GetMediaListFiltered(libraryID string, page, size int, sortBy, sortOrder, keyword string, filterType, filterValue string, uf UserFilter) (interface{}, error) {
+	if err := a.waitForStartup(); err != nil {
+		return nil, err
+	}
+	if a.db == nil {
+		return nil, errors.New("application database is not initialized")
+	}
+	query := a.buildMediaQuery(libraryID, sortBy, keyword, filterType, filterValue)
+	query = a.applyUserFilter(query, uf)
+
 	if size <= 0 {
 		size = 120
 	}
@@ -1273,11 +1325,10 @@ func (a *App) GetMediaList(libraryID string, page, size int, sortBy, sortOrder, 
 	var media []model.Media
 	// 简单的排序处理
 	if sortBy == "created_at" || sortBy == "added_at" || sortBy == "" {
-		a.backfillMediaNfoModTime(libraryID)
 		a.backfillMediaFileCreatedAt(libraryID)
 	}
 
-	sortField := "COALESCE(media.nfo_mod_time, media.file_created_at, media.file_mod_time, media.created_at)"
+	sortField := "COALESCE(media.file_created_at, media.file_mod_time, media.created_at)"
 	switch sortBy {
 	case "release_date":
 		sortField = "CASE WHEN media.release_date_normalized != '' THEN media.release_date_normalized ELSE printf('%04d-01-01', media.year) END"
@@ -1289,10 +1340,15 @@ func (a *App) GetMediaList(libraryID string, page, size int, sortBy, sortOrder, 
 		sortField = "COALESCE(favorite_sort.favorite_at, '')"
 	case "rating":
 		sortField = "media.rating"
+	case "my_rating":
+		// SQLite 没有 NULLS LAST，未评分统一按 0 排到末尾
+		sortField = "COALESCE(my_rating_sort.score, 0)"
+	case "rated_at":
+		sortField = "COALESCE(my_rating_sort.rated_at, '')"
 	case "created_at", "added_at", "":
-		sortField = "COALESCE(media.nfo_mod_time, media.file_created_at, media.file_mod_time, media.created_at)"
+		sortField = "COALESCE(media.file_created_at, media.file_mod_time, media.created_at)"
 	default:
-		sortField = "COALESCE(media.nfo_mod_time, media.file_created_at, media.file_mod_time, media.created_at)"
+		sortField = "COALESCE(media.file_created_at, media.file_mod_time, media.created_at)"
 	}
 
 	dir := "DESC"
@@ -1359,49 +1415,6 @@ func (a *App) backfillMediaFileCreatedAt(libraryID string) {
 	}
 }
 
-type mediaNFOTimeBackfillRow struct {
-	ID       string
-	FilePath string
-}
-
-func (a *App) backfillMediaNfoModTime(libraryID string) {
-	query := a.db.Model(&model.Media{}).
-		Select("id, file_path").
-		Where("nfo_mod_time IS NULL AND nfo_raw_xml != ''")
-	if libraryID != "" {
-		query = query.Where("library_id = ?", libraryID)
-	}
-
-	var rows []mediaNFOTimeBackfillRow
-	if err := query.Find(&rows).Error; err != nil || len(rows) == 0 {
-		return
-	}
-
-	nfoService := service.NewNFOService(a.logger)
-	for _, row := range rows {
-		nfoPath := ""
-		if a.scanner != nil {
-			nfoPath = a.scanner.FindNFOForMedia(row.FilePath)
-		} else {
-			nfoPath = nfoService.FindNFOForMedia(row.FilePath)
-		}
-		if nfoPath == "" {
-			continue
-		}
-
-		info, err := os.Stat(nfoPath)
-		if err != nil || info == nil || info.IsDir() {
-			continue
-		}
-
-		nfoModTime := info.ModTime().UTC().Truncate(time.Second)
-		_ = a.db.Model(&model.Media{}).
-			Where("id = ?", row.ID).
-			Update("nfo_mod_time", &nfoModTime).
-			Error
-	}
-}
-
 // GetDirectoryStats 获取目录聚合统计
 func (a *App) GetDirectoryStats(libraryID string) ([]StatsItem, error) {
 	var filePaths []string
@@ -1428,9 +1441,8 @@ func (a *App) GetDirectoryStats(libraryID string) ([]StatsItem, error) {
 	return results, nil
 }
 
-// GetActorStats 获取演员聚合统计
-func (a *App) GetActorStats(libraryID string) ([]StatsItem, error) {
-	var rawResults []actorStatsRow
+func (a *App) actorStatsRows(libraryID string) ([]actorStatsRow, error) {
+	var rows []actorStatsRow
 	err := a.db.Raw(`
 		SELECT p.id, p.name, p.profile_url, COUNT(mp.media_id) as count
 		FROM people p
@@ -1439,12 +1451,18 @@ func (a *App) GetActorStats(libraryID string) ([]StatsItem, error) {
 		WHERE m.library_id = ? AND mp.role = 'actor'
 		GROUP BY p.id, p.name, p.profile_url
 		ORDER BY count DESC, p.name ASC
-	`, libraryID).Scan(&rawResults).Error
+	`, libraryID).Scan(&rows).Error
+	return rows, err
+}
+
+// GetActorStats 获取演员聚合统计
+func (a *App) GetActorStats(libraryID string) ([]StatsItem, error) {
+	rawResults, err := a.actorStatsRows(libraryID)
 	if err != nil {
 		return nil, err
 	}
 	if a.gfriendsAvatarsEnabled() {
-		a.backfillActorStatsAvatars(rawResults)
+		a.startActorAvatarBackfill(rawResults)
 	}
 
 	var results []StatsItem
@@ -1470,22 +1488,301 @@ func (a *App) gfriendsAvatarsEnabled() bool {
 	return settings.EnableGfriendsAvatars
 }
 
-func (a *App) backfillActorStatsAvatars(rows []actorStatsRow) {
+// startActorAvatarBackfill downloads the avatars this page is missing without
+// making the page wait for them: every avatar is a network round trip, and one
+// slow or rate-limited source would otherwise stall the whole actor list. The
+// downloads persist to the artwork cache and people.profile_url, so the next
+// visit renders them from disk.
+func (a *App) startActorAvatarBackfill(rows []actorStatsRow) {
 	if a == nil || a.avatarService == nil || a.db == nil {
 		return
 	}
+	pending := actorRowsMissingAvatar(rows)
+	if len(pending) == 0 {
+		return
+	}
+	// Reopening the page while a run is in flight must not start a second one.
+	if !a.avatarBackfilling.CompareAndSwap(false, true) {
+		return
+	}
+	a.maintenanceWG.Add(1)
+	go func() {
+		defer a.maintenanceWG.Done()
+		defer a.avatarBackfilling.Store(false)
+		a.backfillActorStatsAvatars(pending)
+	}()
+}
+
+// actorAvatarBackfillBudget bounds one run so the button reports back in a
+// predictable time instead of grinding through a throttled source.
+const actorAvatarBackfillBudget = 3 * time.Minute
+
+// isPlaceholderActorName reports the stand-in an NFO leaves when it names no
+// actor. There is no person behind it, so no run should spend a request on it.
+func isPlaceholderActorName(name string) bool {
+	return model.NormalizeChineseVariants(strings.TrimSpace(name)) == "未知演员"
+}
+
+func actorRowsMissingAvatar(rows []actorStatsRow) []actorStatsRow {
+	pending := make([]actorStatsRow, 0, len(rows))
+	for _, row := range rows {
+		if strings.TrimSpace(row.ProfileURL) == "" && !isPlaceholderActorName(row.Name) {
+			pending = append(pending, row)
+		}
+	}
+	return pending
+}
+
+// BackfillActorAvatars fills the missing avatars now and waits for the result,
+// so the actor page can report what it fetched. Clicking the button is a
+// deliberate retry, so the cooldown on earlier failures is cleared first.
+// ActorAvatarBackfillResult 让界面能区分两种「一张都没补到」：没人缺头像
+// （后台补全已经补完，界面只是还没刷新），和缺了但图源没收录。
+type ActorAvatarBackfillResult struct {
+	Filled  int `json:"filled"`
+	Pending int `json:"pending"`
+}
+
+func (a *App) BackfillActorAvatars(libraryID string) (*ActorAvatarBackfillResult, error) {
+	if a == nil || a.avatarService == nil || a.db == nil {
+		return nil, fmt.Errorf("演员头像服务不可用")
+	}
+	if !a.gfriendsAvatarsEnabled() {
+		return nil, fmt.Errorf("gfriends 演员头像已在设置中关闭")
+	}
+	rows, err := a.actorStatsRows(libraryID)
+	if err != nil {
+		return nil, err
+	}
+	pending := actorRowsMissingAvatar(rows)
+	result := &ActorAvatarBackfillResult{Pending: len(pending)}
+	if len(pending) == 0 {
+		return result, nil
+	}
+	if !a.avatarBackfilling.CompareAndSwap(false, true) {
+		return nil, fmt.Errorf("头像补全正在进行中")
+	}
+	defer a.avatarBackfilling.Store(false)
+
+	a.avatarService.ResetDownloadFailures()
+	result.Filled = a.backfillActorStatsAvatars(pending)
+	return result, nil
+}
+
+// SelectActorAvatarFile asks the user for an image file to import.
+func (a *App) SelectActorAvatarFile() (string, error) {
+	return wailsRuntime.OpenFileDialog(a.ctx, wailsRuntime.OpenDialogOptions{
+		Title: "选择演员头像",
+		Filters: []wailsRuntime.FileFilter{
+			{DisplayName: "图片 (*.jpg;*.jpeg;*.png;*.webp;*.bmp)", Pattern: "*.jpg;*.jpeg;*.png;*.webp;*.bmp"},
+			{DisplayName: "所有文件 (*.*)", Pattern: "*.*"},
+		},
+	})
+}
+
+// SetActorAvatarFromFile imports a local image as an actor's avatar. The stored
+// copy belongs to the library, so the imported file can be deleted afterwards.
+func (a *App) SetActorAvatarFromFile(personID, sourcePath string) (string, error) {
+	return a.applyActorAvatar(personID, func(actorName string) (string, error) {
+		return a.avatarStore.ImportFile(actorName, sourcePath)
+	})
+}
+
+// SetActorAvatarFromURL imports an image address, for the actors no avatar index
+// covers.
+func (a *App) SetActorAvatarFromURL(personID, imageURL string) (string, error) {
+	return a.applyActorAvatar(personID, func(actorName string) (string, error) {
+		return a.avatarStore.ImportURL(actorName, imageURL)
+	})
+}
+
+func (a *App) applyActorAvatar(personID string, importAvatar func(actorName string) (string, error)) (string, error) {
+	if a == nil || a.avatarStore == nil || a.db == nil {
+		return "", fmt.Errorf("演员头像存储不可用")
+	}
+	if strings.TrimSpace(personID) == "" {
+		return "", fmt.Errorf("演员标识为空")
+	}
+	var person model.Person
+	if err := a.db.First(&person, "id = ?", personID).Error; err != nil {
+		return "", err
+	}
+	storedPath, err := importAvatar(person.Name)
+	if err != nil {
+		return "", err
+	}
+	if err := a.db.Model(&model.Person{}).
+		Where("id = ?", personID).
+		Updates(map[string]any{"profile_url": storedPath, "avatar_source": ""}).Error; err != nil {
+		return "", err
+	}
+	return storedPath, nil
+}
+
+// ActorAvatarCycleResult 告诉界面换到了第几张、一共几张。
+type ActorAvatarCycleResult struct {
+	ProfileURL string `json:"profile_url"`
+	Index      int    `json:"index"`
+	Total      int    `json:"total"`
+}
+
+// CycleActorAvatar 换用图源里这个演员的下一张头像。
+//
+// 图源对同一个演员常有多张（不同片商各存一版），但索引只留了一张，所以「移除
+// 再补全」拿回来的永远是同一张。这里按需列出全部候选，记住当前停在哪一张，
+// 每调一次前进一张，转完一圈回到第一张。
+func (a *App) CycleActorAvatar(personID string) (*ActorAvatarCycleResult, error) {
+	if a == nil || a.avatarService == nil || a.artworkCache == nil || a.db == nil {
+		return nil, fmt.Errorf("演员头像服务不可用")
+	}
+	if strings.TrimSpace(personID) == "" {
+		return nil, fmt.Errorf("演员标识为空")
+	}
+
+	var person model.Person
+	if err := a.db.First(&person, "id = ?", personID).Error; err != nil {
+		return nil, err
+	}
+
+	candidates, err := a.avatarService.ListCandidates(person.Name)
+	if err != nil {
+		return nil, err
+	}
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("图源里没有收录「%s」的头像", person.Name)
+	}
+	if len(candidates) == 1 {
+		return nil, fmt.Errorf("图源里「%s」只有一张头像", person.Name)
+	}
+
+	next := 0
+	for index, candidate := range candidates {
+		if candidate.CandidateKey() == person.AvatarSource {
+			next = (index + 1) % len(candidates)
+			break
+		}
+	}
+
+	data, err := a.avatarService.FetchCandidate(candidates[next])
+	if err != nil {
+		return nil, fmt.Errorf("下载头像失败：%w", err)
+	}
+	cachedPath, err := a.artworkCache.CacheActorImage(person.ID, person.Name, data)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(cachedPath) == "" {
+		return nil, fmt.Errorf("头像缓存失败")
+	}
+
+	if err := a.db.Model(&model.Person{}).
+		Where("id = ?", personID).
+		Updates(map[string]any{
+			"profile_url":   cachedPath,
+			"avatar_source": candidates[next].CandidateKey(),
+		}).Error; err != nil {
+		return nil, err
+	}
+
+	return &ActorAvatarCycleResult{
+		ProfileURL: cachedPath,
+		Index:      next + 1,
+		Total:      len(candidates),
+	}, nil
+}
+
+// ClearActorAvatar drops an actor's avatar so the grid falls back to the initial
+// and the next backfill may look for it again.
+func (a *App) ClearActorAvatar(personID string) error {
+	if a == nil || a.db == nil {
+		return fmt.Errorf("演员头像存储不可用")
+	}
+	if strings.TrimSpace(personID) == "" {
+		return fmt.Errorf("演员标识为空")
+	}
+
+	var person model.Person
+	if err := a.db.First(&person, "id = ?", personID).Error; err != nil {
+		return err
+	}
+	// Only imported avatars are deleted: a fetched one lives in the artwork
+	// cache, which manages its own files.
+	if a.avatarStore.Owns(person.ProfileURL) {
+		if err := a.avatarStore.Remove(person.Name); err != nil {
+			return err
+		}
+	}
+	return a.db.Model(&model.Person{}).Where("id = ?", personID).
+		Updates(map[string]any{"profile_url": "", "avatar_source": ""}).Error
+}
+
+// restoreOrFetchActorAvatar prefers an avatar the user imported. An overwrite
+// rescan drops the people rows, so after one the imported avatars are the only
+// ones that cannot be fetched again — they get reattached here, offline, before
+// any request goes out.
+func (a *App) restoreOrFetchActorAvatar(person *model.Person) (bool, error) {
+	if stored := a.avatarStore.Lookup(person.Name); stored != "" {
+		if strings.EqualFold(filepath.Clean(stored), filepath.Clean(person.ProfileURL)) {
+			return false, nil
+		}
+		person.ProfileURL = stored
+		return true, nil
+	}
+	return a.avatarService.EnsureActorAvatar(person)
+}
+
+// adoptLegacyActorAvatars moves avatars imported under a person id onto the
+// actor's name, the key that survives a rescan.
+func (a *App) adoptLegacyActorAvatars() {
+	if a == nil || a.avatarStore == nil || a.db == nil {
+		return
+	}
+	var people []model.Person
+	if err := a.db.Where("profile_url LIKE ?", "%actors%").Find(&people).Error; err != nil {
+		return
+	}
+	for _, person := range people {
+		if !a.avatarStore.Owns(person.ProfileURL) {
+			continue
+		}
+		adopted, err := a.avatarStore.Adopt(person.ID, person.Name)
+		if err != nil {
+			if a.logger != nil {
+				a.logger.Warnf("adopt actor avatar failed: actor=%s err=%v", person.Name, err)
+			}
+			continue
+		}
+		if adopted == "" || samePathValue(adopted, person.ProfileURL) {
+			continue
+		}
+		if err := a.db.Model(&model.Person{}).Where("id = ?", person.ID).Update("profile_url", adopted).Error; err != nil && a.logger != nil {
+			a.logger.Warnf("persist adopted actor avatar failed: actor=%s err=%v", person.Name, err)
+		}
+	}
+}
+
+func samePathValue(left, right string) bool {
+	return strings.EqualFold(filepath.Clean(strings.TrimSpace(left)), filepath.Clean(strings.TrimSpace(right)))
+}
+
+func (a *App) backfillActorStatsAvatars(rows []actorStatsRow) int {
+	if a == nil || a.avatarService == nil || a.db == nil {
+		return 0
+	}
 
 	type avatarResult struct {
-		index  int
 		person *model.Person
 		err    error
 	}
 	jobs := make(chan int)
 	completed := make(chan avatarResult, len(rows))
-	workerCount := 6
+	// Six parallel workers were themselves enough of a burst to get the source
+	// to start refusing, which cost more avatars than the parallelism won.
+	workerCount := 3
 	if len(rows) < workerCount {
 		workerCount = len(rows)
 	}
+	deadline := time.Now().Add(actorAvatarBackfillBudget)
 
 	var workers sync.WaitGroup
 	for worker := 0; worker < workerCount; worker++ {
@@ -1495,16 +1792,22 @@ func (a *App) backfillActorStatsAvatars(rows []actorStatsRow) {
 			for index := range jobs {
 				row := rows[index]
 				person := &model.Person{ID: row.ID, Name: row.Name, ProfileURL: row.ProfileURL}
-				changed, err := a.avatarService.EnsureActorAvatar(person)
+				changed, err := a.restoreOrFetchActorAvatar(person)
 				if !changed && err == nil {
 					continue
 				}
-				completed <- avatarResult{index: index, person: person, err: err}
+				completed <- avatarResult{person: person, err: err}
 			}
 		}()
 	}
 
 	for index := range rows {
+		// A throttled source can keep a run going for a very long time. Stop
+		// handing out work once the budget is spent; whatever is left stays
+		// missing and the next run — or the button — picks it up.
+		if time.Now().After(deadline) {
+			break
+		}
 		if strings.TrimSpace(rows[index].ProfileURL) == "" {
 			jobs <- index
 		}
@@ -1513,6 +1816,7 @@ func (a *App) backfillActorStatsAvatars(rows []actorStatsRow) {
 	workers.Wait()
 	close(completed)
 
+	filled := 0
 	for result := range completed {
 		if result.err != nil {
 			if a.logger != nil {
@@ -1522,14 +1826,18 @@ func (a *App) backfillActorStatsAvatars(rows []actorStatsRow) {
 		}
 		if err := a.db.Model(&model.Person{}).
 			Where("id = ?", result.person.ID).
-			Update("profile_url", result.person.ProfileURL).Error; err != nil {
+			Updates(map[string]any{
+				"profile_url":   result.person.ProfileURL,
+				"avatar_source": result.person.AvatarSource,
+			}).Error; err != nil {
 			if a.logger != nil {
 				a.logger.Warnf("persist actor avatar failed: actor=%s err=%v", result.person.Name, err)
 			}
 			continue
 		}
-		rows[result.index].ProfileURL = result.person.ProfileURL
+		filled++
 	}
+	return filled
 }
 
 // GetGenreStats 获取类别聚合统计
@@ -1694,6 +2002,7 @@ type MediaDetailBundle struct {
 	Detail   *model.Media `json:"detail"`
 	Files    []string     `json:"files"`
 	Previews []string     `json:"previews"`
+	Trailer  string       `json:"trailer"`
 }
 
 func (a *App) getMediaFilesByPath(filePath string) []string {
@@ -1843,24 +2152,6 @@ func (a *App) getMediaPreviewsByPath(filePath string) []string {
 		}
 	}
 
-	if entries, err := os.ReadDir(dir); err == nil {
-		for _, entry := range entries {
-			if entry.IsDir() {
-				continue
-			}
-			path := filepath.Join(dir, entry.Name())
-			if !isPreviewImage(path) {
-				continue
-			}
-			if !previewBelongsToMediaFile(entry.Name(), filePath, requirePrefix) {
-				continue
-			}
-			if priority, ok := previewPriority(entry.Name()); ok {
-				addCandidate(path, priority)
-			}
-		}
-	}
-
 	sort.SliceStable(candidates, func(i, j int) bool {
 		if candidates[i].priority != candidates[j].priority {
 			return candidates[i].priority < candidates[j].priority
@@ -1868,7 +2159,7 @@ func (a *App) getMediaPreviewsByPath(filePath string) []string {
 		leftName := strings.ToLower(filepath.Base(candidates[i].path))
 		rightName := strings.ToLower(filepath.Base(candidates[j].path))
 		if leftName != rightName {
-			return leftName < rightName
+			return service.NaturalLess(leftName, rightName)
 		}
 		return candidates[i].order < candidates[j].order
 	})
@@ -1897,15 +2188,18 @@ func (a *App) getMediaPreviews(media *model.Media) []string {
 	if media == nil {
 		return nil
 	}
-	if a.scanner != nil {
-		if previews := a.scanner.CachedMediaPreviews(media.ID); len(previews) > 0 {
-			return previews
-		}
-	}
 
 	previews := a.getMediaPreviewsByPath(media.FilePath)
-	if len(previews) == 0 || a.scanner == nil {
+	if a.scanner == nil {
 		return previews
+	}
+	// 磁盘上没有剧照目录时，只可能有截帧生成的预览图。
+	if len(previews) == 0 {
+		return a.scanner.GeneratedMediaPreviews(media.ID)
+	}
+	// 缓存要跟当前的来源图片对得上，否则 extrafanart 有增减时会一直显示旧的那批。
+	if cached := a.scanner.CachedMediaPreviewsForSources(media.ID, previews); len(cached) > 0 {
+		return cached
 	}
 	a.cacheMediaPreviewsInBackground(*media, previews)
 	return previews
@@ -1945,6 +2239,7 @@ func (a *App) GetMediaDetailBundle(mediaID string) (*MediaDetailBundle, error) {
 		Detail:   detail,
 		Files:    a.getMediaFilesByPath(detail.FilePath),
 		Previews: a.getMediaPreviews(detail),
+		Trailer:  getMediaTrailerByPath(detail.FilePath),
 	}, nil
 }
 
@@ -2820,18 +3115,62 @@ func previewBelongsToMediaFile(name string, mediaFilePath string, requirePrefix 
 	return strings.HasPrefix(imageStem, mediaStem+"-")
 }
 
-func previewPriority(name string) (int, bool) {
-	lower := strings.ToLower(strings.TrimSuffix(name, filepath.Ext(name)))
-	switch {
-	case strings.Contains(lower, "thumb"):
-		return 2, true
-	case strings.Contains(lower, "fanart") || strings.Contains(lower, "backdrop"):
-		return 3, true
-	case strings.Contains(lower, "poster") || strings.Contains(lower, "cover") || strings.Contains(lower, "folder"):
-		return 4, true
-	default:
-		return 0, false
+var trailerVideoExts = []string{".mp4", ".m4v", ".mov", ".webm", ".mkv"}
+
+func isTrailerVideo(name string) bool {
+	ext := strings.ToLower(filepath.Ext(name))
+	for _, candidate := range trailerVideoExts {
+		if ext == candidate {
+			return true
+		}
 	}
+	return false
+}
+
+// getMediaTrailerByPath 找刮削器下载的预告片。MDCx 有两种落盘方式：同级的
+// <片名>-trailer.mp4，以及 trailers/trailer.mp4（同目录的分集共用一份）。
+func getMediaTrailerByPath(filePath string) string {
+	filePath = strings.TrimSpace(filePath)
+	if filePath == "" {
+		return ""
+	}
+
+	dir := filepath.Dir(filePath)
+	stem := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
+	for _, ext := range trailerVideoExts {
+		candidate := filepath.Join(dir, stem+"-trailer"+ext)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+
+	trailerDir := filepath.Join(dir, "trailers")
+	entries, err := os.ReadDir(trailerDir)
+	if err != nil {
+		return ""
+	}
+	// 带片名的归属明确，优先于目录内共用的那份。
+	var owned, shared []string
+	for _, entry := range entries {
+		if entry.IsDir() || !isTrailerVideo(entry.Name()) {
+			continue
+		}
+		path := filepath.Join(trailerDir, entry.Name())
+		if previewBelongsToMediaFile(entry.Name(), filePath, true) {
+			owned = append(owned, path)
+		} else {
+			shared = append(shared, path)
+		}
+	}
+	sort.Strings(owned)
+	sort.Strings(shared)
+	if len(owned) > 0 {
+		return owned[0]
+	}
+	if len(shared) > 0 {
+		return shared[0]
+	}
+	return ""
 }
 
 func previewGroupKey(path, rootDir string) string {

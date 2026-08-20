@@ -434,7 +434,7 @@ func (t *ThumbnailService) cachedPreviewCount(media *model.Media) int {
 	if t == nil || t.artworkCache == nil || media == nil {
 		return 0
 	}
-	return len(t.artworkCache.CachedMediaPreviews(media.ID))
+	return len(t.artworkCache.GeneratedMediaPreviews(media.ID))
 }
 
 func (t *ThumbnailService) countThumbnailPreviewImages(media *model.Media, sidecars *directorySidecarFiles) int {

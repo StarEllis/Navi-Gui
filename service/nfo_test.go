@@ -34,6 +34,16 @@ const malformedURLNFO = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 </movie>
 `
 
+const numericTagNFO = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<movie>
+  <title>SDNT-008 title</title>
+  <num>SDNT-008</num>
+  <year>2025</year>
+  <dmmid>https://tv.dmm.co.jp/list/?content=1sdnt00008&i3_ref=search&i3_ord=1</dmmid>
+  <7mmtvid>https://7mmtv.sx/zh/reducing-mosaic_content/15046/107SDNT-008.html</7mmtvid>
+</movie>
+`
+
 const nestedSetSeriesNFO = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <movie>
   <title>MIAA-085 title</title>
@@ -88,6 +98,23 @@ func TestParseMovieNFOToleratesBareAmpersandInURL(t *testing.T) {
 	}
 	if media.NfoRawXml == "" {
 		t.Fatal("expected raw NFO XML to be retained")
+	}
+}
+
+func TestParseMovieNFOToleratesNumericTagName(t *testing.T) {
+	service := NewNFOService(zap.NewNop().Sugar())
+	media := &model.Media{FilePath: `C:\videos\SDNT-008-C.mp4`}
+
+	nfoPath := writeTempNFO(t, numericTagNFO)
+	if err := service.ParseMovieNFO(nfoPath, media); err != nil {
+		t.Fatalf("ParseMovieNFO returned error: %v", err)
+	}
+
+	if media.Title != "SDNT-008 title" {
+		t.Fatalf("expected title from NFO, got %q", media.Title)
+	}
+	if media.Year != 2025 {
+		t.Fatalf("expected year 2025, got %d", media.Year)
 	}
 }
 

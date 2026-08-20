@@ -2,7 +2,10 @@ package service
 
 import (
 	"bytes"
+	_ "embed"
 	"encoding/json"
+	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +13,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,49 +25,82 @@ import (
 
 const (
 	gfriendsIndexTTL              = 7 * 24 * time.Hour
+	gfriendsAvatarRetryDelay      = 6 * time.Hour
+	gfriendsDownloadAttempts      = 2
+	gfriendsDownloadBackoff       = 2 * time.Second
 	maxGfriendsIndexDownloadBytes = 32 << 20
 	maxGfriendsAvatarBytes        = 4 << 20
 )
 
 // gfriends uses Japanese stage names while local NFO files commonly contain
-// Chinese translations. Keep this list explicit so similarly named actors are
-// never matched heuristically.
-var gfriendsActorAliases = map[string]string{
-	"七濑爱丽丝": "七瀬アリス",
-	"仓本堇":   "倉本すみれ",
-	"佐佐木明希": "佐々木あき",
-	"凉森玲梦":  "涼森れむ",
-	"坂道美琉":  "坂道みる",
-	"夏希栗":   "夏希まろん",
-	"小花暖":   "小花のん",
-	"明日花绮罗": "明日花キララ",
-	"仲村美羽":  "仲村みう",
-	"枫芙爱":   "楓ふうあ",
-	"桃乃木香奈": "桃乃木かな",
-	"梦乃爱华":  "夢乃あいか",
-	"椎名由奈":  "椎名ゆな",
-	"樱空桃":   "桜空もも",
-	"武藤彩香":  "武藤あやか",
-	"水卜樱":   "水卜さくら",
-	"沙月芽衣":  "さつき芽衣",
-	"筱田优":   "篠田ゆう",
-	"纱仓真菜":  "紗倉まな",
-	"藤浦惠":   "藤浦めぐ",
-	"辻井穗乃果": "辻井ほのか",
-	"香水纯":   "香水じゅん",
-	"白峰美羽":  "白峰ミウ",
-	"黑川纱里奈": "黒川サリナ",
+// Chinese translations, which OpenCC cannot bridge whenever the Japanese name
+// is written in kana. mapping_actor.xml pairs every known spelling of an actor
+// with that Japanese name, so the translation stays data instead of guesswork.
+// Source: https://github.com/sqzw-x/mdcx/blob/master/resources/mapping_table/mapping_actor.xml
+//
+//go:embed data/mapping_actor.xml
+var gfriendsActorMappingXML []byte
+
+// gfriendsActorAliases maps a normalized spelling to the Japanese stage name.
+var gfriendsActorAliases = sync.OnceValue(loadGfriendsActorAliases)
+
+func loadGfriendsActorAliases() map[string]string {
+	var table struct {
+		Actors []struct {
+			Simplified  string `xml:"zh_cn,attr"`
+			Traditional string `xml:"zh_tw,attr"`
+			Japanese    string `xml:"jp,attr"`
+			Keyword     string `xml:"keyword,attr"`
+		} `xml:"a"`
+	}
+	if err := xml.Unmarshal(gfriendsActorMappingXML, &table); err != nil {
+		return nil
+	}
+
+	aliases := make(map[string]string, len(table.Actors)*3)
+	for _, actor := range table.Actors {
+		japanese := strings.TrimSpace(actor.Japanese)
+		if japanese == "" {
+			continue
+		}
+		names := append([]string{actor.Simplified, actor.Traditional}, strings.Split(actor.Keyword, ",")...)
+		for _, name := range names {
+			// 【同名異人】 and similar annotations mark names, they are not names.
+			if strings.Contains(name, "【") {
+				continue
+			}
+			key := normalizeGfriendsName(name)
+			if key == "" {
+				continue
+			}
+			// The first spelling wins so a later entry reusing a retired stage
+			// name cannot steal it from the actor who is listed under it.
+			if _, exists := aliases[key]; !exists {
+				aliases[key] = japanese
+			}
+		}
+	}
+	return aliases
 }
 
+// Both entries serve the same upstream repository; the second one only reaches
+// it through a different exit. GitHub throttles this content hard enough that a
+// single path returns 429 for long stretches, and the two paths fail
+// independently, so the fallback is what turns a run into eventual success.
 var defaultGfriendsIndexURLs = []string{
 	"https://raw.githubusercontent.com/gfriends/gfriends/master/Filetree.json",
-	"https://cdn.jsdelivr.net/gh/xinxin8816/gfriends@master/Filetree.json",
+	"https://ghfast.top/https://raw.githubusercontent.com/gfriends/gfriends/master/Filetree.json",
 }
 
 var defaultGfriendsContentBases = []string{
 	"https://raw.githubusercontent.com/gfriends/gfriends/master/Content/",
-	"https://cdn.jsdelivr.net/gh/xinxin8816/gfriends@master/Content/",
+	"https://ghfast.top/https://raw.githubusercontent.com/gfriends/gfriends/master/Content/",
 }
+
+// errGfriendsSourceUnavailable marks the source refusing or failing to answer —
+// throttling, a gateway error, a timeout — rather than the file being missing.
+// Those are worth retrying; a 404 is not.
+var errGfriendsSourceUnavailable = errors.New("gfriends source unavailable")
 
 type GfriendsAvatarOptions struct {
 	CacheDir     string
@@ -95,6 +132,9 @@ type GfriendsAvatarService struct {
 	index       map[string]AvatarCandidate
 	indexLoaded bool
 	indexStamp  time.Time
+
+	failureMu sync.Mutex
+	failures  map[string]time.Time
 }
 
 func NewGfriendsAvatarService(options GfriendsAvatarOptions) *GfriendsAvatarService {
@@ -112,7 +152,7 @@ func NewGfriendsAvatarService(options GfriendsAvatarOptions) *GfriendsAvatarServ
 	}
 	client := options.Client
 	if client == nil {
-		client = &http.Client{Timeout: 20 * time.Second}
+		client = NewHTTPClient(20 * time.Second)
 	}
 	artworkCache := options.ArtworkCache
 	if artworkCache == nil {
@@ -126,6 +166,7 @@ func NewGfriendsAvatarService(options GfriendsAvatarOptions) *GfriendsAvatarServ
 		contentBases: contentBases,
 		client:       client,
 		index:        make(map[string]AvatarCandidate),
+		failures:     make(map[string]time.Time),
 	}
 }
 
@@ -187,11 +228,116 @@ func (s *GfriendsAvatarService) FindCandidate(actorName string) (*AvatarCandidat
 	return &candidate, true
 }
 
+// gfriendsMaxCandidates 给候选数封顶。图源里个别演员在同一个片商目录下堆了近
+// 千张（按作品拆的），一张张翻过去没有意义，取前若干张够用。
+const gfriendsMaxCandidates = 20
+
+// CandidateKey 是候选在图源里的身份：片商 + 文件名。存进 people.avatar_source，
+// 下次「换一张」据此知道现在停在哪一张。
+func (c AvatarCandidate) CandidateKey() string {
+	return c.Studio + "/" + c.FileName
+}
+
+// ListCandidates 返回这个演员在图源里的全部头像候选。
+//
+// 常驻内存的索引是「一个名字一张图」（同名后来的覆盖先来的），换一张需要看到
+// 全部候选，所以这里按需重读磁盘上的 Filetree.json，不把几十万条候选常驻内存。
+func (s *GfriendsAvatarService) ListCandidates(actorName string) ([]AvatarCandidate, error) {
+	if s == nil || strings.TrimSpace(actorName) == "" {
+		return nil, nil
+	}
+	if err := s.RefreshIndexIfNeeded(); err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(s.indexPath())
+	if err != nil {
+		return nil, err
+	}
+
+	var filetree struct {
+		Content json.RawMessage `json:"Content"`
+	}
+	if err := json.Unmarshal(data, &filetree); err != nil {
+		return nil, err
+	}
+	studios, err := decodeGfriendsStudios(filetree.Content)
+	if err != nil {
+		return nil, err
+	}
+
+	wanted := map[string]bool{normalizeGfriendsName(actorName): true}
+	// 演员名可能是中文写法（樱空桃），图源按日文归档（桜空もも），走别名表补一个。
+	if japanese, ok := gfriendsActorAliases()[normalizeGfriendsName(actorName)]; ok {
+		if key := normalizeGfriendsName(japanese); key != "" {
+			wanted[key] = true
+		}
+	}
+	delete(wanted, "")
+	if len(wanted) == 0 {
+		return nil, nil
+	}
+
+	seen := make(map[string]bool)
+	candidates := make([]AvatarCandidate, 0, 8)
+	for _, entry := range studios {
+		for aliasFileName, targetWithQuery := range entry.files {
+			targetFileName, query := splitGfriendsTarget(targetWithQuery)
+			if targetFileName == "" {
+				targetFileName, query = splitGfriendsTarget(aliasFileName)
+			}
+			candidate := AvatarCandidate{
+				ActorName: actorStem(targetFileName),
+				Studio:    entry.name,
+				FileName:  targetFileName,
+				Query:     query,
+			}
+			matched := false
+			for _, name := range []string{aliasFileName, targetFileName, candidate.ActorName} {
+				if wanted[normalizeGfriendsName(actorStem(name))] ||
+					wanted[normalizeGfriendsName(gfriendsVariantStem(name))] {
+					matched = true
+					break
+				}
+			}
+			if !matched || seen[candidate.CandidateKey()] {
+				continue
+			}
+			seen[candidate.CandidateKey()] = true
+			candidate.URL = s.candidateURL(candidate, 0)
+			candidates = append(candidates, candidate)
+		}
+	}
+
+	// 片商目录名带排序前缀（0-Hand-Storage、8-GRAPHIS…），照它排序结果才稳定，
+	// 不然每次读出来的顺序都跟着 map 遍历乱跳。
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Studio != candidates[j].Studio {
+			return candidates[i].Studio < candidates[j].Studio
+		}
+		return NaturalLess(candidates[i].FileName, candidates[j].FileName)
+	})
+	if len(candidates) > gfriendsMaxCandidates {
+		candidates = candidates[:gfriendsMaxCandidates]
+	}
+	return candidates, nil
+}
+
+// FetchCandidate 下载指定候选的图片数据。
+func (s *GfriendsAvatarService) FetchCandidate(candidate AvatarCandidate) ([]byte, error) {
+	if s == nil {
+		return nil, fmt.Errorf("gfriends avatar service unavailable")
+	}
+	return s.downloadCandidate(candidate)
+}
+
 func (s *GfriendsAvatarService) EnsureActorAvatar(person *model.Person) (bool, error) {
 	if s == nil || person == nil || strings.TrimSpace(person.Name) == "" {
 		return false, nil
 	}
 	if fileExists(person.ProfileURL) {
+		return false, nil
+	}
+	if s.downloadRecentlyFailed(person.Name) {
 		return false, nil
 	}
 	if err := s.RefreshIndexIfNeeded(); err != nil {
@@ -204,6 +350,11 @@ func (s *GfriendsAvatarService) EnsureActorAvatar(person *model.Person) (bool, e
 
 	data, err := s.downloadCandidate(*candidate)
 	if err != nil {
+		// A source that refused says nothing about this actor, so it stays
+		// eligible for the next run instead of sitting out the whole cooldown.
+		if !errors.Is(err, errGfriendsSourceUnavailable) {
+			s.recordDownloadFailure(person.Name)
+		}
 		if s.logger != nil {
 			s.logger.Debugf("download gfriends avatar failed: actor=%s err=%v", person.Name, err)
 		}
@@ -217,7 +368,52 @@ func (s *GfriendsAvatarService) EnsureActorAvatar(person *model.Person) (bool, e
 		return false, nil
 	}
 	person.ProfileURL = cachedPath
+	person.AvatarSource = candidate.CandidateKey()
 	return true, nil
+}
+
+// downloadRecentlyFailed reports whether this actor's avatar was already tried
+// and failed. Without it, an unreachable or rate-limited source is re-attempted
+// for every actor every time the actor page is opened.
+func (s *GfriendsAvatarService) downloadRecentlyFailed(actorName string) bool {
+	key := normalizeGfriendsName(actorName)
+	if key == "" {
+		return false
+	}
+	s.failureMu.Lock()
+	defer s.failureMu.Unlock()
+	failedAt, ok := s.failures[key]
+	if !ok {
+		return false
+	}
+	if time.Since(failedAt) >= gfriendsAvatarRetryDelay {
+		delete(s.failures, key)
+		return false
+	}
+	return true
+}
+
+// ResetDownloadFailures drops the cooldown so an explicit retry starts clean.
+func (s *GfriendsAvatarService) ResetDownloadFailures() {
+	if s == nil {
+		return
+	}
+	s.failureMu.Lock()
+	defer s.failureMu.Unlock()
+	s.failures = make(map[string]time.Time)
+}
+
+func (s *GfriendsAvatarService) recordDownloadFailure(actorName string) {
+	key := normalizeGfriendsName(actorName)
+	if key == "" {
+		return
+	}
+	s.failureMu.Lock()
+	defer s.failureMu.Unlock()
+	if s.failures == nil {
+		s.failures = make(map[string]time.Time)
+	}
+	s.failures[key] = time.Now()
 }
 
 func (s *GfriendsAvatarService) loadIndexFromFile(indexPath string, stamp time.Time) error {
@@ -262,12 +458,15 @@ func (s *GfriendsAvatarService) loadIndex(data []byte, stamp time.Time) error {
 			}
 		}
 	}
-	for alias, canonical := range gfriendsActorAliases {
-		candidate, ok := index[normalizeGfriendsName(canonical)]
-		if !ok {
+	for alias, japanese := range gfriendsActorAliases() {
+		// A spelling gfriends already files an avatar under always wins: the
+		// alias table is only allowed to fill gaps, never to redirect a name.
+		if _, exists := index[alias]; exists {
 			continue
 		}
-		index[normalizeGfriendsName(alias)] = candidate
+		if candidate, ok := index[normalizeGfriendsName(japanese)]; ok {
+			index[alias] = candidate
+		}
 	}
 
 	s.mu.Lock()
@@ -317,6 +516,29 @@ func decodeGfriendsStudios(content json.RawMessage) ([]gfriendsStudioFiles, erro
 
 func (s *GfriendsAvatarService) downloadCandidate(candidate AvatarCandidate) ([]byte, error) {
 	var lastErr error
+	for attempt := 0; attempt < gfriendsDownloadAttempts; attempt++ {
+		if attempt > 0 {
+			// While throttled the sources answer probabilistically, so spacing
+			// the retry is what turns a refusal into an eventual avatar.
+			time.Sleep(time.Duration(attempt) * gfriendsDownloadBackoff)
+		}
+		data, err := s.downloadFromContentBases(candidate)
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+		if !errors.Is(err, errGfriendsSourceUnavailable) {
+			break
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no gfriends content base configured")
+	}
+	return nil, lastErr
+}
+
+func (s *GfriendsAvatarService) downloadFromContentBases(candidate AvatarCandidate) ([]byte, error) {
+	var lastErr error
 	for index := range s.contentBases {
 		candidateURL := s.candidateURL(candidate, index)
 		if strings.TrimSpace(candidateURL) == "" {
@@ -327,9 +549,6 @@ func (s *GfriendsAvatarService) downloadCandidate(candidate AvatarCandidate) ([]
 			return data, nil
 		}
 		lastErr = err
-	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("no gfriends content base configured")
 	}
 	return nil, lastErr
 }
@@ -372,9 +591,12 @@ func (s *GfriendsAvatarService) downloadURLLimited(rawURL string, maxBytes int64
 	req.Header.Set("User-Agent", "alex-desktop-gfriends-cache/1.0")
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errGfriendsSourceUnavailable, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		return nil, fmt.Errorf("%w: HTTP %d", errGfriendsSourceUnavailable, resp.StatusCode)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
@@ -444,6 +666,22 @@ func splitGfriendsTarget(value string) (string, string) {
 		return path.Base(value[:index]), value[index:]
 	}
 	return path.Base(value), ""
+}
+
+// gfriendsVariantStem 去掉 gfriends 给同一演员多张图编的序号（桜空もも-2.jpg）。
+// 只用于列举候选：常驻索引那边的匹配规则不动，免得把已有头像认到别人身上。
+func gfriendsVariantStem(fileName string) string {
+	stem := actorStem(fileName)
+	index := strings.LastIndex(stem, "-")
+	if index <= 0 || index == len(stem)-1 {
+		return stem
+	}
+	for _, r := range stem[index+1:] {
+		if r < '0' || r > '9' {
+			return stem
+		}
+	}
+	return stem[:index]
 }
 
 func actorStem(fileName string) string {

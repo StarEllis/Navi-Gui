@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
+	"navi-desktop/model"
 )
 
 // ScanEvent represents the type of scan progress event.
@@ -63,16 +64,18 @@ type MediaMetadataEventData struct {
 }
 
 type MediaStateEventData struct {
-	MediaID         string     `json:"media_id"`
-	Position        *float64   `json:"position,omitempty"`
-	Duration        *float64   `json:"duration,omitempty"`
-	ProgressPercent *float64   `json:"progress_percent,omitempty"`
-	Completed       *bool      `json:"completed,omitempty"`
-	IsWatched       *bool      `json:"is_watched,omitempty"`
-	IsFavorite      *bool      `json:"is_favorite,omitempty"`
-	LastWatchedAt   *time.Time `json:"last_watched_at,omitempty"`
-	PlaybackState   *string    `json:"playback_state,omitempty"`
-	Revision        uint64     `json:"revision,omitempty"`
+	MediaID         string       `json:"media_id"`
+	Position        *float64     `json:"position,omitempty"`
+	Duration        *float64     `json:"duration,omitempty"`
+	ProgressPercent *float64     `json:"progress_percent,omitempty"`
+	Completed       *bool        `json:"completed,omitempty"`
+	IsWatched       *bool        `json:"is_watched,omitempty"`
+	IsFavorite      *bool        `json:"is_favorite,omitempty"`
+	LastWatchedAt   *time.Time   `json:"last_watched_at,omitempty"`
+	PlaybackState   *string      `json:"playback_state,omitempty"`
+	MyRating        *int         `json:"my_rating,omitempty"`
+	MyTags          *[]model.Tag `json:"my_tags,omitempty"`
+	Revision        uint64       `json:"revision,omitempty"`
 }
 
 // WSHub provides a shim for the original WebSocket hub.

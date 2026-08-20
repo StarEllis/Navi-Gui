@@ -345,6 +345,8 @@ type Media struct {
 	SearchPinyin    string       `json:"-" gorm:"type:text"`
 	SearchInitials  string       `json:"-" gorm:"type:text"`
 	IsFavorite      bool         `json:"is_favorite" gorm:"-"`
+	MyRating        int          `json:"my_rating" gorm:"-"`
+	MyTags          []Tag        `json:"my_tags" gorm:"-"`
 	IsWatched       bool         `json:"is_watched" gorm:"-"`
 	WatchPosition   float64      `json:"position" gorm:"-"`
 	WatchDuration   float64      `json:"watch_duration" gorm:"-"`
@@ -358,7 +360,10 @@ type Person struct {
 	Name       string `json:"name" gorm:"index;type:text;not null"`
 	OrigName   string `json:"orig_name" gorm:"type:text"`
 	ProfileURL string `json:"profile_url" gorm:"type:text"` // 头像路径
-	TMDbID     int    `json:"tmdb_id" gorm:"index"`
+	// AvatarSource 记住当前头像取自图源里的哪一张（"片商/文件名"）。
+	// 「换一张头像」靠它算出现在是第几张、下一张该取哪张。
+	AvatarSource string `json:"avatar_source" gorm:"type:text"`
+	TMDbID       int    `json:"tmdb_id" gorm:"index"`
 	// 时间戳
 	CreatedAt time.Time `json:"created_at"`
 }
@@ -417,6 +422,23 @@ type Favorite struct {
 
 	User  User  `json:"-" gorm:"foreignKey:UserID"`
 	Media Media `json:"media" gorm:"foreignKey:MediaID"`
+}
+
+// MediaRating 我的评分（区别于 media.rating 的刮削评分）
+type MediaRating struct {
+	ID        string    `json:"id" gorm:"primaryKey;type:text"`
+	UserID    string    `json:"user_id" gorm:"index;uniqueIndex:idx_rating_user_media;type:text;not null"`
+	MediaID   string    `json:"media_id" gorm:"index;uniqueIndex:idx_rating_user_media;type:text;not null"`
+	Score     int       `json:"score"` // 1-5，0 视为未评分（不写行）
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at" gorm:"index"` // 「打分时间」排序要用
+}
+
+func (r *MediaRating) BeforeCreate(tx *gorm.DB) error {
+	if r.ID == "" {
+		r.ID = uuid.New().String()
+	}
+	return nil
 }
 
 // TranscodeTask 转码任务
@@ -852,6 +874,8 @@ func AutoMigrate(db *gorm.DB) error {
 		// P2: 标签管理系统
 		&Tag{},
 		&MediaTag{},
+		// 我的评分
+		&MediaRating{},
 		// P2: 分享链接功能
 		&ShareLink{},
 		// P3: 自定义匹配规则

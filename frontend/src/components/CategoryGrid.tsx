@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Camera } from 'lucide-react';
 import { normalizeSearchTerm } from '../utils/mediaSearch';
 import { toLocalAssetUrl } from '../utils/media';
 
@@ -29,7 +30,28 @@ interface CategoryGridProps {
     onSelect: (value: string, label: string) => void;
     onStatsChange?: (stats: CategoryStats) => void;
     fetchFn: (libId: string) => Promise<StatsItem[]>;
+    onPickAvatarFile?: (personID: string, name: string) => void;
+    onPickAvatarURL?: (personID: string, name: string) => void;
+    onCycleAvatar?: (personID: string, name: string) => void;
+    onClearAvatar?: (personID: string, name: string) => void;
 }
+
+type AvatarMenuState = {
+    x: number;
+    y: number;
+    personID: string;
+    name: string;
+    hasImage: boolean;
+} | null;
+
+const AVATAR_MENU_WIDTH = 168;
+const AVATAR_MENU_HEIGHT = 118;
+const AVATAR_MENU_MARGIN = 8;
+
+const clampAvatarMenuPosition = (x: number, y: number) => ({
+    x: Math.max(AVATAR_MENU_MARGIN, Math.min(x, window.innerWidth - AVATAR_MENU_WIDTH - AVATAR_MENU_MARGIN)),
+    y: Math.max(AVATAR_MENU_MARGIN, Math.min(y, window.innerHeight - AVATAR_MENU_HEIGHT - AVATAR_MENU_MARGIN)),
+});
 
 type CountBucket = {
     key: string;
@@ -96,15 +118,73 @@ const CategoryGrid: React.FC<CategoryGridProps> = ({
     onSelect,
     onStatsChange,
     fetchFn,
+    onPickAvatarFile,
+    onPickAvatarURL,
+    onCycleAvatar,
+    onClearAvatar,
 }) => {
     const [items, setItems] = useState<StatsItem[]>([]);
     const [loading, setLoading] = useState(true);
+    const loadedKeyRef = useRef('');
     const [activeBucket, setActiveBucket] = useState('all');
+    const [avatarMenu, setAvatarMenu] = useState<AvatarMenuState>(null);
     const normalizedKeyword = normalizeSearchTerm(keyword);
+    const avatarEditable = type === 'actor' && Boolean(onPickAvatarFile || onPickAvatarURL || onCycleAvatar || onClearAvatar);
+
+    useEffect(() => {
+        if (!avatarMenu) {
+            return;
+        }
+        const close = () => setAvatarMenu(null);
+        const closeOnEscape = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                close();
+            }
+        };
+        document.addEventListener('mousedown', close);
+        document.addEventListener('keydown', closeOnEscape);
+        window.addEventListener('resize', close);
+        return () => {
+            document.removeEventListener('mousedown', close);
+            document.removeEventListener('keydown', closeOnEscape);
+            window.removeEventListener('resize', close);
+        };
+    }, [avatarMenu]);
+
+    // 右键任意演员、或点头像上的角标，都打开同一个菜单。
+    const openAvatarMenu = (event: React.MouseEvent, item: StatsItem) => {
+        if (!avatarEditable) {
+            return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        const position = clampAvatarMenuPosition(event.clientX, event.clientY);
+        setAvatarMenu({
+            ...position,
+            personID: item.filter_value,
+            name: item.name,
+            hasImage: Boolean(typeof item.image === 'string' && item.image.trim()),
+        });
+    };
+
+    const runAvatarAction = (action?: (personID: string, name: string) => void) => {
+        if (!avatarMenu || !action) {
+            return;
+        }
+        const { personID, name } = avatarMenu;
+        setAvatarMenu(null);
+        action(personID, name);
+    };
 
     useEffect(() => {
         let active = true;
-        setLoading(true);
+        // 扫描收尾后元数据补全还要跑几分钟，期间每隔几秒就推一次刷新。
+        // 那种刷新只是重取同一份数据，不能把已经画出来的网格清空成加载态，
+        // 否则整页在「正在加载...」和内容之间反复跳。只有切库/切类型才给加载态。
+        const loadKey = `${libraryId}|${type}`;
+        if (loadedKeyRef.current !== loadKey) {
+            setLoading(true);
+        }
 
         fetchFn(libraryId)
             .then((res) => {
@@ -119,6 +199,7 @@ const CategoryGrid: React.FC<CategoryGridProps> = ({
                     return left.name.localeCompare(right.name, 'zh-CN');
                 });
                 setItems(nextItems);
+                loadedKeyRef.current = loadKey;
                 setLoading(false);
             })
             .catch((error) => {
@@ -217,6 +298,7 @@ const CategoryGrid: React.FC<CategoryGridProps> = ({
                                 type="button"
                                 className="navi-people-top-card"
                                 onClick={() => onSelect(item.filter_value, item.name)}
+                                onContextMenu={(event) => openAvatarMenu(event, item)}
                             >
                                 <PersonAvatar item={item} className="navi-people-top-avatar" />
                                 <div className="navi-people-top-copy">
@@ -254,6 +336,7 @@ const CategoryGrid: React.FC<CategoryGridProps> = ({
                             type="button"
                             className="navi-person-row"
                             onClick={() => onSelect(item.filter_value, item.name)}
+                            onContextMenu={(event) => openAvatarMenu(event, item)}
                         >
                             <PersonAvatar item={item} className="navi-person-row-avatar" />
                             <span className="navi-person-row-name" title={item.name}>{item.name}</span>
@@ -264,19 +347,82 @@ const CategoryGrid: React.FC<CategoryGridProps> = ({
             ) : (
                 <div className="navi-people-grid">
                     {visibleItems.map((item) => (
-                        <button
-                            key={item.filter_value || item.name}
-                            type="button"
-                            className="navi-person"
-                            onClick={() => onSelect(item.filter_value, item.name)}
-                        >
-                            <PersonAvatar item={item} className="navi-person-avatar" />
-                            <div className="navi-person-copy">
-                                <div className="navi-person-name" title={item.name}>{item.name}</div>
-                                <div className="navi-person-count">{item.count}</div>
-                            </div>
-                        </button>
+                        <div className="navi-person-slot" key={item.filter_value || item.name}>
+                            <button
+                                type="button"
+                                className="navi-person"
+                                onClick={() => onSelect(item.filter_value, item.name)}
+                                onContextMenu={(event) => openAvatarMenu(event, item)}
+                            >
+                                <PersonAvatar item={item} className="navi-person-avatar" />
+                                <div className="navi-person-copy">
+                                    <div className="navi-person-name" title={item.name}>{item.name}</div>
+                                    <div className="navi-person-count">{item.count}</div>
+                                </div>
+                            </button>
+
+                            {avatarEditable && (
+                                // 只覆盖头像那个正方形，其余区域点击穿透给卡片。
+                                <div className="navi-person-avatar-anchor">
+                                    <button
+                                        type="button"
+                                        className="navi-person-avatar-edit"
+                                        title="设置头像"
+                                        aria-label={`设置 ${item.name} 的头像`}
+                                        onClick={(event) => openAvatarMenu(event, item)}
+                                    >
+                                        <Camera size={13} />
+                                    </button>
+                                </div>
+                            )}
+                        </div>
                     ))}
+                </div>
+            )}
+
+            {avatarMenu && (
+                <div
+                    className="navi-avatar-menu"
+                    style={{ left: avatarMenu.x, top: avatarMenu.y }}
+                    role="menu"
+                    aria-label={`${avatarMenu.name} 的头像`}
+                    onMouseDown={(event) => event.stopPropagation()}
+                    onContextMenu={(event) => event.preventDefault()}
+                >
+                    <div className="navi-avatar-menu-title" title={avatarMenu.name}>{avatarMenu.name}</div>
+                    <button
+                        type="button"
+                        className="navi-avatar-menu-item"
+                        role="menuitem"
+                        onClick={() => runAvatarAction(onCycleAvatar)}
+                    >
+                        换一张头像
+                    </button>
+                    <button
+                        type="button"
+                        className="navi-avatar-menu-item"
+                        role="menuitem"
+                        onClick={() => runAvatarAction(onPickAvatarFile)}
+                    >
+                        设置头像…
+                    </button>
+                    <button
+                        type="button"
+                        className="navi-avatar-menu-item"
+                        role="menuitem"
+                        onClick={() => runAvatarAction(onPickAvatarURL)}
+                    >
+                        从图片链接设置…
+                    </button>
+                    <button
+                        type="button"
+                        className="navi-avatar-menu-item"
+                        role="menuitem"
+                        disabled={!avatarMenu.hasImage}
+                        onClick={() => runAvatarAction(onClearAvatar)}
+                    >
+                        移除头像
+                    </button>
                 </div>
             )}
 

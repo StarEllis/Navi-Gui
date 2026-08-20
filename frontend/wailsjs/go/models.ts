@@ -38,6 +38,36 @@ export namespace gorm {
 
 export namespace main {
 	
+	export class ActorAvatarBackfillResult {
+	    filled: number;
+	    pending: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new ActorAvatarBackfillResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.filled = source["filled"];
+	        this.pending = source["pending"];
+	    }
+	}
+	export class ActorAvatarCycleResult {
+	    profile_url: string;
+	    index: number;
+	    total: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new ActorAvatarCycleResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.profile_url = source["profile_url"];
+	        this.index = source["index"];
+	        this.total = source["total"];
+	    }
+	}
 	export class DeleteLibraryResult {
 	    deleted: boolean;
 	    warning?: string;
@@ -138,10 +168,27 @@ export namespace main {
 	        this.emby_api_key = source["emby_api_key"];
 	    }
 	}
+	export class FilterFacets {
+	    tags: Record<string, number>;
+	    ratings: Record<string, number>;
+	    total: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new FilterFacets(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.tags = source["tags"];
+	        this.ratings = source["ratings"];
+	        this.total = source["total"];
+	    }
+	}
 	export class MediaDetailBundle {
 	    detail?: model.Media;
 	    files: string[];
 	    previews: string[];
+	    trailer: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new MediaDetailBundle(source);
@@ -152,6 +199,7 @@ export namespace main {
 	        this.detail = this.convertValues(source["detail"], model.Media);
 	        this.files = source["files"];
 	        this.previews = source["previews"];
+	        this.trailer = source["trailer"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -240,6 +288,38 @@ export namespace main {
 	        this.filter_value = source["filter_value"];
 	    }
 	}
+	export class TagWithCount {
+	    id: string;
+	    name: string;
+	    category: string;
+	    count: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new TagWithCount(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.category = source["category"];
+	        this.count = source["count"];
+	    }
+	}
+	export class UserFilter {
+	    scores: number[];
+	    tag_groups: string[][];
+	
+	    static createFrom(source: any = {}) {
+	        return new UserFilter(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.scores = source["scores"];
+	        this.tag_groups = source["tag_groups"];
+	    }
+	}
 
 }
 
@@ -296,6 +376,56 @@ export namespace model {
 	        this.auto_download_sub = source["auto_download_sub"];
 	        this.metadata_mode = source["metadata_mode"];
 	        this.enable_file_watch = source["enable_file_watch"];
+	        this.created_at = this.convertValues(source["created_at"], null);
+	        this.updated_at = this.convertValues(source["updated_at"], null);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class Tag {
+	    id: string;
+	    name: string;
+	    color: string;
+	    icon: string;
+	    category: string;
+	    sort_order: number;
+	    usage_count: number;
+	    created_by: string;
+	    // Go type: time
+	    created_at: any;
+	    // Go type: time
+	    updated_at: any;
+	
+	    static createFrom(source: any = {}) {
+	        return new Tag(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.color = source["color"];
+	        this.icon = source["icon"];
+	        this.category = source["category"];
+	        this.sort_order = source["sort_order"];
+	        this.usage_count = source["usage_count"];
+	        this.created_by = source["created_by"];
 	        this.created_at = this.convertValues(source["created_at"], null);
 	        this.updated_at = this.convertValues(source["updated_at"], null);
 	    }
@@ -483,6 +613,8 @@ export namespace model {
 	    actors?: MediaActor[];
 	    search_text: string;
 	    is_favorite: boolean;
+	    my_rating: number;
+	    my_tags: Tag[];
 	    is_watched: boolean;
 	    position: number;
 	    watch_duration: number;
@@ -563,6 +695,8 @@ export namespace model {
 	        this.actors = this.convertValues(source["actors"], MediaActor);
 	        this.search_text = source["search_text"];
 	        this.is_favorite = source["is_favorite"];
+	        this.my_rating = source["my_rating"];
+	        this.my_tags = this.convertValues(source["my_tags"], Tag);
 	        this.is_watched = source["is_watched"];
 	        this.position = source["position"];
 	        this.watch_duration = source["watch_duration"];
@@ -589,6 +723,7 @@ export namespace model {
 		}
 	}
 	
+	
 
 }
 
@@ -609,6 +744,7 @@ export namespace repository {
 	    AIAnalysisTasks: number;
 	    CoverCandidates: number;
 	    MediaTags: number;
+	    MediaRatings: number;
 	    MediaShares: number;
 	    MediaLikes: number;
 	    Recommendations: number;
@@ -635,6 +771,7 @@ export namespace repository {
 	        this.AIAnalysisTasks = source["AIAnalysisTasks"];
 	        this.CoverCandidates = source["CoverCandidates"];
 	        this.MediaTags = source["MediaTags"];
+	        this.MediaRatings = source["MediaRatings"];
 	        this.MediaShares = source["MediaShares"];
 	        this.MediaLikes = source["MediaLikes"];
 	        this.Recommendations = source["Recommendations"];

@@ -7,6 +7,8 @@ export type MediaStateUpdate = {
     completed?: boolean;
     is_watched?: boolean;
     is_favorite?: boolean;
+    my_rating?: number;
+    my_tags?: Array<Record<string, any>>;
     last_watched_at?: string;
     playback_state?: string;
     revision?: number;
@@ -20,6 +22,8 @@ const MEDIA_STATE_FIELDS: Array<keyof Omit<MediaStateUpdate, 'id'>> = [
     'completed',
     'is_watched',
     'is_favorite',
+    'my_rating',
+    'my_tags',
     'last_watched_at',
     'playback_state',
     'revision',
@@ -74,6 +78,13 @@ export const normalizeMediaStateEvent = (data: any): MediaStateUpdate | null => 
     }
     if (typeof data?.is_favorite === 'boolean') {
         update.is_favorite = data.is_favorite;
+    }
+    const myRating = finiteNumber(data?.my_rating);
+    if (myRating !== null) {
+        update.my_rating = Math.max(0, Math.trunc(myRating));
+    }
+    if (Array.isArray(data?.my_tags)) {
+        update.my_tags = data.my_tags;
     }
     if (lastWatchedAt) {
         update.last_watched_at = lastWatchedAt;
@@ -132,6 +143,8 @@ export const shouldInvalidateMediaPagination = (
         (sortField === 'favorite_at' && (changed.has('is_favorite') || changed.has('favorite_at')))
         || (sortField === 'last_watched' && changed.has('last_watched_at'))
         || (sortField === 'rating' && changed.has('rating'))
+        || (sortField === 'my_rating' && changed.has('my_rating'))
+        || (sortField === 'rated_at' && changed.has('my_rating'))
     );
     return membershipChanged || sortKeyChanged;
 };

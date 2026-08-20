@@ -1,6 +1,7 @@
 import React from 'react';
 import RecommendationCard from './RecommendationCard';
 import type { AppMedia, RecommendationItem } from '../types/wails';
+import type { StatusKind } from '../types/status';
 
 interface RecommendationRailProps {
     title: string;
@@ -8,7 +9,7 @@ interface RecommendationRailProps {
     items: RecommendationItem[];
     loading?: boolean;
     onSelectMedia: (media: AppMedia) => void;
-    onStatus?: (message: string) => void;
+    onStatus?: (message: string, kind?: StatusKind) => void;
 }
 
 const RecommendationRail: React.FC<RecommendationRailProps> = ({

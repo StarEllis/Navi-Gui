@@ -627,6 +627,32 @@ func (d *nfoXMLDocument) planList(names []string, values []string, render func(s
 	return nil
 }
 
+// planMirroredLists 分别改写 <genre> 和 <tag> 两组。刮削器普遍把同一批分类
+// 同时写进这两组，合在一起当成单个列表处理的话，每个值都会被判成重复；
+// 就算跳过判重，改写时也会把其中一组整体抹掉。
+func (d *nfoXMLDocument) planMirroredLists(names []string, values []string, patches *[]nfoXMLPatch, inserts *[][]byte) error {
+	present := make([]string, 0, len(names))
+	for _, name := range names {
+		if len(d.directElements(name)) > 0 {
+			present = append(present, name)
+		}
+	}
+	// 原本一组都没有时只补第一种，不要凭空造出另一组。
+	if len(present) == 0 {
+		present = names[:1]
+	}
+	for _, name := range present {
+		element := name
+		render := func(value string) []byte {
+			return renderNFOElement(element, value)
+		}
+		if err := d.planList([]string{element}, values, render, patches, inserts); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (d *nfoXMLDocument) planActors(values []string, patches *[]nfoXMLPatch, inserts *[][]byte) error {
 	containers := d.directElements("actors")
 	if len(containers) > 1 {
@@ -895,9 +921,7 @@ func buildEditedNFO(original []byte, data *NFOEditorData) ([]byte, error) {
 		case "maker":
 			err = document.planScalar("maker", strings.TrimSpace(data.Maker), &patches, &inserts)
 		case "genres":
-			err = document.planList([]string{"genre", "tag"}, splitEditorValues(data.Genres), func(value string) []byte {
-				return renderNFOElement("genre", value)
-			}, &patches, &inserts)
+			err = document.planMirroredLists([]string{"genre", "tag"}, splitEditorValues(data.Genres), &patches, &inserts)
 		case "actors":
 			actors := splitEditorValues(data.Actors)
 			err = document.planActors(actors, &patches, &inserts)

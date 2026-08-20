@@ -846,6 +846,19 @@ func TestArtworkCacheCachesPreviewsAndCanRemoveOnlyMediaArtwork(t *testing.T) {
 		t.Fatalf("preview too large: %dx%d", size.X, size.Y)
 	}
 
+	if cached := cache.CachedMediaPreviewsForSources(media.ID, []string{previewSource}); len(cached) != 1 {
+		t.Fatalf("expected the cached copy to be reused for the same source, got %v", cached)
+	}
+	otherSource := filepath.Join(t.TempDir(), "extrafanart", "ABC-123-preview-02.jpg")
+	writeTestJPEG(t, otherSource, 1920, 1080)
+	if cached := cache.CachedMediaPreviewsForSources(media.ID, []string{previewSource, otherSource}); cached != nil {
+		t.Fatalf("expected a new source to invalidate the cached set, got %v", cached)
+	}
+	// sidecar 缓存出来的副本不算"已经生成过预览图"。
+	if generated := cache.GeneratedMediaPreviews(media.ID); len(generated) != 0 {
+		t.Fatalf("expected no generated previews, got %v", generated)
+	}
+
 	if err := cache.RemoveMedia(media.ID); err != nil {
 		t.Fatalf("remove media cache: %v", err)
 	}

@@ -1,6 +1,8 @@
 import React, { useMemo } from 'react';
-import { FolderOpen, Heart, Play } from 'lucide-react';
-import { OpenMediaFolder, PlayMedia, ToggleFavorite } from "../../wailsjs/go/main/App";
+import { Check, FolderOpen, Heart, Play, Star, Tag } from 'lucide-react';
+import { OpenMediaFolder, PlayMedia, SetMyRating, ToggleFavorite } from "../../wailsjs/go/main/App";
+import StarRating from './StarRating';
+import { categoryColor, UNCATEGORIZED_DOT } from '../utils/userTags';
 import { formatMediaMeta, toLocalAssetUrl } from '../utils/media';
 import { areMediaCardMediaPropsEqual, shouldOpenMediaFromCardKey } from '../utils/mediaCardState';
 import { markComponentRender } from '../utils/performanceDiagnostics';
@@ -14,6 +16,12 @@ interface MediaCardProps {
     onPrefetchMedia?: (media: any) => void;
     onFocusMedia?: (mediaId: string) => void;
     onMediaChange?: (media: any) => void;
+    categoryColors?: Map<string, string>;
+    selected?: boolean;
+    selectionActive?: boolean;
+    onToggleSelect?: (mediaId: string) => void;
+    onOpenTagPicker?: (media: any, anchor: HTMLElement) => void;
+    tagging?: boolean;
 }
 
 // 与 service/player/manager.go 的续播阈值一致：进度过了这条线就当看完了。
@@ -36,6 +44,12 @@ const MediaCard: React.FC<MediaCardProps> = ({
     onPrefetchMedia,
     onFocusMedia,
     onMediaChange,
+    categoryColors,
+    selected = false,
+    selectionActive = false,
+    onToggleSelect,
+    onOpenTagPicker,
+    tagging = false,
 }) => {
     markComponentRender('MediaCard');
     const coverUrl = useMemo(() => (
@@ -61,6 +75,14 @@ const MediaCard: React.FC<MediaCardProps> = ({
         && position > 0;
     const remainingSeconds = hasResumePoint && duration > position ? duration - position : 0;
     const isWatched = media.is_watched === true && !hasResumePoint;
+
+    const myRating = Number.isFinite(Number(media.my_rating)) ? Math.max(0, Number(media.my_rating)) : 0;
+    const myTags: any[] = Array.isArray(media.my_tags) ? media.my_tags : [];
+    // 静止态角标：没评分也没标签的卡，海报保持完全干净
+    const showStaticBadge = myRating > 0 || myTags.length > 0;
+    const badgeDotColor = myTags.length > 0 && categoryColors
+        ? categoryColor(categoryColors, typeof myTags[0]?.category === 'string' ? myTags[0].category : '')
+        : UNCATEGORIZED_DOT;
 
     const resolution = typeof media.resolution === 'string' ? media.resolution.trim() : '';
     const metaLine = remainingSeconds > 0
@@ -105,15 +127,38 @@ const MediaCard: React.FC<MediaCardProps> = ({
         }
     };
 
+    const handleRate = async (score: number) => {
+        try {
+            await SetMyRating(media.id, score);
+            onMediaChange?.({ ...media, my_rating: myRating === score ? 0 : score });
+        } catch (error) {
+            console.error(error);
+            onQuickPlayStatus?.(`打分失败：${formatError(error)}`, 'error');
+        }
+    };
+
     const openMedia = () => onSelectMedia(media);
 
     return (
         <div
-            className={`navi-card ${isWatched ? 'watched' : ''}`.trim()}
+            className={`navi-card ${isWatched ? 'watched' : ''} ${selected ? 'selected' : ''} ${tagging ? 'tagging' : ''}`.trim()}
             role="button"
             tabIndex={0}
             aria-label={`打开 ${title} 详情`}
-            onClick={openMedia}
+            onClick={(event) => {
+                // 只认 Ctrl：Shift 在列表里通常是「连选一段」，这里没有区间选择，
+                // 留着它只会让人以为能拉一片
+                if (event.ctrlKey) {
+                    event.preventDefault();
+                    onToggleSelect?.(media.id);
+                    return;
+                }
+                if (selectionActive) {
+                    onToggleSelect?.(media.id);
+                    return;
+                }
+                openMedia();
+            }}
             onKeyDown={(event) => {
                 if (shouldOpenMediaFromCardKey(event.key, event.target === event.currentTarget)) {
                     event.preventDefault();
@@ -177,7 +222,56 @@ const MediaCard: React.FC<MediaCardProps> = ({
                     {hasResumePoint && (
                         <div className="navi-card-resume">从 {formatPlaybackTime(position)} 继续</div>
                     )}
+
+                    {/* 星级在左下、标签键在右下：都在进度条和收边渐变之上，互不遮挡 */}
+                    <div
+                        className="navi-card-stars"
+                        title={`我的评分 · Ctrl 点选可多选后批量打分`}
+                        onClick={(event) => event.stopPropagation()}
+                    >
+                        <StarRating
+                            value={myRating}
+                            size={13}
+                            emptyColor="rgba(255,255,255,.3)"
+                            onChange={(score) => void handleRate(score)}
+                        />
+                    </div>
+                    <button
+                        type="button"
+                        className="navi-card-tag-btn"
+                        title={`给《${title}》打标签 · Ctrl 点选可多选后批量打`}
+                        aria-label={`给 ${title} 打标签`}
+                        onClick={(event) => {
+                            event.stopPropagation();
+                            onOpenTagPicker?.(media, event.currentTarget);
+                        }}
+                    >
+                        <Tag size={12} />
+                    </button>
                 </div>
+
+                {showStaticBadge && (
+                    <div className="navi-card-badge">
+                        {myRating > 0 && (
+                            <>
+                                <Star size={11} color="#e0a05a" fill="#e0a05a" />
+                                <span className="navi-card-badge-score">{myRating}</span>
+                            </>
+                        )}
+                        {myTags.length > 0 && (
+                            <>
+                                <span className="navi-tag-dot" style={{ background: badgeDotColor }} />
+                                <span className="navi-card-badge-tags">{myTags.length}</span>
+                            </>
+                        )}
+                    </div>
+                )}
+
+                {selected && (
+                    <span className="navi-card-check" aria-hidden="true">
+                        <Check size={12} />
+                    </span>
+                )}
 
                 {/* 收边渐变只为进度条垫底：没看过的卡片海报保持完全干净 */}
                 {hasProgressBar && (
@@ -210,4 +304,10 @@ export default React.memo(MediaCard, (prev, next) => (
     && prev.onPrefetchMedia === next.onPrefetchMedia
     && prev.onFocusMedia === next.onFocusMedia
     && prev.onMediaChange === next.onMediaChange
+    && prev.categoryColors === next.categoryColors
+    && prev.selected === next.selected
+    && prev.selectionActive === next.selectionActive
+    && prev.onToggleSelect === next.onToggleSelect
+    && prev.onOpenTagPicker === next.onOpenTagPicker
+    && prev.tagging === next.tagging
 ));

@@ -104,6 +104,98 @@ func TestGfriendsAvatarServiceNetworkFailureDoesNotBlockWhenNoIndexExists(t *tes
 	}
 }
 
+// newCountingAvatarService serves an index with one actor and answers every
+// avatar request with status, counting the attempts.
+func newCountingAvatarService(t *testing.T, status int) (*GfriendsAvatarService, *int32) {
+	t.Helper()
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/Filetree.json" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"Content":{"StudioA":{"有馬美玖.jpg":"有馬美玖.jpg"}}}`)
+			return
+		}
+		atomic.AddInt32(&attempts, 1)
+		http.Error(w, http.StatusText(status), status)
+	}))
+	t.Cleanup(server.Close)
+
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	return NewGfriendsAvatarService(GfriendsAvatarOptions{
+		CacheDir:     cacheDir,
+		ArtworkCache: NewArtworkCache(cacheDir, nil),
+		IndexURLs:    []string{server.URL + "/Filetree.json"},
+		ContentBases: []string{server.URL + "/Content/"},
+	}), &attempts
+}
+
+func ensureAvatarTimes(t *testing.T, service *GfriendsAvatarService, times int) {
+	t.Helper()
+	for attempt := 0; attempt < times; attempt++ {
+		changed, err := service.EnsureActorAvatar(&model.Person{ID: "person-1", Name: "有马美玖"})
+		if err != nil || changed {
+			t.Fatalf("attempt %d: changed=%v err=%v", attempt, changed, err)
+		}
+	}
+}
+
+func TestGfriendsAvatarServiceDoesNotRetryMissingAvatarDuringCooldown(t *testing.T) {
+	service, attempts := newCountingAvatarService(t, http.StatusNotFound)
+	ensureAvatarTimes(t, service, 3)
+	if got := atomic.LoadInt32(attempts); got != 1 {
+		t.Fatalf("expected one download attempt, got %d", got)
+	}
+}
+
+func TestGfriendsAvatarServiceRetriesAfterRateLimit(t *testing.T) {
+	service, attempts := newCountingAvatarService(t, http.StatusTooManyRequests)
+	ensureAvatarTimes(t, service, 2)
+	// Rate limiting is about the source, not the actor: parking the actor for
+	// the cooldown would outlast the limit by hours. Each call retries, so both
+	// calls spend the full attempt budget.
+	if got := atomic.LoadInt32(attempts); got != 2*gfriendsDownloadAttempts {
+		t.Fatalf("expected %d attempts, got %d", 2*gfriendsDownloadAttempts, got)
+	}
+}
+
+func TestGfriendsAvatarServiceRecoversWhenRetrySucceeds(t *testing.T) {
+	var attempts int32
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/Filetree.json" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"Content":{"StudioA":{"有馬美玖.jpg":"有馬美玖.jpg"}}}`)
+			return
+		}
+		// The source refuses once, then answers — the shape of a throttled run.
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "image/jpeg")
+		sourcePath := filepath.Join(cacheDir, "source.jpg")
+		writeTestJPEG(t, sourcePath, 800, 1200)
+		http.ServeFile(w, r, sourcePath)
+	}))
+	defer server.Close()
+
+	service := NewGfriendsAvatarService(GfriendsAvatarOptions{
+		CacheDir:     cacheDir,
+		ArtworkCache: NewArtworkCache(cacheDir, nil),
+		IndexURLs:    []string{server.URL + "/Filetree.json"},
+		ContentBases: []string{server.URL + "/Content/"},
+	})
+
+	person := &model.Person{ID: "person-1", Name: "有马美玖"}
+	changed, err := service.EnsureActorAvatar(person)
+	if err != nil || !changed {
+		t.Fatalf("expected the retry to fetch the avatar: changed=%v err=%v", changed, err)
+	}
+	if person.ProfileURL == "" {
+		t.Fatal("expected a cached profile URL")
+	}
+}
+
 func TestGfriendsAvatarServiceRefreshIndexOnlyDownloadsOnceConcurrently(t *testing.T) {
 	var hits int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -175,6 +267,61 @@ func TestGfriendsAvatarServiceMatchesChineseAndJapaneseNameVariants(t *testing.T
 		if candidate.FileName != expectedFile {
 			t.Fatalf("candidate for %q = %q, want %q", name, candidate.FileName, expectedFile)
 		}
+	}
+}
+
+func TestGfriendsAvatarServiceMatchesChineseNamesOfKanaStageNames(t *testing.T) {
+	service := NewGfriendsAvatarService(GfriendsAvatarOptions{})
+	if err := service.loadIndex([]byte(`{
+		"Content": {
+			"StudioA": {
+				"天海つばさ.jpg": "天海つばさ.jpg",
+				"深田えいみ.jpg": "深田えいみ.jpg",
+				"鈴村あいり.jpg": "鈴村あいり.jpg",
+				"野々浦暖.jpg": "野々浦暖.jpg"
+			}
+		}
+	}`), time.Now()); err != nil {
+		t.Fatalf("load index: %v", err)
+	}
+
+	tests := map[string]string{
+		"天海翼":  "天海つばさ.jpg",
+		"深田咏美": "深田えいみ.jpg",
+		"铃村爱里": "鈴村あいり.jpg",
+		"野野浦暖": "野々浦暖.jpg",
+	}
+	for name, expectedFile := range tests {
+		candidate, ok := service.FindCandidate(name)
+		if !ok {
+			t.Fatalf("expected %q to match", name)
+		}
+		if candidate.FileName != expectedFile {
+			t.Fatalf("candidate for %q = %q, want %q", name, candidate.FileName, expectedFile)
+		}
+	}
+}
+
+func TestGfriendsAvatarServiceAliasesNeverShadowIndexedNames(t *testing.T) {
+	service := NewGfriendsAvatarService(GfriendsAvatarOptions{})
+	// 田中瞳 is both an indexed gfriends name and an alias of Hitomi.
+	if err := service.loadIndex([]byte(`{
+		"Content": {
+			"StudioA": {
+				"田中瞳.jpg": "田中瞳.jpg",
+				"Hitomi.jpg": "Hitomi.jpg"
+			}
+		}
+	}`), time.Now()); err != nil {
+		t.Fatalf("load index: %v", err)
+	}
+
+	candidate, ok := service.FindCandidate("田中瞳")
+	if !ok {
+		t.Fatal("expected 田中瞳 to match")
+	}
+	if candidate.FileName != "田中瞳.jpg" {
+		t.Fatalf("candidate for 田中瞳 = %q, want the indexed 田中瞳.jpg", candidate.FileName)
 	}
 }
 

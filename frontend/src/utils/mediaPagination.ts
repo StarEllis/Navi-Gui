@@ -14,6 +14,7 @@ export type MediaPageQuery = {
     watched: boolean | null;
     filterType: string;
     filterValue: string;
+    userFilter: string;
 };
 
 export type MediaPageResult = {
@@ -46,6 +47,7 @@ export const getMediaPageRequestKey = (query: MediaPageQuery) => JSON.stringify(
     query.watched,
     query.filterType,
     query.filterValue,
+    query.userFilter,
 ]);
 
 export const requestMediaPage = (query: MediaPageQuery, loader: PageLoader, requestScope = ''): Promise<MediaPageResult> => {

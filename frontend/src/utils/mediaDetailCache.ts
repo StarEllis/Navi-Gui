@@ -6,6 +6,7 @@ export type MediaDetailCacheEntry = {
     detail: AppMedia;
     files: string[];
     previews: string[];
+    trailer: string;
     updatedAt: number;
 };
 
@@ -15,6 +16,7 @@ type MediaDetailBundle = {
     detail?: AppMedia;
     files?: string[];
     previews?: string[];
+    trailer?: string;
 };
 
 const mediaDetailCache = new Map<string, MediaDetailCacheEntry>();
@@ -40,6 +42,12 @@ const setMediaDetailCacheEntry = (mediaID: string, entry: MediaDetailCacheEntry)
     trimMediaDetailCache();
 };
 
+// 「空值不覆盖非空」这条护栏是给刮削字段用的：卡片对象比详情稀疏，
+// 不能让它把 overview 之类的清掉。但用户自己的评分和标签相反——
+// 0 星和 0 个标签是用户明确表达的状态，必须能覆盖掉旧值，
+// 否则「再点同一颗星清空」「摘掉最后一个标签」永远同步不出去。
+const CLEARABLE_USER_FIELDS = new Set(['my_rating', 'my_tags']);
+
 const mergeMediaDetail = (currentDetail: AppMedia | null | undefined, nextDetail: AppMedia) => {
     if (!currentDetail) {
         return nextDetail;
@@ -52,14 +60,16 @@ const mergeMediaDetail = (currentDetail: AppMedia | null | undefined, nextDetail
         }
 
         const currentValue = (mergedDetail as Record<string, unknown>)[key];
-        if (typeof value === 'string' && value.trim() === '' && typeof currentValue === 'string' && currentValue.trim() !== '') {
-            return;
-        }
-        if (typeof value === 'number' && value === 0 && typeof currentValue === 'number' && currentValue !== 0) {
-            return;
-        }
-        if (Array.isArray(value) && value.length === 0 && Array.isArray(currentValue) && currentValue.length > 0) {
-            return;
+        if (!CLEARABLE_USER_FIELDS.has(key)) {
+            if (typeof value === 'string' && value.trim() === '' && typeof currentValue === 'string' && currentValue.trim() !== '') {
+                return;
+            }
+            if (typeof value === 'number' && value === 0 && typeof currentValue === 'number' && currentValue !== 0) {
+                return;
+            }
+            if (Array.isArray(value) && value.length === 0 && Array.isArray(currentValue) && currentValue.length > 0) {
+                return;
+            }
         }
 
         (mergedDetail as Record<string, unknown>)[key] = value;
@@ -124,6 +134,7 @@ export const seedMediaDetailCache = (media: AppMedia) => {
         detail: mergeMediaDetail(existingEntry?.detail, media),
         files: existingEntry?.files.length ? existingEntry.files : seededFiles,
         previews: existingEntry?.previews || [],
+        trailer: existingEntry?.trailer || '',
         updatedAt: existingEntry?.updatedAt || Date.now(),
     });
 };
@@ -139,6 +150,7 @@ export const mergeMediaDetailCacheEntry = (media: AppMedia) => {
         detail: mergeMediaDetail(existingEntry?.detail, media),
         files: existingEntry?.files || [],
         previews: existingEntry?.previews || [],
+        trailer: existingEntry?.trailer || '',
         updatedAt: Date.now(),
     });
 };
@@ -159,6 +171,7 @@ export const mergeMediaStateCacheEntry = (update: MediaStateUpdate) => {
         detail: nextDetail,
         files: existingEntry?.files || [],
         previews: existingEntry?.previews || [],
+        trailer: existingEntry?.trailer || '',
         updatedAt: Date.now(),
     });
 };
@@ -194,6 +207,7 @@ export const fetchMediaDetailCacheEntry = async (mediaID: string): Promise<Media
                 detail: mergeFetchedMediaDetail(existingEntry?.detail, bundle.detail),
                 files: Array.isArray(bundle?.files) ? bundle.files : [],
                 previews: Array.isArray(bundle?.previews) ? bundle.previews : [],
+                trailer: typeof bundle?.trailer === 'string' ? bundle.trailer : '',
                 updatedAt: Date.now(),
             };
             setMediaDetailCacheEntry(normalizedMediaID, nextEntry);

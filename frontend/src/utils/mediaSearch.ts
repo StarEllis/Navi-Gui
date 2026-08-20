@@ -21,6 +21,8 @@ const cjkVariantMap: Record<string, string> = {
 const cjkVariantPattern = new RegExp(`[${Object.keys(cjkVariantMap).join('')}]`, 'g');
 const cjkCharacterPattern = /[\u3005\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff]/;
 const asciiAlphaNumericPattern = /[a-z0-9]/i;
+const searchTokenCharacterPattern = /[0-9A-Za-z_.-]/;
+const searchTokenPattern = /^[0-9A-Za-z_.-]+$/;
 
 export type ParsedMediaSearchQuery = {
     normalized: string;
@@ -54,6 +56,24 @@ export const shouldReplaceActorFilterOnSearchChange = (
 ) => filterType === 'actor' && nextValue !== currentValue;
 
 export const hasCJKSearchCharacter = (value: string) => cjkCharacterPattern.test(value);
+
+// 番号里的连字符会被浏览器当成分词符，双击只能选中一半，这里把选区补成完整的一段。
+export const expandSearchTokenRange = (value: string, start: number, end: number) => {
+    if (start >= end || !searchTokenPattern.test(value.slice(start, end))) {
+        return { start, end };
+    }
+
+    let tokenStart = start;
+    let tokenEnd = end;
+    while (tokenStart > 0 && searchTokenCharacterPattern.test(value[tokenStart - 1])) {
+        tokenStart -= 1;
+    }
+    while (tokenEnd < value.length && searchTokenCharacterPattern.test(value[tokenEnd])) {
+        tokenEnd += 1;
+    }
+
+    return { start: tokenStart, end: tokenEnd };
+};
 
 const uniqueInOrder = (values: string[]) => {
     const seen = new Set<string>();

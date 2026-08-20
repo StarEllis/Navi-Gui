@@ -33,6 +33,9 @@ const (
 	artworkWideMaxHeight   = 720
 	artworkActorMaxWidth   = 240
 	artworkActorMaxHeight  = 240
+
+	// 截帧生成的缓存文件用它区分于 sidecar 图片缓存出来的副本。
+	artworkGeneratedPrefix = "generated-"
 )
 
 type ArtworkCache struct {
@@ -196,7 +199,7 @@ func (c *ArtworkCache) CacheMediaPreviews(media *model.Media, sourcePaths []stri
 		if source == "" {
 			continue
 		}
-		key := fmt.Sprintf("%03d-%s", index+1, c.sourceKey(source))
+		key := previewCacheKey(index, c.sourceKey(source))
 		cached, err := c.cacheImageFileWithKey("preview", media.ID, key, source, artworkWideMaxWidth, artworkWideMaxHeight)
 		if err != nil {
 			return paths, err
@@ -271,6 +274,16 @@ func (c *ArtworkCache) CacheActorImage(personID, actorName string, sourcePathOrB
 }
 
 func (c *ArtworkCache) CachedMediaPreviews(mediaID string) []string {
+	return c.cachedMediaPreviews(mediaID, false)
+}
+
+// GeneratedMediaPreviews 只返回截帧生成的预览图。sidecar 图片缓存出来的副本会随
+// 磁盘上的来源变化而失效，不能当成"这个媒体已经有预览图了"的依据。
+func (c *ArtworkCache) GeneratedMediaPreviews(mediaID string) []string {
+	return c.cachedMediaPreviews(mediaID, true)
+}
+
+func (c *ArtworkCache) cachedMediaPreviews(mediaID string, generatedOnly bool) []string {
 	if c == nil || strings.TrimSpace(mediaID) == "" {
 		return nil
 	}
@@ -284,6 +297,9 @@ func (c *ArtworkCache) CachedMediaPreviews(mediaID string) []string {
 		if entry.IsDir() {
 			continue
 		}
+		if generatedOnly && !strings.HasPrefix(entry.Name(), artworkGeneratedPrefix) {
+			continue
+		}
 		if strings.EqualFold(filepath.Ext(entry.Name()), ".jpg") {
 			paths = append(paths, filepath.Join(dir, entry.Name()))
 		}
@@ -291,6 +307,33 @@ func (c *ArtworkCache) CachedMediaPreviews(mediaID string) []string {
 	sort.Strings(paths)
 	c.touchMany(paths)
 	return paths
+}
+
+// CachedMediaPreviewsForSources 返回这批来源图片对应的缓存副本，缺一张就整体作废。
+// 缓存文件名里带了来源的大小和修改时间，来源换了就命中不到旧文件。
+func (c *ArtworkCache) CachedMediaPreviewsForSources(mediaID string, sourcePaths []string) []string {
+	if c == nil || strings.TrimSpace(mediaID) == "" || len(sourcePaths) == 0 {
+		return nil
+	}
+	paths := make([]string, 0, len(sourcePaths))
+	for index, source := range sourcePaths {
+		source = strings.TrimSpace(source)
+		if source == "" {
+			continue
+		}
+		key := previewCacheKey(index, c.sourceKey(source))
+		path := c.cachedImagePath("preview", mediaID, key, source, artworkWideMaxWidth, artworkWideMaxHeight)
+		if !fileExists(path) {
+			return nil
+		}
+		paths = append(paths, path)
+	}
+	c.touchMany(paths)
+	return paths
+}
+
+func previewCacheKey(index int, sourceKey string) string {
+	return fmt.Sprintf("%03d-%s", index+1, sourceKey)
 }
 
 func (c *ArtworkCache) RemoveMedia(mediaID string) error {
@@ -401,18 +444,30 @@ func (c *ArtworkCache) GeneratedMediaArtworkPath(media *model.Media, role string
 	if role == "poster" {
 		width, height = artworkPosterMaxWidth, artworkPosterMaxHeight
 	}
-	return filepath.Join(c.mediaRoleDir(role, media.ID), fmt.Sprintf("generated-%s.jpg", c.mediaSourceKey(media, role, width, height)))
+	return filepath.Join(c.mediaRoleDir(role, media.ID), fmt.Sprintf(artworkGeneratedPrefix+"%s.jpg", c.mediaSourceKey(media, role, width, height)))
 }
 
 func (c *ArtworkCache) GeneratedMediaPreviewPath(media *model.Media, index int) string {
 	if c == nil || media == nil || index <= 0 {
 		return ""
 	}
-	return filepath.Join(c.mediaRoleDir("preview", media.ID), fmt.Sprintf("generated-%s-%02d.jpg", c.mediaSourceKey(media, "preview", artworkWideMaxWidth, artworkWideMaxHeight), index))
+	return filepath.Join(c.mediaRoleDir("preview", media.ID), fmt.Sprintf(artworkGeneratedPrefix+"%s-%02d.jpg", c.mediaSourceKey(media, "preview", artworkWideMaxWidth, artworkWideMaxHeight), index))
 }
 
 func (c *ArtworkCache) cacheImageFile(role, mediaID, sourcePath string, maxWidth, maxHeight int) (string, error) {
 	return c.cacheImageFileWithKey(role, mediaID, c.sourceKey(sourcePath), sourcePath, maxWidth, maxHeight)
+}
+
+func (c *ArtworkCache) cachedImagePath(role, mediaID, key, sourcePath string, maxWidth, maxHeight int) string {
+	id := safeArtworkName(mediaID)
+	if id == "" {
+		id = safeArtworkName(strings.TrimSuffix(filepath.Base(sourcePath), filepath.Ext(sourcePath)))
+	}
+	if id == "" {
+		id = "media"
+	}
+	key = fmt.Sprintf("%s-%dx%d", key, maxWidth, maxHeight)
+	return filepath.Join(c.mediaRoleDir(role, id), fmt.Sprintf("%s.jpg", safeArtworkName(key)))
 }
 
 func (c *ArtworkCache) cacheImageFileWithKey(role, mediaID, key, sourcePath string, maxWidth, maxHeight int) (string, error) {
@@ -426,15 +481,7 @@ func (c *ArtworkCache) cacheImageFileWithKey(role, mediaID, key, sourcePath stri
 	}
 	defer file.Close()
 
-	id := safeArtworkName(mediaID)
-	if id == "" {
-		id = safeArtworkName(strings.TrimSuffix(filepath.Base(sourcePath), filepath.Ext(sourcePath)))
-	}
-	if id == "" {
-		id = "media"
-	}
-	key = fmt.Sprintf("%s-%dx%d", key, maxWidth, maxHeight)
-	outputPath := filepath.Join(c.mediaRoleDir(role, id), fmt.Sprintf("%s.jpg", safeArtworkName(key)))
+	outputPath := c.cachedImagePath(role, mediaID, key, sourcePath, maxWidth, maxHeight)
 	if fileExists(outputPath) {
 		c.hits.Add(1)
 		c.touch(outputPath)

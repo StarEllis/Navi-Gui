@@ -69,6 +69,55 @@ func DefaultMigrations() []Migration {
 			Name:    "media_search_fields",
 			Apply:   migrateMediaSearchFields,
 		},
+		{
+			// 拼音索引改成「只覆盖标题和演员名 + 按音节边界切成单元」之后，
+			// 库里存量的值全是旧格式，必须整体重算一遍。
+			Version: 6,
+			Name:    "phonetic_search_index_rebuild",
+			Apply:   migrateMediaSearchFields,
+		},
+		{
+			// people 新增 avatar_source 列，「换一张头像」要靠它记住当前用的是
+			// 图源里的哪一张。AutoMigrate 只在 v1 跑过，存量库拿不到新列。
+			Version: 7,
+			Name:    "person_avatar_source",
+			Apply: func(tx *gorm.DB) (MigrationStats, error) {
+				if err := tx.AutoMigrate(&model.Person{}); err != nil {
+					return nil, fmt.Errorf("add person avatar source column: %w", err)
+				}
+				return MigrationStats{}, nil
+			},
+		},
+		{
+			// search_text 以前收录整条文件路径，用户按「有码 / 无码」建的目录名
+			// 会被当成标签搜到；改成只收文件名之后，存量的值要整体重算。
+			Version: 8,
+			Name:    "search_text_filename_only",
+			Apply:   migrateMediaSearchFields,
+		},
+		{
+			// NFO 附加字段里的封面 / 预告片链接不再进 search_text，存量的值要重算。
+			Version: 9,
+			Name:    "search_text_without_urls",
+			Apply:   migrateMediaSearchFields,
+		},
+		{
+			// 我的评分是张新表。model.AutoMigrate 只在 v1 baseline 跑过，
+			// 存量库不会自己长出新表，得在这里显式建一次。
+			Version: 10,
+			Name:    "my_rating_table",
+			Apply: func(tx *gorm.DB) (MigrationStats, error) {
+				if err := tx.AutoMigrate(&model.MediaRating{}); err != nil {
+					return nil, fmt.Errorf("create media ratings table: %w", err)
+				}
+				// 标签表虽然在 v1 的 AutoMigrate 列表里，但比 v1 更早建库的
+				// 存量文件不一定有，顺手补齐，省得打标签时再炸一次。
+				if err := tx.AutoMigrate(&model.Tag{}, &model.MediaTag{}); err != nil {
+					return nil, fmt.Errorf("create tag tables: %w", err)
+				}
+				return MigrationStats{}, nil
+			},
+		},
 	}
 }
 
@@ -131,6 +180,8 @@ var orphanRules = []orphanRule{
 	{"user_sync_configs", "user_id", "users", true},
 	{"media_tags", "media_id", "media", true},
 	{"media_tags", "tag_id", "tags", true},
+	{"media_ratings", "media_id", "media", true},
+	{"media_ratings", "user_id", "users", true},
 	{"share_links", "created_by", "users", true},
 	{"share_links", "media_id", "media", false},
 	{"share_links", "series_id", "series", false},
@@ -456,6 +507,16 @@ func mergeMediaReferences(tx *gorm.DB, survivor, loser string) error {
 					}
 				}
 			}
+		}
+	}
+	if tx.Migrator().HasTable("media_ratings") {
+		// UNIQUE(user_id, media_id)：同一个用户对两条重复媒体都打过分时，
+		// 直接改 media_id 会撞唯一索引，先删掉 loser 那条再迁
+		if err := tx.Exec(`DELETE FROM media_ratings WHERE media_id = ? AND user_id IN (SELECT user_id FROM media_ratings WHERE media_id = ?)`, loser, survivor).Error; err != nil {
+			return err
+		}
+		if err := tx.Exec("UPDATE media_ratings SET media_id = ? WHERE media_id = ?", survivor, loser).Error; err != nil {
+			return err
 		}
 	}
 	if tx.Migrator().HasTable("media_tags") {

@@ -3,12 +3,13 @@ import { Play } from 'lucide-react';
 import { PlayMedia } from "../../wailsjs/go/main/App";
 import { formatError, toLocalAssetUrl } from '../utils/media';
 import type { AppMedia, RecommendationItem } from '../types/wails';
+import type { StatusKind } from '../types/status';
 import { getMediaProgressPercent } from '../utils/mediaPlaybackState';
 
 interface RecommendationCardProps {
     item: RecommendationItem;
     onSelectMedia: (media: AppMedia) => void;
-    onStatus?: (message: string) => void;
+    onStatus?: (message: string, kind?: StatusKind) => void;
 }
 
 const RecommendationCard: React.FC<RecommendationCardProps> = ({ item, onSelectMedia, onStatus }) => {
@@ -26,16 +27,16 @@ const RecommendationCard: React.FC<RecommendationCardProps> = ({ item, onSelectM
 
         const targetPath = typeof media?.file_path === 'string' ? media.file_path.trim() : '';
         if (!targetPath) {
-            onStatus?.('播放失败：当前推荐没有可播放文件');
+            onStatus?.('播放失败：当前推荐没有可播放文件', 'error');
             return;
         }
 
         try {
-            onStatus?.(`正在启动播放器：${targetPath.split(/[\\/]/).pop()}`);
+            onStatus?.(`正在启动播放器：${targetPath.split(/[\\/]/).pop()}`, 'play');
             await PlayMedia(media.id, targetPath);
         } catch (error) {
             console.error(error);
-            onStatus?.(`播放失败：${formatError(error)}`);
+            onStatus?.(`播放失败：${formatError(error)}`, 'error');
         }
     };
 

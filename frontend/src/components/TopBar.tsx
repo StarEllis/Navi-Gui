@@ -4,14 +4,17 @@ import {
     ArrowLeft,
     ArrowUpNarrowWide,
     Folder,
+    ImageDown,
     LayoutGrid,
     List,
     RefreshCw,
     Search,
     Shuffle,
+    SlidersHorizontal,
     X,
 } from 'lucide-react';
 import { ClipboardGetText, ClipboardSetText, WindowToggleMaximise } from '../../wailsjs/runtime/runtime';
+import { expandSearchTokenRange } from '../utils/mediaSearch';
 
 const CLEAR_FILTER_LABEL = '清除筛选';
 
@@ -45,6 +48,8 @@ interface TopBarProps {
     onScanWithMode?: (mode: string) => void;
     onRandomPlay?: () => void;
     onSortSelect?: (field: string) => void;
+    onBackfillAvatars?: () => void;
+    backfillingAvatars?: boolean;
     sortField?: string;
     sortOrder?: 'asc' | 'desc';
     sortOptions?: SortOption[];
@@ -56,6 +61,13 @@ interface TopBarProps {
     libraryName?: string;
     libraryPath?: string;
     libraryMediaCount?: number;
+    // 「我的评分 / 我的标签」筛选：面板和条件条由 App 组装后塞进来，
+    // TopBar 只负责那颗按钮和两个位置。
+    onToggleFilterPanel?: () => void;
+    filterPanelOpen?: boolean;
+    filterConditionCount?: number;
+    filterPanel?: React.ReactNode;
+    filterConditionBar?: React.ReactNode;
 }
 
 const DEFAULT_SORT_OPTIONS: SortOption[] = [
@@ -121,6 +133,15 @@ const getInputSelection = (input: HTMLInputElement) => {
     return { start, end };
 };
 
+const expandSelectionToSearchToken = (input: HTMLInputElement) => {
+    const { start, end } = getInputSelection(input);
+    const token = expandSearchTokenRange(input.value, start, end);
+
+    if (token.start !== start || token.end !== end) {
+        input.setSelectionRange(token.start, token.end);
+    }
+};
+
 const readClipboardText = async () => {
     try {
         return await ClipboardGetText();
@@ -165,6 +186,8 @@ const TopBar: React.FC<TopBarProps> = ({
     onScanWithMode,
     onRandomPlay,
     onSortSelect,
+    onBackfillAvatars,
+    backfillingAvatars = false,
     sortField = 'created_at',
     sortOrder = 'desc',
     sortOptions = DEFAULT_SORT_OPTIONS,
@@ -176,6 +199,11 @@ const TopBar: React.FC<TopBarProps> = ({
     libraryName = '',
     libraryPath = '',
     libraryMediaCount = 0,
+    onToggleFilterPanel,
+    filterPanelOpen = false,
+    filterConditionCount = 0,
+    filterPanel,
+    filterConditionBar,
 }) => {
     const [openMenu, setOpenMenu] = useState<MenuType>(null);
     const [confirmScanMode, setConfirmScanMode] = useState<ConfirmScanMode | null>(null);
@@ -442,10 +470,30 @@ const TopBar: React.FC<TopBarProps> = ({
                                     onSearch(event.target.value);
                                 }}
                                 onContextMenu={handleSearchContextMenu}
+                                onDoubleClick={(event) => expandSelectionToSearchToken(event.currentTarget)}
                                 onKeyDown={handleSearchKeyDown}
                                 disabled={searchDisabled}
                             />
                         </label>
+                    )}
+
+                    {onToggleFilterPanel && (
+                        <div className={`navi-filter-shell ${filterPanelOpen ? 'open' : ''}`.trim()}>
+                            <button
+                                type="button"
+                                className={`navi-filter-btn ${filterConditionCount > 0 ? 'on' : ''}`.trim()}
+                                title="筛选"
+                                aria-expanded={filterPanelOpen}
+                                onClick={onToggleFilterPanel}
+                            >
+                                <SlidersHorizontal size={14} />
+                                <span>筛选</span>
+                                {filterConditionCount > 0 && (
+                                    <span className="navi-filter-btn-count">{filterConditionCount}</span>
+                                )}
+                            </button>
+                            {filterPanelOpen && filterPanel}
+                        </div>
                     )}
 
                     {onRandomPlay && (
@@ -457,6 +505,20 @@ const TopBar: React.FC<TopBarProps> = ({
                             onClick={onRandomPlay}
                         >
                             <Shuffle size={16} />
+                        </button>
+                    )}
+
+                    {onBackfillAvatars && (
+                        <button
+                            type="button"
+                            className="navi-icon-btn"
+                            title={backfillingAvatars ? '正在补全头像…' : '补全头像'}
+                            aria-label={backfillingAvatars ? '正在补全头像' : '补全头像'}
+                            aria-busy={backfillingAvatars}
+                            disabled={backfillingAvatars}
+                            onClick={onBackfillAvatars}
+                        >
+                            <ImageDown size={16} className={backfillingAvatars ? 'navi-icon-busy' : undefined} />
                         </button>
                     )}
 
@@ -551,6 +613,9 @@ const TopBar: React.FC<TopBarProps> = ({
                     )}
                 </div>
             </div>
+
+            {/* 条件条常驻在顶栏下方：面板关掉它也留着 */}
+            {!hidden && filterConditionBar}
 
             {searchContextMenu && (
                 <div

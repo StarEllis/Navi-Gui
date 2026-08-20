@@ -1,7 +1,9 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { EyeOff, HeartOff } from 'lucide-react';
-import { GetMediaList } from "../../wailsjs/go/main/App";
+import { GetMediaListFiltered } from "../../wailsjs/go/main/App";
 import MediaCard from './MediaCard';
+import TagPicker from './TagPicker';
+import StarRating from './StarRating';
 import { prefetchMediaDetailCacheEntry, seedMediaDetailCache } from '../utils/mediaDetailCache';
 import {
     createLatestRequestGate,
@@ -18,6 +20,18 @@ import {
 } from '../utils/mediaPagination';
 import { markComponentRender } from '../utils/performanceDiagnostics';
 import { shouldInvalidateMediaPagination } from '../utils/mediaPlaybackState';
+import {
+    buildCategoryColorMap,
+    EMPTY_USER_FILTER,
+    getUserTagsSnapshot,
+    isUserFilterEmpty,
+    invalidateUserTags,
+    loadUserTags,
+    subscribeUserTags,
+    type UserFilter,
+} from '../utils/userTags';
+import { BatchSetMyRating } from "../../wailsjs/go/main/App";
+import { Tag, X } from 'lucide-react';
 import type { StatusKind } from '../types/status';
 
 interface MediaGridProps {
@@ -28,6 +42,8 @@ interface MediaGridProps {
     layoutVersion?: number;
     refreshVersion?: number;
     filter?: { type: string; value: string; label: string } | null;
+    userFilter?: UserFilter;
+    onClearUserFilter?: () => void;
     onSelectMedia: (media: any) => void;
     onCountChange?: (count: number) => void;
     onQuickPlayStatus?: (message: string, kind?: StatusKind) => void;
@@ -57,7 +73,17 @@ export const getMediaListCacheKey = (
     sortOrder: 'asc' | 'desc',
     filterType: string,
     filterValue: string,
-) => JSON.stringify([libraryId, keyword.trim(), sortField, sortOrder, filterType, filterValue]);
+    userFilter?: UserFilter,
+) => JSON.stringify([
+    libraryId, keyword.trim(), sortField, sortOrder, filterType, filterValue,
+    serializeUserFilter(userFilter),
+]);
+
+// 用户条件参与缓存键和请求去重键，否则换一套筛选会读到上一套的缓存页。
+export const serializeUserFilter = (userFilter?: UserFilter) => JSON.stringify([
+    userFilter?.scores || [],
+    userFilter?.tag_groups || [],
+]);
 
 // 空的已看 / 收藏页给一个说明为什么空、怎么填满的空状态，而不是一句报错似的灰字。
 const EMPTY_LIST_STATES: Record<string, { Icon: typeof EyeOff; title: string; hint: string }> = {
@@ -98,6 +124,8 @@ const MediaGrid: React.FC<MediaGridProps> = ({
     layoutVersion = 0,
     refreshVersion = 0,
     filter,
+    userFilter = EMPTY_USER_FILTER,
+    onClearUserFilter,
     onSelectMedia,
     onCountChange,
     onQuickPlayStatus,
@@ -109,6 +137,19 @@ const MediaGrid: React.FC<MediaGridProps> = ({
     markComponentRender('MediaGrid');
     const filterType = filter?.type || '';
     const filterValue = filter?.value || '';
+    const serializedUserFilter = useMemo(() => serializeUserFilter(userFilter), [userFilter]);
+    // loadPage 是 useCallback 出来的，把最新的用户条件放在 ref 里避免每次重建请求闭包
+    const activeUserFilterRef = useRef(userFilter);
+    activeUserFilterRef.current = userFilter;
+
+    const userTags = useSyncExternalStore(subscribeUserTags, getUserTagsSnapshot);
+    const categoryColors = useMemo(() => buildCategoryColorMap(userTags), [userTags]);
+    const [selectedIDs, setSelectedIDs] = useState<ReadonlySet<string>>(() => new Set());
+    const [tagPickerTarget, setTagPickerTarget] = useState<{ mediaIDs: string[]; rect: DOMRect; label: string } | null>(null);
+
+    useEffect(() => {
+        void loadUserTags();
+    }, []);
     const [layout, setLayout] = useState({ columns: 4, gap: 20, justify: 'start' });
     const [viewportHeight, setViewportHeight] = useState(0);
     const [virtualScrollTop, setVirtualScrollTop] = useState(initialScrollTop);
@@ -162,7 +203,8 @@ const MediaGrid: React.FC<MediaGridProps> = ({
         watched: filterType === 'watched' ? true : filterType === 'unwatched' ? false : null,
         filterType,
         filterValue,
-    }), [filterType, filterValue, libraryId, normalizedKeyword, sortField, sortOrder]);
+        userFilter: serializedUserFilter,
+    }), [filterType, filterValue, libraryId, normalizedKeyword, serializedUserFilter, sortField, sortOrder]);
 
     const beginRequestGeneration = useCallback(() => {
         const generation = requestGateRef.current.next();
@@ -183,7 +225,7 @@ const MediaGrid: React.FC<MediaGridProps> = ({
 
         const query: MediaPageQuery = { ...baseQuery, page };
         void requestMediaPage(query, async (normalizedQuery) => {
-            const response: any = await GetMediaList(
+            const response: any = await GetMediaListFiltered(
                 normalizedQuery.libraryId,
                 normalizedQuery.page,
                 normalizedQuery.pageSize,
@@ -192,6 +234,7 @@ const MediaGrid: React.FC<MediaGridProps> = ({
                 normalizedQuery.searchTerm,
                 normalizedQuery.filterType,
                 normalizedQuery.filterValue,
+                activeUserFilterRef.current as any,
             );
             return {
                 items: Array.isArray(response?.items) ? response.items : [],
@@ -437,6 +480,11 @@ const MediaGrid: React.FC<MediaGridProps> = ({
     useEffect(() => {
         if (focusedMediaIDRef.current && !visibleMediaIDs.has(focusedMediaIDRef.current)) {
             focusedMediaIDRef.current = '';
+            // 焦点已经移到网格之外（例如搜索框）时不要抢回来，只有卡片被虚拟列表移除才回收焦点。
+            const active = document.activeElement;
+            if (active && active !== document.body && !containerRef.current?.contains(active)) {
+                return;
+            }
             containerRef.current?.focus({ preventScroll: true });
         }
     }, [visibleMediaIDs]);
@@ -455,7 +503,82 @@ const MediaGrid: React.FC<MediaGridProps> = ({
     const handleFocusMedia = useCallback((mediaID: string) => {
         focusedMediaIDRef.current = mediaID;
     }, []);
-    const emptyListState = normalizedKeyword ? undefined : EMPTY_LIST_STATES[filterType];
+
+    // 进多选有两条路：Ctrl 点选随时可加；已经在多选里时普通点也算选。
+    // 两种情况下的动作是一样的，都是切换这一张。
+    const handleToggleSelect = useCallback((mediaID: string) => {
+        setSelectedIDs((current) => {
+            const next = new Set(current);
+            if (next.has(mediaID)) {
+                next.delete(mediaID);
+            } else {
+                next.add(mediaID);
+            }
+            return next;
+        });
+    }, []);
+
+    const clearSelection = useCallback(() => setSelectedIDs(new Set()), []);
+
+    const handleOpenTagPicker = useCallback((media: any, anchor: HTMLElement) => {
+        setTagPickerTarget({
+            mediaIDs: [media.id],
+            rect: anchor.getBoundingClientRect(),
+            label: media.title || media.code || '这部影片',
+        });
+    }, []);
+
+    // popover 浮在海报墙上，光靠位置分不清是哪张卡，来源卡要一直亮着
+    const taggingMediaID = tagPickerTarget?.mediaIDs.length === 1 ? tagPickerTarget.mediaIDs[0] : '';
+
+    const selectedMediaList = useMemo(() => {
+        if (selectedIDs.size === 0) {
+            return [] as any[];
+        }
+        const found: any[] = [];
+        pages.forEach((items) => items.forEach((item) => {
+            if (item && selectedIDs.has(item.id)) {
+                found.push(item);
+            }
+        }));
+        return found;
+    }, [pages, selectedIDs]);
+
+    // TagPicker 的三态勾选要知道选中的这批片子里有几部已经挂了某个标签
+    const selectionAssigned = useMemo(() => {
+        const counts: Record<string, number> = {};
+        const wanted = new Set(tagPickerTarget?.mediaIDs || []);
+        const source: any[] = [];
+        pages.forEach((items) => items.forEach((item) => {
+            if (item && wanted.has(item.id)) {
+                source.push(item);
+            }
+        }));
+        source.forEach((media) => {
+            (Array.isArray(media?.my_tags) ? media.my_tags : []).forEach((tag: any) => {
+                if (tag?.id) {
+                    counts[tag.id] = (counts[tag.id] || 0) + 1;
+                }
+            });
+        });
+        return counts;
+    }, [pages, tagPickerTarget]);
+
+    const applyBatchRating = useCallback(async (score: number) => {
+        const ids = Array.from(selectedIDs);
+        if (ids.length === 0) {
+            return;
+        }
+        try {
+            await BatchSetMyRating(ids, score);
+            selectedMediaList.forEach((media) => onMediaChange?.({ ...media, my_rating: score }));
+        } catch (error) {
+            console.error(error);
+            onQuickPlayStatus?.('批量打分失败', 'error');
+        }
+    }, [onMediaChange, onQuickPlayStatus, selectedIDs, selectedMediaList]);
+    const hasUserFilter = !isUserFilterEmpty(userFilter);
+    const emptyListState = (normalizedKeyword || hasUserFilter) ? undefined : EMPTY_LIST_STATES[filterType];
     const retry = () => {
         setShowingStaleResults(false);
         const generation = beginRequestGeneration();
@@ -497,10 +620,22 @@ const MediaGrid: React.FC<MediaGridProps> = ({
                         <div className="navi-empty-state-title">{emptyListState.title}</div>
                         <div className="navi-empty-state-hint">{emptyListState.hint}</div>
                     </div>
-                ) : (
+                ) : hasUserFilter ? (
+                    // 库里有几千部、只是条件筛没了，得说清楚并给条出路
                     <div className="grid-feedback" role="status">
-                        {normalizedKeyword || filterType ? '没有符合当前搜索或筛选条件的媒体' : '当前媒体库为空'}
+                        <span>没有符合当前条件的影片</span>
+                        {onClearUserFilter && (
+                            <button type="button" className="grid-feedback-action" onClick={onClearUserFilter}>
+                                清空条件
+                            </button>
+                        )}
                     </div>
+                ) : normalizedKeyword ? (
+                    <div className="grid-feedback" role="status">没搜到「{normalizedKeyword}」</div>
+                ) : filterType ? (
+                    <div className="grid-feedback" role="status">没有符合当前筛选条件的媒体</div>
+                ) : (
+                    <div className="grid-feedback" role="status">当前媒体库为空</div>
                 )
             )}
             {error && (
@@ -532,6 +667,12 @@ const MediaGrid: React.FC<MediaGridProps> = ({
                                     onPrefetchMedia={handlePrefetchMedia}
                                     onFocusMedia={handleFocusMedia}
                                     onMediaChange={onMediaChange}
+                                    categoryColors={categoryColors}
+                                    selected={selectedIDs.has(media.id)}
+                                    selectionActive={selectedIDs.size > 0}
+                                    onToggleSelect={handleToggleSelect}
+                                    onOpenTagPicker={handleOpenTagPicker}
+                                    tagging={media.id === taggingMediaID}
                                 />
                             ) : (
                                 <div key={`placeholder-${index}`} className="navi-card navi-card-placeholder" aria-hidden="true">
@@ -543,6 +684,63 @@ const MediaGrid: React.FC<MediaGridProps> = ({
                         </div>
                     </div>
                 </>
+            )}
+
+            {selectedIDs.size > 0 && (
+                <div className="navi-batch-bar" role="toolbar" aria-label="批量操作">
+                    <span className="navi-batch-count">已选 {selectedIDs.size} 部</span>
+                    <span className="navi-batch-sep" />
+                    <StarRating
+                        value={0}
+                        size={15}
+                        emptyColor="rgba(255,255,255,.28)"
+                        label="批量评分"
+                        onChange={(score) => void applyBatchRating(score)}
+                    />
+                    <button
+                        type="button"
+                        className="navi-batch-btn"
+                        onClick={(event) => setTagPickerTarget({
+                            mediaIDs: Array.from(selectedIDs),
+                            rect: event.currentTarget.getBoundingClientRect(),
+                            label: `已选 ${selectedIDs.size} 部`,
+                        })}
+                    >
+                        <Tag size={13} />
+                        <span>打标签</span>
+                    </button>
+                    <button
+                        type="button"
+                        className="navi-batch-close"
+                        aria-label="退出多选"
+                        onClick={clearSelection}
+                    >
+                        <X size={14} />
+                    </button>
+                </div>
+            )}
+
+            {tagPickerTarget && (
+                <TagPicker
+                    mediaIDs={tagPickerTarget.mediaIDs}
+                    assigned={selectionAssigned}
+                    targetLabel={tagPickerTarget.label}
+                    style={{
+                        position: 'fixed',
+                        left: Math.max(12, Math.min(tagPickerTarget.rect.left, window.innerWidth - 302)),
+                        top: Math.min(tagPickerTarget.rect.bottom + 6, window.innerHeight - 320),
+                    }}
+                    onClose={() => setTagPickerTarget(null)}
+                    onChanged={() => {
+                        invalidateUserTags();
+                        // 标签变化改的是 my_tags，客户端没法判断还符不符合筛选条件，直接重拉
+                        const generation = beginRequestGeneration();
+                        pagesRef.current = new Map();
+                        setPages(new Map());
+                        (visiblePagesRef.current.length > 0 ? visiblePagesRef.current : [1])
+                            .forEach((page) => loadPage(page, generation, true));
+                    }}
+                />
             )}
         </div>
     );
@@ -557,6 +755,7 @@ export default React.memo(MediaGrid, (prev, next) => (
     && prev.refreshVersion === next.refreshVersion
     && (prev.filter?.type || '') === (next.filter?.type || '')
     && (prev.filter?.value || '') === (next.filter?.value || '')
+    && serializeUserFilter(prev.userFilter) === serializeUserFilter(next.userFilter)
     && prev.onSelectMedia === next.onSelectMedia
     && prev.onCountChange === next.onCountChange
     && prev.onQuickPlayStatus === next.onQuickPlayStatus

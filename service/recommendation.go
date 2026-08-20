@@ -80,6 +80,7 @@ type selectionState struct {
 	prefixCounts   map[string]int
 	favoriteSet    map[string]bool
 	watchedSet     map[string]bool
+	ratingSet      map[string]int
 	remainingLimit int
 }
 
@@ -374,6 +375,7 @@ func (s *DetailRecommendationService) buildResponseForUser(source *model.Media, 
 	}
 
 	favoriteSet, watchedSet := s.loadMediaStateSets(mediaIDs)
+	ratingSet := s.loadMyRatingSet(mediaIDs)
 	state := &selectionState{
 		selectedIDs:    make(map[string]bool),
 		actorCounts:    make(map[string]int),
@@ -381,6 +383,7 @@ func (s *DetailRecommendationService) buildResponseForUser(source *model.Media, 
 		prefixCounts:   make(map[string]int),
 		favoriteSet:    favoriteSet,
 		watchedSet:     watchedSet,
+		ratingSet:      ratingSet,
 		remainingLimit: limit,
 	}
 
@@ -541,6 +544,7 @@ func selectRecommendationItem(source *model.Media, item RelatedMediaItem, state 
 	}
 
 	item.Media.IsFavorite = state.favoriteSet[item.Media.ID]
+	item.Media.MyRating = state.ratingSet[item.Media.ID]
 	item.Media.IsWatched = false
 
 	registerSelection(item, state)
@@ -663,6 +667,26 @@ func (s *DetailRecommendationService) loadMediaStateSets(mediaIDs []string) (map
 	}
 
 	return favoriteSet, watchedSet
+}
+
+func (s *DetailRecommendationService) loadMyRatingSet(mediaIDs []string) map[string]int {
+	ratingSet := make(map[string]int, len(mediaIDs))
+	if len(mediaIDs) == 0 {
+		return ratingSet
+	}
+
+	var ratings []model.MediaRating
+	if err := s.repos.DB().Model(&model.MediaRating{}).
+		Where("user_id = ? AND media_id IN ?", recommendationUserID, mediaIDs).
+		Find(&ratings).Error; err == nil {
+		for _, rating := range ratings {
+			if rating.Score > 0 {
+				ratingSet[rating.MediaID] = rating.Score
+			}
+		}
+	}
+
+	return ratingSet
 }
 
 func (s *DetailRecommendationService) loadActorRefs(mediaIDs []string) (map[string][]actorRef, error) {

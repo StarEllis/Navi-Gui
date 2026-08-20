@@ -528,7 +528,7 @@ func (s *ScannerService) prepareOverwriteIO(library *model.Library, options Scan
 		for _, record := range records {
 			existingPaths[nfoPathKey(record.FilePath)] = true
 			if s.artworkCache != nil {
-				prepared.previewCounts[record.ID] = len(s.artworkCache.CachedMediaPreviews(record.ID))
+				prepared.previewCounts[record.ID] = len(s.artworkCache.GeneratedMediaPreviews(record.ID))
 			}
 		}
 	} else {
@@ -1056,18 +1056,6 @@ var sidecarSubtitleExts = map[string]bool{
 	".idx": true,
 }
 
-var previewRootPriorityTokens = []struct {
-	token    string
-	priority int
-}{
-	{token: "thumb", priority: 2},
-	{token: "fanart", priority: 3},
-	{token: "backdrop", priority: 3},
-	{token: "poster", priority: 4},
-	{token: "cover", priority: 4},
-	{token: "folder", priority: 4},
-}
-
 func normalizeFileModTime(ts time.Time) time.Time {
 	return ts.UTC().Truncate(time.Second)
 }
@@ -1115,6 +1103,49 @@ func previewBelongsToMediaFile(name string, mediaFilePath string, requirePrefix 
 	return strings.HasPrefix(imageStem, mediaStem+"-")
 }
 
+func isASCIIDigit(value byte) bool {
+	return value >= '0' && value <= '9'
+}
+
+// NaturalLess 按自然序比较文件名。刮削器写出的剧照是 fanart1…fanart10，
+// 纯字典序会把 fanart10 排到 fanart2 前面，展示顺序就乱了。
+func NaturalLess(left, right string) bool {
+	li, ri := 0, 0
+	for li < len(left) && ri < len(right) {
+		leftDigit := isASCIIDigit(left[li])
+		rightDigit := isASCIIDigit(right[ri])
+		if leftDigit != rightDigit {
+			return left[li] < right[ri]
+		}
+		if !leftDigit {
+			if left[li] != right[ri] {
+				return left[li] < right[ri]
+			}
+			li++
+			ri++
+			continue
+		}
+
+		leftStart, rightStart := li, ri
+		for li < len(left) && isASCIIDigit(left[li]) {
+			li++
+		}
+		for ri < len(right) && isASCIIDigit(right[ri]) {
+			ri++
+		}
+		// 去掉前导零后按位数比大小，避免长数字超出整型范围。
+		leftNumber := strings.TrimLeft(left[leftStart:li], "0")
+		rightNumber := strings.TrimLeft(right[rightStart:ri], "0")
+		if len(leftNumber) != len(rightNumber) {
+			return len(leftNumber) < len(rightNumber)
+		}
+		if leftNumber != rightNumber {
+			return leftNumber < rightNumber
+		}
+	}
+	return len(left)-li < len(right)-ri
+}
+
 func previewGroupKey(path, rootDir string) string {
 	name := strings.ToLower(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
 	name = strings.NewReplacer("_", "-", ".", "-", " ", "-").Replace(name)
@@ -1143,16 +1174,6 @@ func previewGroupKey(path, rootDir string) string {
 		return name
 	}
 	return strings.Join(kept, "-")
-}
-
-func previewPriorityFromName(name string) (int, bool) {
-	lower := strings.ToLower(strings.TrimSuffix(name, filepath.Ext(name)))
-	for _, token := range previewRootPriorityTokens {
-		if strings.Contains(lower, token.token) {
-			return token.priority, true
-		}
-	}
-	return 0, false
 }
 
 func readDirectoryModTime(dir string) time.Time {
@@ -1277,15 +1298,6 @@ func collectDirectorySidecarFilesWithReadDir(dir string, readDir func(string) ([
 			})
 			if firstImagePath == "" {
 				firstImagePath = path
-			}
-			if priority, ok := previewPriorityFromName(name); ok {
-				result.previewFiles = append(result.previewFiles, previewFileCandidate{
-					name:     name,
-					path:     path,
-					priority: priority,
-					groupKey: previewGroupKey(path, dir),
-					order:    len(result.previewFiles),
-				})
 			}
 		}
 	}
@@ -1550,7 +1562,7 @@ func (s *ScannerService) CollectMediaPreviews(mediaPath string) []string {
 		leftName := strings.ToLower(filepath.Base(candidates[i].path))
 		rightName := strings.ToLower(filepath.Base(candidates[j].path))
 		if leftName != rightName {
-			return leftName < rightName
+			return NaturalLess(leftName, rightName)
 		}
 		return candidates[i].order < candidates[j].order
 	})
@@ -1984,11 +1996,18 @@ func (s *ScannerService) SetGfriendsAvatarService(service *GfriendsAvatarService
 	s.gfriendsAvatarsEnabled = enabled
 }
 
-func (s *ScannerService) CachedMediaPreviews(mediaID string) []string {
+func (s *ScannerService) CachedMediaPreviewsForSources(mediaID string, sourcePaths []string) []string {
 	if s == nil || s.artworkCache == nil {
 		return nil
 	}
-	return s.artworkCache.CachedMediaPreviews(mediaID)
+	return s.artworkCache.CachedMediaPreviewsForSources(mediaID, sourcePaths)
+}
+
+func (s *ScannerService) GeneratedMediaPreviews(mediaID string) []string {
+	if s == nil || s.artworkCache == nil {
+		return nil
+	}
+	return s.artworkCache.GeneratedMediaPreviews(mediaID)
 }
 
 func (s *ScannerService) CacheMediaPreviews(media *model.Media, sourcePaths []string, limit int) []string {
@@ -2362,10 +2381,13 @@ func (s *ScannerService) applyLocalSidecarsWithMode(media *model.Media, mediaPat
 		return nil
 	}
 
+	// NFO 解析失败不能连带丢掉海报和背景图：媒体库列表全靠 poster_path 出图，
+	// 解析出错就直接返回的话，这些条目在列表里只剩一张空卡片。
+	var nfoErr error
 	if nfoPath := sidecars.nfoPathForMedia(mediaPath); nfoPath != "" {
 		if parseErr := s.nfoService.ParseMovieNFO(nfoPath, media); parseErr != nil {
 			s.logger.Debugf("parse NFO failed: %s, err=%v", nfoPath, parseErr)
-			return parseErr
+			nfoErr = parseErr
 		}
 	}
 
@@ -2387,12 +2409,12 @@ func (s *ScannerService) applyLocalSidecarsWithMode(media *model.Media, mediaPat
 		if backdropPath != "" && media.BackdropPath == "" {
 			media.BackdropPath = backdropPath
 		}
-		return nil
+		return nfoErr
 	}
 	if overwrite {
 		media.PosterPath = posterPath
 		media.BackdropPath = backdropPath
-		return nil
+		return nfoErr
 	}
 	if posterPath != "" && media.PosterPath == "" {
 		media.PosterPath = posterPath
@@ -2400,7 +2422,7 @@ func (s *ScannerService) applyLocalSidecarsWithMode(media *model.Media, mediaPat
 	if backdropPath != "" && media.BackdropPath == "" {
 		media.BackdropPath = backdropPath
 	}
-	return nil
+	return nfoErr
 }
 
 func (s *ScannerService) resolveThumbnailState(media *model.Media, sidecars *directorySidecarFiles) {
