@@ -118,6 +118,18 @@ func DefaultMigrations() []Migration {
 				return MigrationStats{}, nil
 			},
 		},
+		{
+			// 加入时间独立成表，并给存量数据一次性冻结基准。
+			//
+			// 真正的入库时间已经没了：覆盖扫描把 media 删掉重建，created_at 全部
+			// 变成扫描当天。只能推算——取「NFO 修改时间」和「封面图创建时间」里
+			// 较早的那个。首次入库必然早于任何后续操作，所以较早的更接近真相：
+			// 封面图是第一次刮削的产物且重刮时会被 keep_files 保住，NFO 时间则
+			// 会被每次重刮改写。两个都没有才退回文件时间。
+			Version: 11,
+			Name:    "media_added_times",
+			Apply:   migrateMediaAddedTimes,
+		},
 	}
 }
 

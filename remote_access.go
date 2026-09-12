@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"navi-desktop/config"
 	"navi-desktop/model"
 
 	"github.com/google/uuid"
@@ -35,9 +36,10 @@ const (
 	defaultJellyfinServerName = "Navi Media Sidecar"
 	jellyfinTicksPerSecond    = int64(10_000_000)
 	jellyfinUserID            = desktopUserID
-	remoteAccessLogPath       = "remote_access.log"
 	jellyfinCompatVersion     = "10.10.7"
 )
+
+var remoteAccessLogPath = config.DataPath("logs", "remote_access.log")
 
 type remoteAccessState struct {
 	mu               sync.Mutex

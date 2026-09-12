@@ -354,7 +354,7 @@ func (r *MediaRepo) SearchAdvanced(params SearchAdvancedParams) ([]model.Media, 
 
 	query.Count(&total)
 
-	sortField := "COALESCE(file_created_at, file_mod_time, created_at)"
+	sortField := "COALESCE(library_added_at, file_created_at, file_mod_time, created_at)"
 	sortDir := "DESC"
 	switch params.SortBy {
 	case "title":
@@ -364,7 +364,7 @@ func (r *MediaRepo) SearchAdvanced(params SearchAdvancedParams) ([]model.Media, 
 	case "rating":
 		sortField = "rating"
 	case "created_at":
-		sortField = "COALESCE(file_created_at, file_mod_time, created_at)"
+		sortField = "COALESCE(library_added_at, file_created_at, file_mod_time, created_at)"
 	}
 	if params.SortOrder == "asc" {
 		sortDir = "ASC"
@@ -572,7 +572,7 @@ func (r *MediaRepo) ListFilesAdvanced(page, size int, libraryID, mediaType, keyw
 
 	query.Count(&total)
 
-	sortField := "COALESCE(file_created_at, file_mod_time, created_at)"
+	sortField := "COALESCE(library_added_at, file_created_at, file_mod_time, created_at)"
 	sortDir := "DESC"
 	switch sortBy {
 	case "title":
@@ -584,7 +584,7 @@ func (r *MediaRepo) ListFilesAdvanced(page, size int, libraryID, mediaType, keyw
 	case "file_size":
 		sortField = "file_size"
 	case "created_at":
-		sortField = "COALESCE(file_created_at, file_mod_time, created_at)"
+		sortField = "COALESCE(library_added_at, file_created_at, file_mod_time, created_at)"
 	case "updated_at":
 		sortField = "updated_at"
 	}
@@ -711,7 +711,7 @@ func (r *MediaRepo) ListByFolderPath(folderPath string, page, size int, libraryI
 
 	query.Count(&total)
 
-	sortField := "COALESCE(file_created_at, file_mod_time, created_at)"
+	sortField := "COALESCE(library_added_at, file_created_at, file_mod_time, created_at)"
 	sortDir := "DESC"
 	switch sortBy {
 	case "title":
@@ -723,7 +723,7 @@ func (r *MediaRepo) ListByFolderPath(folderPath string, page, size int, libraryI
 	case "file_size":
 		sortField = "file_size"
 	case "created_at":
-		sortField = "COALESCE(file_created_at, file_mod_time, created_at)"
+		sortField = "COALESCE(library_added_at, file_created_at, file_mod_time, created_at)"
 	case "updated_at":
 		sortField = "updated_at"
 	}

@@ -262,23 +262,26 @@ func (l *Library) ApplyPathConfig() error {
 
 // Media 媒体项（电影/剧集）
 type Media struct {
-	ID                 string     `json:"id" gorm:"primaryKey;type:text"`
-	LibraryID          string     `json:"library_id" gorm:"index;type:text;not null"`
-	Title              string     `json:"title" gorm:"index;type:text;not null"`
-	OrigTitle          string     `json:"orig_title" gorm:"type:text"` // 原始标题
-	Year               int        `json:"year" gorm:"index"`
-	Overview           string     `json:"overview" gorm:"type:text"`
-	PosterPath         string     `json:"poster_path" gorm:"type:text"`   // 海报图片路径
-	BackdropPath       string     `json:"backdrop_path" gorm:"type:text"` // 背景图路径
-	Rating             float64    `json:"rating"`
-	Runtime            int        `json:"runtime"`                             // 时长（分钟）
-	Genres             string     `json:"genres" gorm:"type:text"`             // 逗号分隔的类型
-	FilePath           string     `json:"file_path" gorm:"type:text;not null"` // 视频文件绝对路径
-	PathKey            string     `json:"-" gorm:"index;type:text"`
-	FileSize           int64      `json:"file_size"`
-	FileCreatedAt      *time.Time `json:"file_created_at" gorm:"index"`
-	FileModTime        *time.Time `json:"file_mod_time"`
-	NfoModTime         *time.Time `json:"nfo_mod_time" gorm:"index"`
+	ID            string     `json:"id" gorm:"primaryKey;type:text"`
+	LibraryID     string     `json:"library_id" gorm:"index;type:text;not null"`
+	Title         string     `json:"title" gorm:"index;type:text;not null"`
+	OrigTitle     string     `json:"orig_title" gorm:"type:text"` // 原始标题
+	Year          int        `json:"year" gorm:"index"`
+	Overview      string     `json:"overview" gorm:"type:text"`
+	PosterPath    string     `json:"poster_path" gorm:"type:text"`   // 海报图片路径
+	BackdropPath  string     `json:"backdrop_path" gorm:"type:text"` // 背景图路径
+	Rating        float64    `json:"rating"`
+	Runtime       int        `json:"runtime"`                             // 时长（分钟）
+	Genres        string     `json:"genres" gorm:"type:text"`             // 逗号分隔的类型
+	FilePath      string     `json:"file_path" gorm:"type:text;not null"` // 视频文件绝对路径
+	PathKey       string     `json:"-" gorm:"index;type:text"`
+	FileSize      int64      `json:"file_size"`
+	FileCreatedAt *time.Time `json:"file_created_at" gorm:"index"`
+	FileModTime   *time.Time `json:"file_mod_time"`
+	NfoModTime    *time.Time `json:"nfo_mod_time" gorm:"index"`
+	// LibraryAddedAt 是 media_added_times 的读取副本，「加入日期」排序直接读它，
+	// 省掉每次查询都 JOIN 一次。权威值在那张表里，这里被覆盖扫描冲掉也能重新填回来。
+	LibraryAddedAt     *time.Time `json:"library_added_at" gorm:"index"`
 	VideoFingerprint   string     `json:"video_fingerprint" gorm:"type:text"`
 	SidecarFingerprint string     `json:"sidecar_fingerprint" gorm:"type:text"`
 	MediaType          string     `json:"media_type" gorm:"type:text;default:movie"` // movie / episode
@@ -433,6 +436,23 @@ type MediaRating struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at" gorm:"index"` // 「打分时间」排序要用
 }
+
+// MediaAddedTime 记录「第一次见到这个文件是什么时候」，也就是媒体库意义上的
+// 加入时间。
+//
+// 为什么单独一张表：覆盖扫描是把 media 记录删掉重建的（日志里的 new=2134），
+// 挂在 media 行上的任何字段都会跟着重置——created_at 就是这么被抹平的。放在
+// 独立表里，media 怎么重建都不影响它。
+//
+// PathKey 是主键；Code 作为文件改名后的兜底（刮削器会大量改名，改完路径对不上，
+// 靠番号把加入时间追回来）。
+type MediaAddedTime struct {
+	PathKey string    `json:"path_key" gorm:"primaryKey;type:text"`
+	Code    string    `json:"code" gorm:"index;type:text"`
+	AddedAt time.Time `json:"added_at" gorm:"index;not null"`
+}
+
+func (MediaAddedTime) TableName() string { return "media_added_times" }
 
 func (r *MediaRating) BeforeCreate(tx *gorm.DB) error {
 	if r.ID == "" {
@@ -876,6 +896,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&MediaTag{},
 		// 我的评分
 		&MediaRating{},
+		&MediaAddedTime{},
 		// P2: 分享链接功能
 		&ShareLink{},
 		// P3: 自定义匹配规则

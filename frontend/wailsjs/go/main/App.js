@@ -62,6 +62,10 @@ export function DeleteMyTag(arg1) {
   return window['go']['main']['App']['DeleteMyTag'](arg1);
 }
 
+export function DownloadFFmpeg() {
+  return window['go']['main']['App']['DownloadFFmpeg']();
+}
+
 export function GetActorStats(arg1) {
   return window['go']['main']['App']['GetActorStats'](arg1);
 }
@@ -76,6 +80,10 @@ export function GetDetailRecommendations(arg1, arg2) {
 
 export function GetDirectoryStats(arg1) {
   return window['go']['main']['App']['GetDirectoryStats'](arg1);
+}
+
+export function GetFFmpegStatus() {
+  return window['go']['main']['App']['GetFFmpegStatus']();
 }
 
 export function GetFilterFacets(arg1, arg2, arg3, arg4, arg5) {

@@ -161,8 +161,11 @@ func Open(path string, options Options) (*Manager, error) {
 		return m, nil
 	}
 	if version < supported {
-		if _, err := m.createBackupLocked(version, supported, "migration"); err != nil {
-			return nil, fmt.Errorf("migration backup failed; database was not modified: %w", err)
+		// 刚建出来的空库没有任何东西可救，跳过备份；只有已有数据的库升级前才存一份。
+		if !newDatabase {
+			if _, err := m.createBackupLocked(version, supported, "migration"); err != nil {
+				return nil, fmt.Errorf("migration backup failed; database was not modified: %w", err)
+			}
 		}
 		if err := m.applyMigrations(version); err != nil {
 			return nil, err

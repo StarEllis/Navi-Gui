@@ -37,7 +37,7 @@ func NewConfig() *Config {
 			FFmpegConcurrency:  resolvePositiveInt("NAVI_FFMPEG_CONCURRENCY", "ffmpeg_concurrency", 1),
 		},
 		Cache: CacheConfig{
-			CacheDir: "cache",
+			CacheDir: DataPath("cache"),
 		},
 	}
 }
@@ -45,7 +45,7 @@ func NewConfig() *Config {
 func resolvePositiveInt(envKey, yamlKey string, fallback int) int {
 	value := strings.TrimSpace(os.Getenv(envKey))
 	if value == "" {
-		value = strings.TrimSpace(readSimpleYAMLValue(filepath.Join("config", "app.yaml"), yamlKey))
+		value = strings.TrimSpace(readSimpleYAMLValue(DataPath("app.yaml"), yamlKey))
 	}
 	parsed, err := strconv.Atoi(value)
 	if err != nil || parsed < 1 {
@@ -59,8 +59,14 @@ func resolveBinaryPath(envKey string, yamlKey string, fallbackPath string, fallb
 		return value
 	}
 
-	if value := strings.TrimSpace(readSimpleYAMLValue(filepath.Join("config", "app.yaml"), yamlKey)); value != "" {
+	if value := strings.TrimSpace(readSimpleYAMLValue(DataPath("app.yaml"), yamlKey)); value != "" {
 		return value
+	}
+
+	// 应用自己下载的那份排在自动探测之前：用户点了"下载"就该用这份，
+	// 而不是继续用 PATH 里那个可能坏掉的。
+	if bundled := BundledBinaryPath(fallbackName); bundled != "" {
+		return bundled
 	}
 
 	if _, err := os.Stat(fallbackPath); err == nil {
@@ -68,6 +74,18 @@ func resolveBinaryPath(envKey string, yamlKey string, fallbackPath string, fallb
 	}
 
 	return fallbackName
+}
+
+// FFmpegDir 是应用自己下载的 FFmpeg 的存放位置。
+func FFmpegDir() string { return DataPath("ffmpeg") }
+
+// BundledBinaryPath 返回自带的可执行文件路径，没下载过则返回空串。
+func BundledBinaryPath(name string) string {
+	candidate := filepath.Join(FFmpegDir(), name+".exe")
+	if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+		return candidate
+	}
+	return ""
 }
 
 func readSimpleYAMLValue(path string, key string) string {

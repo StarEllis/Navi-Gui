@@ -318,17 +318,20 @@ func (s *ScannerService) cloneForScanContext(ctx context.Context, taskID string)
 		artworkCache:              s.artworkCache,
 		gfriendsAvatarService:     s.gfriendsAvatarService,
 		gfriendsAvatarsEnabled:    s.gfriendsAvatarsEnabled,
-		sidecarCache:              make(map[string]directorySidecarCacheEntry),
-		walkFileTree:              s.walkFileTree,
-		statFile:                  s.statFile,
-		readDir:                   s.readDir,
-		readFile:                  s.readFile,
-		probeMediaFile:            s.probeMediaFile,
-		probeMediaFileContext:     s.probeMediaFileContext,
-		probeGovernor:             s.probeGovernor,
-		probeScope:                newProbeScope(ctx),
-		scanContext:               ctx,
-		scanTaskID:                taskID,
+		// 缓存【不能】跨扫描保留。它的失效判断靠目录的修改时间，而网络盘（实测
+		// J:/Y:/Z:）在目录里新增文件后根本不更新这个时间——留着上次的缓存，新加的
+		// nfo、字幕、海报就再也扫不出来了。每次扫描从空的开始，重读一遍换正确。
+		sidecarCache:          make(map[string]directorySidecarCacheEntry),
+		walkFileTree:          s.walkFileTree,
+		statFile:              s.statFile,
+		readDir:               s.readDir,
+		readFile:              s.readFile,
+		probeMediaFile:        s.probeMediaFile,
+		probeMediaFileContext: s.probeMediaFileContext,
+		probeGovernor:         s.probeGovernor,
+		probeScope:            newProbeScope(ctx),
+		scanContext:           ctx,
+		scanTaskID:            taskID,
 	}
 }
 
@@ -1009,6 +1012,8 @@ type directorySidecarFiles struct {
 	videoFiles      []string
 	previewFiles    []previewFileCandidate
 	videoCount      int
+	// artworkAliases maps a real video path to stems exposed by symlinks.
+	artworkAliases map[string][]string
 }
 
 type directorySidecarSignature struct {
@@ -1243,7 +1248,8 @@ func (s *ScannerService) collectDirectorySidecarFiles(dir string) *directorySide
 
 func collectDirectorySidecarFilesWithReadDir(dir string, readDir func(string) ([]os.DirEntry, error)) *directorySidecarFiles {
 	result := &directorySidecarFiles{
-		nfoByStem: make(map[string]string),
+		nfoByStem:      make(map[string]string),
+		artworkAliases: make(map[string][]string),
 	}
 
 	entries, err := readDir(dir)
@@ -1287,6 +1293,11 @@ func collectDirectorySidecarFilesWithReadDir(dir string, readDir func(string) ([
 		if supportedExts[ext] {
 			result.videoCount++
 			result.videoFiles = append(result.videoFiles, path)
+			if info, infoErr := os.Lstat(path); infoErr == nil && info.Mode()&os.ModeSymlink != 0 {
+				if target, targetErr := filepath.EvalSymlinks(path); targetErr == nil {
+					result.artworkAliases[target] = append(result.artworkAliases[target], stem)
+				}
+			}
 		}
 
 		if sidecarImageExts[ext] {
@@ -1424,18 +1435,27 @@ func mediaSpecificSidecarMatch(imageStem string, mediaFilePath string, tokens []
 	if mediaStem == "" || imageStem == "" {
 		return false
 	}
-	prefix := mediaStem + "-"
-	if !strings.HasPrefix(imageStem, prefix) {
-		return false
+	stems := []string{mediaStem}
+	// Some libraries keep a site/source prefix on the real file while the
+	// shortcut and its artwork use the shorter title (for example
+	// 489155.com@JUR-754-C.mp4 and JUR-754-C-poster.jpg).
+	if at := strings.LastIndex(mediaStem, "@"); at >= 0 && at+1 < len(mediaStem) {
+		stems = append(stems, normalizeSidecarStem(mediaStem[at+1:]))
 	}
-	suffix := strings.TrimPrefix(imageStem, prefix)
-	parts := strings.Split(suffix, "-")
-	if len(parts) == 0 {
-		return false
-	}
-	for _, token := range tokens {
-		if parts[0] == token {
-			return true
+	for _, stem := range stems {
+		prefix := stem + "-"
+		if !strings.HasPrefix(imageStem, prefix) {
+			continue
+		}
+		suffix := strings.TrimPrefix(imageStem, prefix)
+		parts := strings.Split(suffix, "-")
+		if len(parts) == 0 {
+			return false
+		}
+		for _, token := range tokens {
+			if parts[0] == token {
+				return true
+			}
 		}
 	}
 	return false
@@ -1463,6 +1483,13 @@ func (d *directorySidecarFiles) posterPathForMedia(mediaFilePath string) string 
 	}
 	if path := d.findMediaSpecificImagePath(mediaFilePath, []string{"poster", "cover", "folder", "thumb", "movie", "show"}); path != "" {
 		return path
+	}
+	if target, err := filepath.EvalSymlinks(mediaFilePath); err == nil {
+		for _, alias := range d.artworkAliases[target] {
+			if path := d.findMediaSpecificImagePath(alias+".mp4", []string{"poster", "cover", "folder", "thumb", "movie", "show"}); path != "" {
+				return path
+			}
+		}
 	}
 	if d.hasMultipleVideos() {
 		return ""
@@ -2497,10 +2524,27 @@ func (s *ScannerService) prepareQuickEpisodeMedia(library *model.Library, media 
 	s.applyLibraryMetadataMode(library, media)
 }
 
+// applyLibraryAddedAt 把「加入时间」填进 media 行。权威值在 media_added_times
+// 表里，这里只是取一份副本，好让排序不用每次 JOIN。
+func (s *ScannerService) applyLibraryAddedAt(media *model.Media) {
+	if s == nil || s.mediaRepo == nil || media == nil {
+		return
+	}
+	addedAt, err := s.mediaRepo.ResolveAddedAt(media, time.Now())
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warnf("resolve library added at failed: path=%s err=%v", media.FilePath, err)
+		}
+		return
+	}
+	media.LibraryAddedAt = &addedAt
+}
+
 func (s *ScannerService) persistQuickMedia(media *model.Media) error {
 	if media == nil {
 		return fmt.Errorf("media is nil")
 	}
+	s.applyLibraryAddedAt(media)
 	err := s.retryScanWrite(fmt.Sprintf("save media %s", media.FilePath), func() error {
 		return s.mediaRepo.Create(media)
 	})
@@ -2909,6 +2953,7 @@ func (s *ScannerService) refreshExistingMovieMedia(library *model.Library, exist
 	existing.MetadataPhase = MetadataPhaseFull
 	s.resolveThumbnailState(existing, sidecars)
 	s.applyLibraryMetadataMode(library, existing)
+	s.applyLibraryAddedAt(existing)
 	updateMediaSyncFingerprintsWithStat(existing, mediaPath, info, sidecars, s.stat)
 
 	if err := s.mediaRepo.Update(existing); err != nil {
@@ -3072,6 +3117,8 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 	}
 	s.setScanProgressTotal(library, len(entries))
 
+	prepared := s.prepareScanEntries(entries, existingSignatures, options)
+
 	var pendingList []pendingMedia
 	sidecarCache := make(map[string]*directorySidecarFiles)
 
@@ -3085,11 +3132,16 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 		return sidecars
 	}
 
-	for _, entry := range entries {
+	for index, entry := range entries {
 		if err := s.checkScanCanceled(); err != nil {
 			return count, result, err
 		}
-		mediaPath, info, infoErr := entry.resolvePathAndInfo(s.stat)
+		item := prepared[index]
+		// 预处理被取消打断时这一项是空的，退回原地自己算一次。
+		if !item.resolved {
+			item.path, item.info, item.err = entry.resolvePathAndInfo(s.stat)
+		}
+		mediaPath, info, infoErr := item.path, item.info, item.err
 		if infoErr != nil {
 			return count, result, &ScanIncompleteError{Root: entry.path, Err: infoErr}
 		}
@@ -3113,8 +3165,12 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 
 		if existingSignatures != nil {
 			if signature, ok := existingSignatures[mediaPath]; ok {
-				sidecars := getSidecars(mediaPath)
-				shouldRefresh, refreshVideo := shouldRefreshExistingMovieMediaWithStat(options, signature, mediaPath, info, sidecars, s.stat)
+				sidecars := item.sidecars
+				shouldRefresh, refreshVideo := item.shouldRefresh, item.refreshVideo
+				if !item.compared {
+					sidecars = getSidecars(mediaPath)
+					shouldRefresh, refreshVideo = shouldRefreshExistingMovieMediaWithStat(options, signature, mediaPath, info, sidecars, s.stat)
+				}
 				if !shouldRefresh {
 					skippedExist++
 					s.advanceScanProgress(library, progressMessage)
@@ -3288,6 +3344,80 @@ func (s *ScannerService) scanMovieLibraryWithOptions(library *model.Library, opt
 		library.Name, len(entries), count, skippedExist, skippedUpdated, skippedRule)
 
 	return count, result, nil
+}
+
+// scanPrepareConcurrency 是判定阶段的并发度。这一段只读——stat 文件、读目录、
+// 算指纹——在网络盘上时间几乎全花在等一次次往返上（实测本地盘 0.6ms/部，网络盘
+// 20ms/部），并发把等待重叠起来，实测 1.6~2.2 倍；再往上加到 32、64 收益就平了。
+// 写数据库的活儿不在这里，仍然按原顺序串行做。
+const scanPrepareConcurrency = 16
+
+// preparedScanEntry 是一部片在判定阶段的全部只读结果。
+type preparedScanEntry struct {
+	path     string
+	info     os.FileInfo
+	err      error
+	resolved bool // path/info/err 已填好
+
+	sidecars      *directorySidecarFiles
+	compared      bool // 跟库里已有记录比过了，下面三个字段才有意义
+	shouldRefresh bool
+	refreshVideo  bool
+}
+
+// prepareScanEntries 并发把每部片"要不要刷新"先算出来。结果按下标对号入座，
+// 所以后面的主循环拿到的顺序和 entries 完全一致。
+func (s *ScannerService) prepareScanEntries(
+	entries []scanMediaEntry,
+	existingSignatures map[string]repository.MediaFileSignature,
+	options ScanOptions,
+) []preparedScanEntry {
+	prepared := make([]preparedScanEntry, len(entries))
+	if len(entries) == 0 {
+		return prepared
+	}
+
+	workers := scanPrepareConcurrency
+	if workers > len(entries) {
+		workers = len(entries)
+	}
+
+	indexes := make(chan int)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range indexes {
+				item := &prepared[index]
+				item.path, item.info, item.err = entries[index].resolvePathAndInfo(s.stat)
+				item.resolved = true
+				if item.err != nil || item.info == nil || item.info.IsDir() {
+					continue
+				}
+				signature, ok := existingSignatures[item.path]
+				if !ok {
+					// 新片：sidecar 留给主循环去读，那边本来就要用它建记录。
+					continue
+				}
+				item.sidecars = s.buildDirectorySidecarFiles(filepath.Dir(item.path))
+				item.shouldRefresh, item.refreshVideo = shouldRefreshExistingMovieMediaWithStat(
+					options, signature, item.path, item.info, item.sidecars, s.stat)
+				item.compared = true
+			}
+		}()
+	}
+
+	for index := range entries {
+		if s.checkScanCanceled() != nil {
+			break
+		}
+		indexes <- index
+	}
+	close(indexes)
+	wg.Wait()
+
+	return prepared
 }
 
 type pendingMedia struct {
@@ -5283,6 +5413,36 @@ func isPathWithinRoot(path string, root string) bool {
 	return os.IsPathSeparator(path[len(root)])
 }
 
+// everythingPageTimeout 是单页请求的上限。Everything 偶尔会把响应头回了、
+// body 却再也不发（盘没建好索引时最常见），不设上限就只能死等系统的 TCP
+// 超时——那是两分四十五秒，全耗在一个注定要回退走目录的请求上。
+const everythingPageTimeout = 60 * time.Second
+
+// fetchEverythingPage 取一页搜索结果。超时按页算，慢但能出数据的照常走完。
+func fetchEverythingPage(ctx context.Context, client *http.Client, requestURL string) (*everythingHTTPResponse, error) {
+	pageCtx, cancel := context.WithTimeout(ctx, everythingPageTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(pageCtx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("everything http status %d", resp.StatusCode)
+	}
+
+	var payload everythingHTTPResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	return &payload, nil
+}
+
 func (s *ScannerService) listMovieEntriesWithEverything(ctx context.Context, library *model.Library, addr string, result *scanRootResult) ([]scanMediaEntry, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -5297,7 +5457,12 @@ func (s *ScannerService) listMovieEntriesWithEverything(ctx context.Context, lib
 		rootPaths = []string{strings.TrimSpace(library.Path)}
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	// Everything 一页要回 2000 条结果，网络盘上光是读完 body 就可能超过十几秒。
+	// 所以不给整个请求设死线（那会把"慢"误判成"坏"），只卡住"服务在不在"：
+	// 连不上或迟迟不给响应头才算失败，读 body 的时长跟着扫描 ctx 走。
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 15 * time.Second
+	client := &http.Client{Transport: transport}
 	pageSize := 2000
 
 	seen := make(map[string]bool)
@@ -5333,23 +5498,9 @@ func (s *ScannerService) listMovieEntriesWithEverything(ctx context.Context, lib
 			params.Set("offset", strconv.Itoa(offset))
 			params.Set("search", query)
 
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, addr+"/?"+params.Encode(), nil)
+			payload, err := fetchEverythingPage(ctx, client, addr+"/?"+params.Encode())
 			if err != nil {
 				return nil, err
-			}
-			resp, err := client.Do(req)
-			if err != nil {
-				return nil, err
-			}
-
-			var payload everythingHTTPResponse
-			decodeErr := json.NewDecoder(resp.Body).Decode(&payload)
-			_ = resp.Body.Close()
-			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				return nil, fmt.Errorf("everything http status %d", resp.StatusCode)
-			}
-			if decodeErr != nil {
-				return nil, decodeErr
 			}
 			if payload.TotalResults > expectedResults {
 				expectedResults = payload.TotalResults
@@ -5488,7 +5639,11 @@ func (s *ScannerService) listMovieEntries(library *model.Library, options ScanOp
 		if err == nil {
 			return entries, nil
 		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		// 只有用户主动取消才中断。这里【不能】把 DeadlineExceeded 也算进来：
+		// 扫描 ctx 是 WithCancel 建的，永远超不了时，能走到这儿的超时全是
+		// Everything 请求自己慢——那正是该退回去走目录的情况，中断了就等于
+		// 整个扫描白跑（曾经扫完 963 个文件后死在第三个根目录上）。
+		if errors.Is(err, context.Canceled) {
 			return nil, err
 		}
 		s.logger.Warnf("list movie entries via Everything HTTP failed, fallback to walk: library=%s err=%v", library.Name, err)

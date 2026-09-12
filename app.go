@@ -39,6 +39,7 @@ type App struct {
 	db                 *gorm.DB
 	dbManager          *database.Manager
 	repos              *repository.Repositories
+	cfg                *config.Config
 	scanner            *service.ScannerService
 	thumbnailWorker    *service.ThumbnailWorker
 	artworkCache       *service.ArtworkCache
@@ -198,8 +199,14 @@ func (a *App) finishLibraryScan(libraryID string) {
 func (a *App) startup(ctx context.Context) {
 	a.ctx, a.appCancel = context.WithCancel(ctx)
 
+	// 0. 把工作目录钉在 exe 目录上。新写入的路径都走 config.DataPath，
+	// 这一步是为了让库里存量的相对路径（旧版本存的 cache/artwork/... 之类）
+	// 在从快捷方式启动、系统给的工作目录不是 exe 目录时照样能读到。
+	_ = os.Chdir(config.AppDir())
+	_ = os.MkdirAll(config.DataPath("logs"), 0o755)
+
 	// 1. 初始化控制台和持久化日志
-	l, logFile, logErr := newApplicationLogger("navi.log")
+	l, logFile, logErr := newApplicationLogger(config.DataPath("logs", "navi.log"))
 	if logErr != nil {
 		l, _ = zap.NewDevelopment()
 	}
@@ -210,7 +217,9 @@ func (a *App) startup(ctx context.Context) {
 	}
 
 	// 2. 初始化带版本迁移、备份和连接级 PRAGMA 的 SQLite 持久层。
-	dbManager, err := database.Open("navi.db", database.DefaultOptions())
+	databaseOptions := database.DefaultOptions()
+	databaseOptions.BackupDir = config.DataPath("backups")
+	dbManager, err := database.Open(config.DataPath("navi.db"), databaseOptions)
 	if err != nil {
 		a.logger.Fatalf("连接或升级数据库失败: %v", err)
 	}
@@ -225,6 +234,7 @@ func (a *App) startup(ctx context.Context) {
 
 	// 4. 注入之前写好的最小化 Shim 层
 	cfg := config.NewConfig()
+	a.cfg = cfg
 	wsHub := service.NewWSHub(a.ctx)
 	a.eventHub = wsHub
 	a.playback = player.NewPlaybackSessionManager(
@@ -417,7 +427,7 @@ func (a *App) migrateThumbnailTasksV2(thumbSvc *service.ThumbnailService, settin
 		settings = service.DefaultThumbnailSettings()
 	}
 	if thumbSvc == nil {
-		thumbSvc = service.NewThumbnailService(config.NewConfig(), a.logger)
+		thumbSvc = service.NewThumbnailService(a.currentConfig(), a.logger)
 	}
 	sameMediaPath := func(left string, right string) bool {
 		left = strings.TrimSpace(left)
@@ -1328,7 +1338,7 @@ func (a *App) GetMediaListFiltered(libraryID string, page, size int, sortBy, sor
 		a.backfillMediaFileCreatedAt(libraryID)
 	}
 
-	sortField := "COALESCE(media.file_created_at, media.file_mod_time, media.created_at)"
+	sortField := "COALESCE(media.library_added_at, media.file_created_at, media.file_mod_time, media.created_at)"
 	switch sortBy {
 	case "release_date":
 		sortField = "CASE WHEN media.release_date_normalized != '' THEN media.release_date_normalized ELSE printf('%04d-01-01', media.year) END"
@@ -1346,9 +1356,9 @@ func (a *App) GetMediaListFiltered(libraryID string, page, size int, sortBy, sor
 	case "rated_at":
 		sortField = "COALESCE(my_rating_sort.rated_at, '')"
 	case "created_at", "added_at", "":
-		sortField = "COALESCE(media.file_created_at, media.file_mod_time, media.created_at)"
+		sortField = "COALESCE(media.library_added_at, media.file_created_at, media.file_mod_time, media.created_at)"
 	default:
-		sortField = "COALESCE(media.file_created_at, media.file_mod_time, media.created_at)"
+		sortField = "COALESCE(media.library_added_at, media.file_created_at, media.file_mod_time, media.created_at)"
 	}
 
 	dir := "DESC"
@@ -2293,7 +2303,7 @@ type DesktopSettings struct {
 	EmbyAPIKey  string `json:"emby_api_key"`
 }
 
-var settingsPath = "settings.json"
+var settingsPath = config.DataPath("settings.json")
 
 func (a *App) GetDesktopSettings() (*DesktopSettings, error) {
 	var settings DesktopSettings
@@ -2676,6 +2686,12 @@ func (a *App) DeleteMedia(mediaID string) error {
 				a.logger.Warnf("remove media artwork cache failed: media=%s err=%v", mediaID, err)
 			}
 		}
+	}
+	// 手动移除是「我不要这部片了」，加入时间的存根一并清掉，将来重新加回来
+	// 才会被当成新片。扫描自动清理走的不是这条路径，存根会留着——网络盘掉线
+	// 造成的误判不该把加入顺序也一起毁了。
+	if err := a.repos.Media.ForgetAddedAt(media); err != nil && a.logger != nil {
+		a.logger.Warnf("forget library added at failed: media=%s err=%v", mediaID, err)
 	}
 	return a.repos.Media.DeleteByID(mediaID)
 }
@@ -3358,7 +3374,7 @@ func isPotPlayerExecutable(path string) bool {
 }
 
 func appendPlayLatencyLog(format string, args ...interface{}) {
-	file, err := os.OpenFile("play_latency.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	file, err := os.OpenFile(config.DataPath("logs", "play_latency.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return
 	}

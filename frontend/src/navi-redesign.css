@@ -4209,3 +4209,116 @@ body {
 .navi-card.tagging .navi-card-poster {
   box-shadow: 0 0 0 2px #e0a05a;
 }
+
+/* ── 缺 FFmpeg 提示条 ─────────────────────────────────────────
+   只在检测不到 FFmpeg 时出现，横在顶栏和内容之间。不挡操作，
+   点右侧的叉就永久收起。 */
+.ffmpeg-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0 28px 12px;
+  padding: 11px 13px;
+  border-radius: 11px;
+  background: rgba(238, 186, 92, 0.09);
+  border: 1px solid rgba(238, 186, 92, 0.22);
+  color: rgba(239, 234, 240, 0.86);
+  font-size: 12.5px;
+}
+
+.ffmpeg-notice.is-error {
+  background: rgba(232, 104, 104, 0.1);
+  border-color: rgba(232, 104, 104, 0.26);
+}
+
+.ffmpeg-notice-icon {
+  flex: none;
+  display: flex;
+  padding-top: 1px;
+  color: rgba(238, 186, 92, 0.9);
+}
+
+.ffmpeg-notice.is-error .ffmpeg-notice-icon {
+  color: rgba(232, 104, 104, 0.92);
+}
+
+.ffmpeg-notice-spin {
+  animation: ffmpeg-notice-spin 1s linear infinite;
+}
+
+@keyframes ffmpeg-notice-spin {
+  to { transform: rotate(360deg); }
+}
+
+.ffmpeg-notice-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.ffmpeg-notice-title {
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+.ffmpeg-notice-detail {
+  color: rgba(239, 234, 240, 0.56);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ffmpeg-notice-bar {
+  margin-top: 5px;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+
+.ffmpeg-notice-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: rgba(238, 186, 92, 0.85);
+  transition: width 180ms ease-out;
+}
+
+.ffmpeg-notice-action {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.92);
+  color: #17161b;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ffmpeg-notice-action:hover {
+  background: #fff;
+}
+
+.ffmpeg-notice-close {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: rgba(239, 234, 240, 0.45);
+  cursor: pointer;
+}
+
+.ffmpeg-notice-close:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(239, 234, 240, 0.8);
+}

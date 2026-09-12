@@ -3,9 +3,32 @@ node_modules
 frontend/dist
 .gocache/
 
+# Local tests and development-only verification
+*_test.go
+/frontend/tests/
+/frontend/benchmark.html
+/frontend/src/benchmarks/
+/frontend/vite.config.ts.timestamp-*.mjs
+
+# Local agent, audit, and diagnostic metadata
+/.claude/
+/.codegraph/
+/.codex/
+/AGENTS.md
+/docs/audit/
+/design-qa.md
+/build/README.md
+/cmd/potplayer-probe/
+/extracted-icon.png
+/frontend/package.json.md5
+/pelican-bike-animation.html
+
 # Local application databases and SQLite runtime sidecars
 /alex.db
 /navi.db
+/settings.json
+/cache/
+/navi.db.backups/
 *.db-shm
 *.db-wal
 *.db-journal

@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"strings"
 
+	"navi-desktop/config"
+
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
@@ -60,6 +62,9 @@ func main() {
 		Windows: &windows.Options{
 			Theme:                             windows.Dark,
 			DisableFramelessWindowDecorations: false,
+			// 便携版：WebView2 的 localStorage / 缓存跟数据一起放 exe 同目录，
+			// 不再落在 %APPDATA%\Navi.exe（那份按 exe 文件名建，dev 和打包版会串）。
+			WebviewUserDataPath: config.DataPath("webview2"),
 		},
 		Bind: []interface{}{
 			app,

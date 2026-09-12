@@ -169,9 +169,6 @@ func (t *ThumbnailService) GeneratePreviewsContext(ctx context.Context, media *m
 	if t.hasDedicatedPreviewImages(media.FilePath, sidecars) {
 		return 0, nil
 	}
-	if t.cachedPreviewCount(media) > 0 {
-		return 0, nil
-	}
 
 	duration := mediaDurationSeconds(media)
 	if duration <= 0 {
@@ -395,11 +392,6 @@ func (t *ThumbnailService) syncGeneratedArtworkPaths(media *model.Media) bool {
 }
 
 func (t *ThumbnailService) generatedPosterPath(media *model.Media) string {
-	if t != nil && t.artworkCache != nil {
-		if path := t.artworkCache.GeneratedMediaArtworkPath(media, "poster"); path != "" {
-			return path
-		}
-	}
 	if media == nil {
 		return ""
 	}
@@ -407,11 +399,6 @@ func (t *ThumbnailService) generatedPosterPath(media *model.Media) string {
 }
 
 func (t *ThumbnailService) generatedBackdropPath(media *model.Media) string {
-	if t != nil && t.artworkCache != nil {
-		if path := t.artworkCache.GeneratedMediaArtworkPath(media, "fanart"); path != "" {
-			return path
-		}
-	}
 	if media == nil {
 		return ""
 	}
@@ -419,11 +406,6 @@ func (t *ThumbnailService) generatedBackdropPath(media *model.Media) string {
 }
 
 func (t *ThumbnailService) generatedPreviewPath(media *model.Media, index int) string {
-	if t != nil && t.artworkCache != nil {
-		if path := t.artworkCache.GeneratedMediaPreviewPath(media, index); path != "" {
-			return path
-		}
-	}
 	if media == nil {
 		return ""
 	}

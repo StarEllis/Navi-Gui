@@ -168,6 +168,28 @@ export namespace main {
 	        this.emby_api_key = source["emby_api_key"];
 	    }
 	}
+	export class FFmpegStatus {
+	    available: boolean;
+	    ffmpeg_path: string;
+	    ffprobe_path: string;
+	    bundled: boolean;
+	    downloading: boolean;
+	    supported: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new FFmpegStatus(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.available = source["available"];
+	        this.ffmpeg_path = source["ffmpeg_path"];
+	        this.ffprobe_path = source["ffprobe_path"];
+	        this.bundled = source["bundled"];
+	        this.downloading = source["downloading"];
+	        this.supported = source["supported"];
+	    }
+	}
 	export class FilterFacets {
 	    tags: Record<string, number>;
 	    ratings: Record<string, number>;
@@ -556,6 +578,8 @@ export namespace model {
 	    file_mod_time?: any;
 	    // Go type: time
 	    nfo_mod_time?: any;
+	    // Go type: time
+	    library_added_at?: any;
 	    video_fingerprint: string;
 	    sidecar_fingerprint: string;
 	    media_type: string;
@@ -644,6 +668,7 @@ export namespace model {
 	        this.file_created_at = this.convertValues(source["file_created_at"], null);
 	        this.file_mod_time = this.convertValues(source["file_mod_time"], null);
 	        this.nfo_mod_time = this.convertValues(source["nfo_mod_time"], null);
+	        this.library_added_at = this.convertValues(source["library_added_at"], null);
 	        this.video_fingerprint = source["video_fingerprint"];
 	        this.sidecar_fingerprint = source["sidecar_fingerprint"];
 	        this.media_type = source["media_type"];

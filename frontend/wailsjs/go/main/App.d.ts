@@ -35,6 +35,8 @@ export function DeleteMedia(arg1:string):Promise<void>;
 
 export function DeleteMyTag(arg1:string):Promise<void>;
 
+export function DownloadFFmpeg():Promise<void>;
+
 export function GetActorStats(arg1:string):Promise<Array<main.StatsItem>>;
 
 export function GetDesktopSettings():Promise<main.DesktopSettings>;
@@ -42,6 +44,8 @@ export function GetDesktopSettings():Promise<main.DesktopSettings>;
 export function GetDetailRecommendations(arg1:string,arg2:number):Promise<service.DetailRecommendationResponse>;
 
 export function GetDirectoryStats(arg1:string):Promise<Array<main.StatsItem>>;
+
+export function GetFFmpegStatus():Promise<main.FFmpegStatus>;
 
 export function GetFilterFacets(arg1:string,arg2:string,arg3:string,arg4:string,arg5:main.UserFilter):Promise<main.FilterFacets>;
 

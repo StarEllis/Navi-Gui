@@ -75,6 +75,7 @@ import {
     type SortViewName,
 } from './utils/sortPreferences';
 import ScanTaskPanel from './components/ScanTaskPanel';
+import FFmpegNotice from './components/FFmpegNotice';
 import { scanProgressStore } from './utils/scanProgressStore';
 import {
 	activateScanTaskFromEvent,
@@ -471,6 +472,14 @@ function App() {
 
     useEffect(() => {
         persistCurrentLibraryID(currentLib?.id || '');
+    }, [currentLib]);
+
+    // 没有当前库时顶栏不该还挂着上一个库的部数。两条路都会走到这：删掉最后一个
+    // 媒体库，以及启动时本地缓存里的库在后端已经不存在了。
+    useEffect(() => {
+        if (!currentLib) {
+            setMediaCount(0);
+        }
     }, [currentLib]);
 
     useEffect(() => {
@@ -1333,6 +1342,8 @@ function App() {
                             libraryPath={currentLib?.path || ''}
                             libraryMediaCount={baseCount || 0}
                         />
+
+                        <FFmpegNotice />
 
                         <div className="content-region">
                             {renderWorkspaceContent()}
