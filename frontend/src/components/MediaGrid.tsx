@@ -655,6 +655,7 @@ const MediaGrid: React.FC<MediaGridProps> = ({
                                 gridTemplateColumns: `repeat(${layout.columns}, ${MEDIA_CARD_WIDTH}px)`,
                                 columnGap: `${layout.gap}px`,
                                 justifyContent: layout.justify,
+                                alignItems: 'start',
                                 rowGap: `${MEDIA_GRID_ROW_GAP}px`,
                             }}
                         >

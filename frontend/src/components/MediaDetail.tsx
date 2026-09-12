@@ -26,6 +26,7 @@ import {
     FileVideo,
     FolderOpen,
     Heart,
+    ImagePlus,
     Play,
     Plus,
     RotateCcw,
@@ -33,6 +34,7 @@ import {
     UserRound,
 } from 'lucide-react';
 import NFOEditModal from './NFOEditModal';
+import PosterEditorModal from './PosterEditorModal';
 import RecommendationRail from './RecommendationRail';
 import StarRating from './StarRating';
 import TagPicker from './TagPicker';
@@ -456,6 +458,9 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     const categoryColors = useMemo(() => buildCategoryColorMap(userTags), [userTags]);
     const [codeCopyFeedback, setCodeCopyFeedback] = useState<CopyFeedback | null>(null);
     const [isStickyBarVisible, setIsStickyBarVisible] = useState(false);
+    const [posterAspect, setPosterAspect] = useState('2 / 3');
+    const [posterContextMenu, setPosterContextMenu] = useState<{ x: number; y: number } | null>(null);
+    const [showPosterEditor, setShowPosterEditor] = useState(false);
     const fileDropdownRef = useRef<HTMLDivElement | null>(null);
     const codeCopyTimerRef = useRef<number | null>(null);
     // 详情页整页滚动容器，同时是吸顶栏 IntersectionObserver 的 root
@@ -603,11 +608,13 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
             if (!fileDropdownRef.current?.contains(event.target as Node)) {
                 setShowFileMenu(false);
             }
+            setPosterContextMenu(null);
         };
 
         const onEscape = (event: KeyboardEvent) => {
             if (event.key === 'Escape') {
                 setShowFileMenu(false);
+                setPosterContextMenu(null);
             }
         };
 
@@ -1022,6 +1029,8 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     const immediateBackdropPath = deriveImmediateFanartPath(currFilePath || media.file_path || '');
     const backdropPath = pickBackdropImagePath(detail) || immediateBackdropPath || posterPath;
     const posterUrl = posterPath ? toLocalAssetUrl(posterPath) : '';
+    const posterVersion = detail.updated_at ? encodeURIComponent(String(detail.updated_at)) : '';
+    const versionedPosterUrl = posterUrl ? `${posterUrl}?v=${posterVersion}` : '';
     const trailerThumbPath = backdropPath || previews[0] || '';
     const trailerThumbUrl = trailerThumbPath ? toLocalAssetUrl(trailerThumbPath) : '';
     const backdropUrl = backdropPath ? toLocalAssetUrl(backdropPath) : '';
@@ -1125,8 +1134,29 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
 
                     <div className="navi-detail-hero">
                         <div className="navi-detail-aside">
-                            <div className="navi-detail-poster">
-                                {posterUrl && <img src={posterUrl} alt="poster" />}
+                            <div
+                                className="navi-detail-poster"
+                                style={{ aspectRatio: posterAspect }}
+                                onContextMenu={(event) => {
+                                    event.preventDefault();
+                                    setPosterContextMenu({
+                                        x: Math.min(event.clientX, window.innerWidth - 184),
+                                        y: Math.min(event.clientY, window.innerHeight - 52),
+                                    });
+                                }}
+                            >
+                                {versionedPosterUrl && (
+                                    <img
+                                        src={versionedPosterUrl}
+                                        alt="poster"
+                                        onLoad={(event) => {
+                                            const { naturalWidth, naturalHeight } = event.currentTarget;
+                                            if (naturalWidth > 0 && naturalHeight > 0) {
+                                                setPosterAspect(`${naturalWidth} / ${naturalHeight}`);
+                                            }
+                                        }}
+                                    />
+                                )}
                             </div>
                         </div>
 
@@ -1487,8 +1517,8 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                         <ArrowLeft size={16} />
                     </button>
 
-                    <div className="navi-sticky-poster" aria-hidden="true">
-                        {posterUrl && <img src={posterUrl} alt="" />}
+                    <div className="navi-sticky-poster" aria-hidden="true" style={{ aspectRatio: posterAspect }}>
+                        {versionedPosterUrl && <img src={versionedPosterUrl} alt="" />}
                     </div>
 
                     <div className="navi-sticky-copy">
@@ -1512,6 +1542,37 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                         </button>
                     </div>
                 </div>
+
+                {posterContextMenu && (
+                    <div
+                        className="navi-menu navi-poster-context-menu"
+                        role="menu"
+                        style={{ left: posterContextMenu.x, top: posterContextMenu.y }}
+                        onMouseDown={(event) => event.stopPropagation()}
+                    >
+                        <button
+                            type="button"
+                            className="navi-menu-item"
+                            role="menuitem"
+                            onClick={() => {
+                                setPosterContextMenu(null);
+                                setShowPosterEditor(true);
+                            }}
+                        >
+                            <span><ImagePlus size={14} />更换封面图</span>
+                        </button>
+                    </div>
+                )}
+
+                {showPosterEditor && (
+                    <PosterEditorModal
+                        media={detail}
+                        previews={previews}
+                        onClose={() => setShowPosterEditor(false)}
+                        onSaved={applyResolvedDetail}
+                        onStatus={showMsg}
+                    />
+                )}
 
                 {isPreviewViewerOpen && currentPreviewPath && (
                     <div className="detail-preview-viewer" onClick={handleClosePreviewViewer}>

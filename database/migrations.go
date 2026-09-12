@@ -130,6 +130,16 @@ func DefaultMigrations() []Migration {
 			Name:    "media_added_times",
 			Apply:   migrateMediaAddedTimes,
 		},
+		{
+			Version: 12,
+			Name:    "media_poster_edit_state",
+			Apply: func(tx *gorm.DB) (MigrationStats, error) {
+				if err := tx.AutoMigrate(&model.Media{}); err != nil {
+					return nil, fmt.Errorf("add media poster edit columns: %w", err)
+				}
+				return MigrationStats{}, nil
+			},
+		},
 	}
 }
 

@@ -138,6 +138,10 @@ export function GetNFOEditorData(arg1) {
   return window['go']['main']['App']['GetNFOEditorData'](arg1);
 }
 
+export function GetPosterEditorState(arg1) {
+  return window['go']['main']['App']['GetPosterEditorState'](arg1);
+}
+
 export function GetSeriesStats(arg1) {
   return window['go']['main']['App']['GetSeriesStats'](arg1);
 }
@@ -190,12 +194,20 @@ export function RestartMedia(arg1, arg2) {
   return window['go']['main']['App']['RestartMedia'](arg1, arg2);
 }
 
+export function RestoreMediaPoster(arg1) {
+  return window['go']['main']['App']['RestoreMediaPoster'](arg1);
+}
+
 export function RetryFailedScan(arg1) {
   return window['go']['main']['App']['RetryFailedScan'](arg1);
 }
 
 export function RetryThumbnailTask(arg1) {
   return window['go']['main']['App']['RetryThumbnailTask'](arg1);
+}
+
+export function SaveMediaPoster(arg1) {
+  return window['go']['main']['App']['SaveMediaPoster'](arg1);
 }
 
 export function SaveNFOEditorData(arg1, arg2) {
@@ -216,6 +228,10 @@ export function SelectActorAvatarFile() {
 
 export function SelectDirectory() {
   return window['go']['main']['App']['SelectDirectory']();
+}
+
+export function SelectPosterImageFile() {
+  return window['go']['main']['App']['SelectPosterImageFile']();
 }
 
 export function SelectProgram() {

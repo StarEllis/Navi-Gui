@@ -73,6 +73,8 @@ export function GetMyRating(arg1:string):Promise<number>;
 
 export function GetNFOEditorData(arg1:string):Promise<service.NFOEditorData>;
 
+export function GetPosterEditorState(arg1:string):Promise<main.PosterEditorState>;
+
 export function GetSeriesStats(arg1:string):Promise<Array<main.StatsItem>>;
 
 export function GetThumbnailFailure(arg1:string):Promise<service.ThumbnailTaskEventData>;
@@ -99,9 +101,13 @@ export function RestartApp():Promise<void>;
 
 export function RestartMedia(arg1:string,arg2:string):Promise<void>;
 
+export function RestoreMediaPoster(arg1:string):Promise<model.Media>;
+
 export function RetryFailedScan(arg1:string):Promise<main.ScanTaskInfo>;
 
 export function RetryThumbnailTask(arg1:string):Promise<service.ThumbnailTaskEventData>;
+
+export function SaveMediaPoster(arg1:main.SaveMediaPosterRequest):Promise<model.Media>;
 
 export function SaveNFOEditorData(arg1:string,arg2:service.NFOEditorData):Promise<void>;
 
@@ -112,6 +118,8 @@ export function ScanLibraryWithMode(arg1:string,arg2:string):Promise<main.ScanTa
 export function SelectActorAvatarFile():Promise<string>;
 
 export function SelectDirectory():Promise<string>;
+
+export function SelectPosterImageFile():Promise<string>;
 
 export function SelectProgram():Promise<string>;
 

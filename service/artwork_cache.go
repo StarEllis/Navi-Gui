@@ -27,8 +27,8 @@ import (
 const (
 	artworkJPEGQuality = 82
 
-	artworkPosterMaxWidth  = 400
-	artworkPosterMaxHeight = 540
+	artworkPosterMaxWidth  = 1200
+	artworkPosterMaxHeight = 1800
 	artworkWideMaxWidth    = 1280
 	artworkWideMaxHeight   = 720
 	artworkActorMaxWidth   = 240
@@ -156,7 +156,9 @@ func (c *ArtworkCache) CacheMediaArtwork(media *model.Media, sidecars *directory
 		return posterPath, fanartPath, false, nil
 	}
 
-	if source := sidecars.posterPathForMedia(media.FilePath); strings.TrimSpace(source) != "" {
+	// 手动封面需要让 Media.PosterPath 始终指向媒体目录里的 <stem>-poster.jpg；
+	// 否则后台缓存任务会在弹窗保存后又把它改回 data/cache/artwork。
+	if source := sidecars.posterPathForMedia(media.FilePath); strings.TrimSpace(media.PosterWatermarkConfig) == "" && strings.TrimSpace(source) != "" {
 		cached, cacheErr := c.cacheImageFile("poster", media.ID, source, artworkPosterMaxWidth, artworkPosterMaxHeight)
 		if cacheErr != nil {
 			return posterPath, fanartPath, changed, cacheErr

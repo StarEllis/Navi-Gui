@@ -262,23 +262,26 @@ func (l *Library) ApplyPathConfig() error {
 
 // Media 媒体项（电影/剧集）
 type Media struct {
-	ID            string     `json:"id" gorm:"primaryKey;type:text"`
-	LibraryID     string     `json:"library_id" gorm:"index;type:text;not null"`
-	Title         string     `json:"title" gorm:"index;type:text;not null"`
-	OrigTitle     string     `json:"orig_title" gorm:"type:text"` // 原始标题
-	Year          int        `json:"year" gorm:"index"`
-	Overview      string     `json:"overview" gorm:"type:text"`
-	PosterPath    string     `json:"poster_path" gorm:"type:text"`   // 海报图片路径
-	BackdropPath  string     `json:"backdrop_path" gorm:"type:text"` // 背景图路径
-	Rating        float64    `json:"rating"`
-	Runtime       int        `json:"runtime"`                             // 时长（分钟）
-	Genres        string     `json:"genres" gorm:"type:text"`             // 逗号分隔的类型
-	FilePath      string     `json:"file_path" gorm:"type:text;not null"` // 视频文件绝对路径
-	PathKey       string     `json:"-" gorm:"index;type:text"`
-	FileSize      int64      `json:"file_size"`
-	FileCreatedAt *time.Time `json:"file_created_at" gorm:"index"`
-	FileModTime   *time.Time `json:"file_mod_time"`
-	NfoModTime    *time.Time `json:"nfo_mod_time" gorm:"index"`
+	ID         string `json:"id" gorm:"primaryKey;type:text"`
+	LibraryID  string `json:"library_id" gorm:"index;type:text;not null"`
+	Title      string `json:"title" gorm:"index;type:text;not null"`
+	OrigTitle  string `json:"orig_title" gorm:"type:text"` // 原始标题
+	Year       int    `json:"year" gorm:"index"`
+	Overview   string `json:"overview" gorm:"type:text"`
+	PosterPath string `json:"poster_path" gorm:"type:text"` // 海报图片路径
+	// PosterOriginalPath 保存首次手动更换封面前的刮削原图，供一键恢复。
+	PosterOriginalPath    string     `json:"poster_original_path" gorm:"type:text"`
+	PosterWatermarkConfig string     `json:"poster_watermark_config" gorm:"type:text"`
+	BackdropPath          string     `json:"backdrop_path" gorm:"type:text"` // 背景图路径
+	Rating                float64    `json:"rating"`
+	Runtime               int        `json:"runtime"`                             // 时长（分钟）
+	Genres                string     `json:"genres" gorm:"type:text"`             // 逗号分隔的类型
+	FilePath              string     `json:"file_path" gorm:"type:text;not null"` // 视频文件绝对路径
+	PathKey               string     `json:"-" gorm:"index;type:text"`
+	FileSize              int64      `json:"file_size"`
+	FileCreatedAt         *time.Time `json:"file_created_at" gorm:"index"`
+	FileModTime           *time.Time `json:"file_mod_time"`
+	NfoModTime            *time.Time `json:"nfo_mod_time" gorm:"index"`
 	// LibraryAddedAt 是 media_added_times 的读取副本，「加入日期」排序直接读它，
 	// 省掉每次查询都 JOIN 一次。权威值在那张表里，这里被覆盖扫描冲掉也能重新填回来。
 	LibraryAddedAt     *time.Time `json:"library_added_at" gorm:"index"`

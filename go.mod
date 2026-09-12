@@ -3,12 +3,15 @@ module navi-desktop
 go 1.23.0
 
 require (
+	github.com/disintegration/imaging v1.6.2
+	github.com/gen2brain/jpegn v0.5.0
 	github.com/glebarez/sqlite v1.11.0
 	github.com/google/uuid v1.6.0
 	github.com/longbridgeapp/opencc v0.3.13
 	github.com/mozillazg/go-pinyin v0.21.0
 	github.com/wailsapp/wails/v2 v2.12.0
 	go.uber.org/zap v1.27.1
+	golang.org/x/image v0.12.0
 	golang.org/x/net v0.35.0
 	golang.org/x/sys v0.30.0
 	golang.org/x/text v0.22.0
