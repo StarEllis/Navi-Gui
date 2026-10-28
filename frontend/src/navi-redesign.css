@@ -730,8 +730,7 @@ body {
 .navi-card-poster {
   position: relative;
   width: 192px;
-  height: auto;
-  aspect-ratio: 2 / 3;
+  height: 274px;
   border-radius: 12px;
   overflow: hidden;
   background: var(--navi-poster);

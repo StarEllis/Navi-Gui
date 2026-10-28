@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo } from 'react';
 import { Check, FolderOpen, Heart, Play, Star, Tag } from 'lucide-react';
 import { OpenMediaFolder, PlayMedia, SetMyRating, ToggleFavorite } from "../../wailsjs/go/main/App";
 import StarRating from './StarRating';
@@ -59,7 +59,6 @@ const MediaCard: React.FC<MediaCardProps> = ({
                 ? toLocalAssetUrl(media.backdrop_path)
                 : ''
     ), [media.backdrop_path, media.poster_path, media.updated_at]);
-    const [coverAspect, setCoverAspect] = useState('2 / 3');
     const playbackProgress = getMediaProgressPercent(media) ?? 0;
     const hasProgressBar = playbackProgress > 0;
     const title = media.title || '未知标题';
@@ -172,7 +171,7 @@ const MediaCard: React.FC<MediaCardProps> = ({
                 onPrefetchMedia?.(media);
             }}
         >
-            <div className="navi-card-poster" style={{ aspectRatio: coverAspect }}>
+            <div className="navi-card-poster">
                 {coverUrl && (
                     <img
                         key={coverUrl}
@@ -181,12 +180,6 @@ const MediaCard: React.FC<MediaCardProps> = ({
                         alt={title}
                         loading="lazy"
                         decoding="async"
-                        onLoad={(event) => {
-                            const { naturalWidth, naturalHeight } = event.currentTarget;
-                            if (naturalWidth > 0 && naturalHeight > 0) {
-                                setCoverAspect(`${naturalWidth} / ${naturalHeight}`);
-                            }
-                        }}
                         onError={(event) => {
                             event.currentTarget.hidden = true;
                         }}
