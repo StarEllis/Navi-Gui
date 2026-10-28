@@ -518,19 +518,27 @@ func validateUniqueNFOListIdentity(kind string, sourceValues, requestedValues []
 	return validate(requestedValues, "editor value")
 }
 
-func (d *nfoXMLDocument) directListValues(names ...string) ([]string, error) {
-	wanted := make(map[string]bool, len(names))
-	for _, name := range names {
-		wanted[strings.ToLower(name)] = true
+func (d *nfoXMLDocument) listValuesForIdentityValidation(elements []*nfoXMLElement, allowIdenticalDuplicates bool) ([]string, error) {
+	values := make([]string, 0, len(elements))
+	type seenListElement struct {
+		value string
+		raw   []byte
 	}
-	values := make([]string, 0)
-	for _, child := range d.root.children {
-		if !wanted[strings.ToLower(child.name.Local)] {
-			continue
-		}
-		value, err := d.elementText(child)
+	seen := make(map[string]seenListElement, len(elements))
+	for _, element := range elements {
+		value, err := d.elementText(element)
 		if err != nil {
 			return nil, err
+		}
+		trimmed := strings.TrimSpace(value)
+		normalized := normalizeNFOListValue(value)
+		raw := bytes.TrimSpace(d.data[element.start:element.end])
+		if previous, exists := seen[normalized]; exists && allowIdenticalDuplicates &&
+			previous.value == trimmed && bytes.Equal(previous.raw, raw) {
+			continue
+		}
+		if _, exists := seen[normalized]; !exists {
+			seen[normalized] = seenListElement{value: trimmed, raw: append([]byte(nil), raw...)}
 		}
 		values = append(values, value)
 	}
@@ -554,9 +562,9 @@ func (d *nfoXMLDocument) planScalar(name, value string, patches *[]nfoXMLPatch, 
 	return nil
 }
 
-func (d *nfoXMLDocument) planList(names []string, values []string, render func(string) []byte, patches *[]nfoXMLPatch, inserts *[][]byte) error {
+func (d *nfoXMLDocument) planList(names []string, values []string, render func(string) []byte, allowExactSourceDuplicates bool, patches *[]nfoXMLPatch, inserts *[][]byte) error {
 	existing := d.directElements(names...)
-	sourceValues, err := d.directListValues(names...)
+	sourceValues, err := d.listValuesForIdentityValidation(existing, allowExactSourceDuplicates)
 	if err != nil {
 		return err
 	}
@@ -646,7 +654,9 @@ func (d *nfoXMLDocument) planMirroredLists(names []string, values []string, patc
 		render := func(value string) []byte {
 			return renderNFOElement(element, value)
 		}
-		if err := d.planList([]string{element}, values, render, patches, inserts); err != nil {
+		// 同组里字面完全一致的分类只是冗余项。planList 会保留
+		// 编辑器请求的一份并删掉多余元素；大小写等原文不同的冲突仍会拒绝。
+		if err := d.planList([]string{element}, values, render, true, patches, inserts); err != nil {
 			return err
 		}
 	}
@@ -913,7 +923,7 @@ func buildEditedNFO(original []byte, data *NFOEditorData) ([]byte, error) {
 		case "director":
 			err = document.planList([]string{"director"}, splitEditorValues(data.Director), func(value string) []byte {
 				return renderNFOElement("director", value)
-			}, &patches, &inserts)
+			}, false, &patches, &inserts)
 		case "series":
 			err = document.planSeries(strings.TrimSpace(data.Series), &patches, &inserts)
 		case "publisher":
