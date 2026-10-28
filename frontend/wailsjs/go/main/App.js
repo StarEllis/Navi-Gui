@@ -6,6 +6,18 @@ export function BackfillActorAvatars(arg1) {
   return window['go']['main']['App']['BackfillActorAvatars'](arg1);
 }
 
+export function BackfillMediaPreviews(arg1, arg2, arg3) {
+  return window['go']['main']['App']['BackfillMediaPreviews'](arg1, arg2, arg3);
+}
+
+export function BackfillMediaTrailer(arg1, arg2) {
+  return window['go']['main']['App']['BackfillMediaTrailer'](arg1, arg2);
+}
+
+export function BackfillMediaTrailers(arg1, arg2) {
+  return window['go']['main']['App']['BackfillMediaTrailers'](arg1, arg2);
+}
+
 export function BatchAddTag(arg1, arg2) {
   return window['go']['main']['App']['BatchAddTag'](arg1, arg2);
 }
@@ -20,6 +32,10 @@ export function BatchSetMyRating(arg1, arg2) {
 
 export function CancelLibraryScan(arg1) {
   return window['go']['main']['App']['CancelLibraryScan'](arg1);
+}
+
+export function CancelMediaResourceBackfill(arg1) {
+  return window['go']['main']['App']['CancelMediaResourceBackfill'](arg1);
 }
 
 export function CancelScan(arg1) {
@@ -102,6 +118,10 @@ export function GetLastScanTask(arg1) {
   return window['go']['main']['App']['GetLastScanTask'](arg1);
 }
 
+export function GetLatestMediaResourceBackfill(arg1) {
+  return window['go']['main']['App']['GetLatestMediaResourceBackfill'](arg1);
+}
+
 export function GetLibraries() {
   return window['go']['main']['App']['GetLibraries']();
 }
@@ -128,6 +148,10 @@ export function GetMediaListFiltered(arg1, arg2, arg3, arg4, arg5, arg6, arg7, a
 
 export function GetMediaPreviews(arg1) {
   return window['go']['main']['App']['GetMediaPreviews'](arg1);
+}
+
+export function GetMediaResourceBackfill(arg1) {
+  return window['go']['main']['App']['GetMediaResourceBackfill'](arg1);
 }
 
 export function GetMyRating(arg1) {
@@ -168,6 +192,10 @@ export function OpenMediaFolder(arg1) {
 
 export function OpenNFO(arg1) {
   return window['go']['main']['App']['OpenNFO'](arg1);
+}
+
+export function PlanMediaResourceBackfill(arg1, arg2) {
+  return window['go']['main']['App']['PlanMediaResourceBackfill'](arg1, arg2);
 }
 
 export function PlayMedia(arg1, arg2) {
@@ -252,6 +280,14 @@ export function SetMediaTags(arg1, arg2) {
 
 export function SetMyRating(arg1, arg2) {
   return window['go']['main']['App']['SetMyRating'](arg1, arg2);
+}
+
+export function StartMediaResourceBackfill(arg1, arg2) {
+  return window['go']['main']['App']['StartMediaResourceBackfill'](arg1, arg2);
+}
+
+export function StartMediaResourceBackfillBatch(arg1, arg2) {
+  return window['go']['main']['App']['StartMediaResourceBackfillBatch'](arg1, arg2);
 }
 
 export function ToggleFavorite(arg1) {

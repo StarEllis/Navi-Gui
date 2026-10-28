@@ -2870,3 +2870,64 @@ body {
 .detail-playback-progress-track {
   border-radius: 2px;
 }
+
+.resource-backfill-modal {
+  width: min(680px, calc(100vw - 32px));
+}
+
+.resource-backfill-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin-bottom: 16px;
+}
+
+.resource-backfill-options label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: rgba(235, 240, 248, 0.88);
+  font-size: 12px;
+}
+
+.resource-backfill-candidates {
+  display: grid;
+  gap: 7px;
+}
+
+.resource-backfill-label {
+  color: rgba(235, 240, 248, 0.58);
+  font-size: 11px;
+}
+
+.resource-backfill-candidate {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr) 42px;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.resource-backfill-candidate-url {
+  overflow: hidden;
+  color: rgba(235, 240, 248, 0.58);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.resource-backfill-empty,
+.resource-backfill-progress {
+  margin-top: 12px;
+  color: rgba(235, 240, 248, 0.68);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.resource-backfill-errors {
+  margin-top: 6px;
+  color: #ff9f9f;
+  white-space: pre-wrap;
+}

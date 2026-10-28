@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { Info, Play, TriangleAlert } from 'lucide-react';
+import { Check, Info, Loader2, Play, TriangleAlert, X } from 'lucide-react';
 import './App.css';
 import './library-refine.css';
 import './navi-redesign.css';
@@ -12,6 +12,7 @@ import {
     GetGenreStats,
     CountTaggedMedia,
     GetFilterFacets,
+    GetMediaDetail,
     GetLibraries,
     PlayRandomLibraryMedia,
     ScanLibraryWithMode,
@@ -92,6 +93,14 @@ import {
 type ViewName = 'libs' | 'settings' | 'actor' | 'genre' | 'watched' | 'favorite' | 'tags';
 type StatusAction = { label: string; onClick: () => void };
 type StatusToast = { text: string; kind: StatusKind; action?: StatusAction } | null;
+type GlobalBackfillToast = {
+    taskID: string;
+    mediaID: string;
+    kind: 'running' | 'success' | 'error';
+    title: string;
+    meta: string;
+    progress: number;
+} | null;
 type SortOption = { field: SortField; label: string };
 type FilterState = { type: string; value: string; label: string; showHeaderLabel?: boolean } | null;
 type FilterReturnContext = {
@@ -235,6 +244,7 @@ function App() {
     const [editingLib, setEditingLib] = useState<any>(null);
     const [selectedMedia, setSelectedMedia] = useState<any>(null);
     const [statusToast, setStatusToast] = useState<StatusToast>(null);
+    const [globalBackfillToast, setGlobalBackfillToast] = useState<GlobalBackfillToast>(null);
     const [mediaCount, setMediaCount] = useState(() => {
         const initialCount = initialLibraryState.currentLibrary?.media_count;
         return typeof initialCount === 'number' ? initialCount : 0;
@@ -265,6 +275,7 @@ function App() {
     const metadataRefreshTimerRef = useRef<number | null>(null);
     const lastContentRefreshAtRef = useRef(0);
     const statusTimerRef = useRef<number | null>(null);
+    const backfillToastTimerRef = useRef<number | null>(null);
     const currentLibRef = useRef<any>(null);
     const mediaStateByIDRef = useRef(new Map<string, MediaStateUpdate>());
 
@@ -314,6 +325,59 @@ function App() {
 
     useEffect(() => {
         void loadUserTags();
+    }, []);
+
+    useEffect(() => {
+        const updateBackfillToast = (task: any, terminal: boolean) => {
+            const taskID = typeof task?.id === 'string' ? task.id : '';
+            const mediaID = typeof task?.media_id === 'string' ? task.media_id : '';
+            if (!taskID || !mediaID) return;
+            const result = task?.result || {};
+            const options = task?.options || {};
+            const done = (result.image_success || 0) + (result.image_skipped || 0) + (result.image_failed || 0) + (result.trailer_status === 'success' ? 1 : 0);
+            const total = Math.max(1, (options.want_trailer ? 1 : 0) + (options.want_preview_images ? result.image_total || 0 : 0));
+            const failed = task.status === 'failed' || task.status === 'canceled';
+            const completed = task.status === 'completed';
+            const meta = terminal
+                ? completed
+                    ? `新增 ${result.trailer_status === 'success' ? '1 个预告片' : '0 个预告片'}、${result.image_success || 0} 张剧照`
+                    : task.message || (result.errors || []).join('；') || '补齐未完成'
+                : result.image_success
+                    ? `剧照 已补 ${result.image_success} 张`
+                    : result.trailer_status === 'success'
+                        ? '预告片已完成'
+                        : result.stage === 'provider'
+                            ? '正在查询来源'
+                            : '准备下载';
+            setGlobalBackfillToast({
+                taskID,
+                mediaID,
+                kind: failed ? 'error' : completed ? 'success' : 'running',
+                title: failed ? (task.status === 'canceled' ? '已停止补齐' : '补齐失败') : completed ? '补齐完成' : '正在补齐媒体资源',
+                meta,
+                progress: terminal ? 1 : Math.min(1, done / total),
+            });
+            if (backfillToastTimerRef.current !== null) {
+                window.clearTimeout(backfillToastTimerRef.current);
+                backfillToastTimerRef.current = null;
+            }
+            if (terminal) {
+                backfillToastTimerRef.current = window.setTimeout(() => {
+                    setGlobalBackfillToast(null);
+                    backfillToastTimerRef.current = null;
+                }, 5000);
+            }
+        };
+        const unsubscribeProgress = EventsOn('media-resource-backfill-progress', (task: any) => updateBackfillToast(task, false));
+        const unsubscribeFinished = EventsOn('media-resource-backfill-finished', (task: any) => updateBackfillToast(task, true));
+        return () => {
+            unsubscribeProgress();
+            unsubscribeFinished();
+            if (backfillToastTimerRef.current !== null) {
+                window.clearTimeout(backfillToastTimerRef.current);
+                backfillToastTimerRef.current = null;
+            }
+        };
     }, []);
 
     // 标签页的顶栏计数：标签数来自缓存，覆盖部数要问后端。
@@ -815,6 +879,15 @@ function App() {
         seedMediaDetailCache(media);
         setSelectedMedia(media);
     }, []);
+
+    const openGlobalBackfillDetail = useCallback((mediaID: string) => {
+        GetMediaDetail(mediaID)
+            .then((media: any) => {
+                if (media) handleSelectMedia(media);
+            })
+            .catch((error: unknown) => showStatus(`无法打开补齐明细：${formatError(error)}`, 'error'));
+    }, [handleSelectMedia, showStatus]);
+
 
     const handleDetailMediaChange = useCallback((media: any) => {
         seedMediaDetailCache(media);
@@ -1389,6 +1462,23 @@ function App() {
                     onSubmit={handleSubmitAvatarURL}
                     onClose={() => setAvatarURLTarget(null)}
                 />
+            )}
+
+            {globalBackfillToast && selectedMedia?.id !== globalBackfillToast.mediaID && (
+                <div className={`backfill-toast app-global ${globalBackfillToast.kind}`} role="status">
+                    {globalBackfillToast.kind === 'running'
+                        ? <Loader2 size={18} className="navi-spin" />
+                        : globalBackfillToast.kind === 'success'
+                            ? <Check size={18} />
+                            : <X size={18} />}
+                    <div className="backfill-toast-copy">
+                        <div className="title">{globalBackfillToast.title}</div>
+                        <div className="meta">{globalBackfillToast.meta}</div>
+                    </div>
+                    <button type="button" className="backfill-toast-btn" onClick={() => openGlobalBackfillDetail(globalBackfillToast.mediaID)}>
+                        {globalBackfillToast.kind === 'running' ? '明细' : '查看'}
+                    </button>
+                </div>
             )}
 
             {statusToast && (

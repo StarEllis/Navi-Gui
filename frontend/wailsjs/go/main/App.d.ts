@@ -7,6 +7,12 @@ import {service} from '../models';
 
 export function BackfillActorAvatars(arg1:string):Promise<main.ActorAvatarBackfillResult>;
 
+export function BackfillMediaPreviews(arg1:string,arg2:Array<string>,arg3:number):Promise<number>;
+
+export function BackfillMediaTrailer(arg1:string,arg2:string):Promise<string>;
+
+export function BackfillMediaTrailers(arg1:Array<string>,arg2:Record<string, string>):Promise<Array<string>>;
+
 export function BatchAddTag(arg1:Array<string>,arg2:string):Promise<void>;
 
 export function BatchRemoveTag(arg1:Array<string>,arg2:string):Promise<void>;
@@ -14,6 +20,8 @@ export function BatchRemoveTag(arg1:Array<string>,arg2:string):Promise<void>;
 export function BatchSetMyRating(arg1:Array<string>,arg2:number):Promise<void>;
 
 export function CancelLibraryScan(arg1:string):Promise<void>;
+
+export function CancelMediaResourceBackfill(arg1:string):Promise<void>;
 
 export function CancelScan(arg1:string):Promise<void>;
 
@@ -55,6 +63,8 @@ export function GetLastScanFailure(arg1:string):Promise<main.ScanTaskInfo>;
 
 export function GetLastScanTask(arg1:string):Promise<main.ScanTaskInfo>;
 
+export function GetLatestMediaResourceBackfill(arg1:string):Promise<main.MediaResourceBackfillTask>;
+
 export function GetLibraries():Promise<Array<model.Library>>;
 
 export function GetMediaDetail(arg1:string):Promise<model.Media>;
@@ -68,6 +78,8 @@ export function GetMediaList(arg1:string,arg2:number,arg3:number,arg4:string,arg
 export function GetMediaListFiltered(arg1:string,arg2:number,arg3:number,arg4:string,arg5:string,arg6:string,arg7:string,arg8:string,arg9:main.UserFilter):Promise<any>;
 
 export function GetMediaPreviews(arg1:string):Promise<Array<string>>;
+
+export function GetMediaResourceBackfill(arg1:string):Promise<main.MediaResourceBackfillTask>;
 
 export function GetMyRating(arg1:string):Promise<number>;
 
@@ -88,6 +100,8 @@ export function MoveMyTag(arg1:string,arg2:string):Promise<void>;
 export function OpenMediaFolder(arg1:string):Promise<void>;
 
 export function OpenNFO(arg1:string):Promise<void>;
+
+export function PlanMediaResourceBackfill(arg1:string,arg2:main.BackfillOptions):Promise<main.MediaResourceBackfillPlan>;
 
 export function PlayMedia(arg1:string,arg2:string):Promise<void>;
 
@@ -130,6 +144,10 @@ export function SetActorAvatarFromURL(arg1:string,arg2:string):Promise<string>;
 export function SetMediaTags(arg1:string,arg2:Array<string>):Promise<void>;
 
 export function SetMyRating(arg1:string,arg2:number):Promise<void>;
+
+export function StartMediaResourceBackfill(arg1:string,arg2:main.BackfillOptions):Promise<string>;
+
+export function StartMediaResourceBackfillBatch(arg1:Array<string>,arg2:main.BackfillOptions):Promise<Array<string>>;
 
 export function ToggleFavorite(arg1:string):Promise<void>;
 

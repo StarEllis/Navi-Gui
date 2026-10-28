@@ -68,6 +68,28 @@ export namespace main {
 	        this.total = source["total"];
 	    }
 	}
+	export class BackfillOptions {
+	    want_trailer: boolean;
+	    want_preview_images: boolean;
+	    only_missing: boolean;
+	    replace_invalid: boolean;
+	    max_images: number;
+	    max_retries: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new BackfillOptions(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.want_trailer = source["want_trailer"];
+	        this.want_preview_images = source["want_preview_images"];
+	        this.only_missing = source["only_missing"];
+	        this.replace_invalid = source["replace_invalid"];
+	        this.max_images = source["max_images"];
+	        this.max_retries = source["max_retries"];
+	    }
+	}
 	export class DeleteLibraryResult {
 	    deleted: boolean;
 	    warning?: string;
@@ -175,11 +197,11 @@ export namespace main {
 	    bundled: boolean;
 	    downloading: boolean;
 	    supported: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new FFmpegStatus(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.available = source["available"];
@@ -242,50 +264,26 @@ export namespace main {
 		    return a;
 		}
 	}
-	export class PosterWatermarkConfig {
-	    subtitle: boolean;
-	    type_mark: string;
-	    quality_mark: string;
-	    subtitle_corner: string;
-	    type_corner: string;
-	    quality_corner: string;
-	    size: number;
-
+	export class MediaResourceBackfillPlan {
+	    media_id: string;
+	    code: string;
+	    candidates: service.ResourceCandidate[];
+	    trailer_missing: boolean;
+	    preview_missing: boolean;
+	
 	    static createFrom(source: any = {}) {
-	        return new PosterWatermarkConfig(source);
+	        return new MediaResourceBackfillPlan(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.subtitle = source["subtitle"];
-	        this.type_mark = source["type_mark"];
-	        this.quality_mark = source["quality_mark"];
-	        this.subtitle_corner = source["subtitle_corner"];
-	        this.type_corner = source["type_corner"];
-	        this.quality_corner = source["quality_corner"];
-	        this.size = source["size"];
+	        this.media_id = source["media_id"];
+	        this.code = source["code"];
+	        this.candidates = this.convertValues(source["candidates"], service.ResourceCandidate);
+	        this.trailer_missing = source["trailer_missing"];
+	        this.preview_missing = source["preview_missing"];
 	    }
-	}
-	export class PosterEditorState {
-	    source_path: string;
-	    current_poster_path: string;
-	    can_restore: boolean;
-	    config: PosterWatermarkConfig;
-	    watermark_assets: Record<string, string>;
-
-	    static createFrom(source: any = {}) {
-	        return new PosterEditorState(source);
-	    }
-
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.source_path = source["source_path"];
-	        this.current_poster_path = source["current_poster_path"];
-	        this.can_restore = source["can_restore"];
-	        this.config = this.convertValues(source["config"], PosterWatermarkConfig);
-	        this.watermark_assets = source["watermark_assets"];
-	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -304,7 +302,139 @@ export namespace main {
 		    return a;
 		}
 	}
-
+	export class MediaResourceBackfillResult {
+	    trailer_status: string;
+	    image_total: number;
+	    image_success: number;
+	    image_skipped: number;
+	    image_failed: number;
+	    stage?: string;
+	    current: number;
+	    total: number;
+	    errors?: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new MediaResourceBackfillResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.trailer_status = source["trailer_status"];
+	        this.image_total = source["image_total"];
+	        this.image_success = source["image_success"];
+	        this.image_skipped = source["image_skipped"];
+	        this.image_failed = source["image_failed"];
+	        this.stage = source["stage"];
+	        this.current = source["current"];
+	        this.total = source["total"];
+	        this.errors = source["errors"];
+	    }
+	}
+	export class MediaResourceBackfillTask {
+	    id: string;
+	    media_id: string;
+	    status: string;
+	    message: string;
+	    options: BackfillOptions;
+	    result?: MediaResourceBackfillResult;
+	    plan?: MediaResourceBackfillPlan;
+	
+	    static createFrom(source: any = {}) {
+	        return new MediaResourceBackfillTask(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.media_id = source["media_id"];
+	        this.status = source["status"];
+	        this.message = source["message"];
+	        this.options = this.convertValues(source["options"], BackfillOptions);
+	        this.result = this.convertValues(source["result"], MediaResourceBackfillResult);
+	        this.plan = this.convertValues(source["plan"], MediaResourceBackfillPlan);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class PosterWatermarkConfig {
+	    subtitle: boolean;
+	    type_mark: string;
+	    quality_mark: string;
+	    subtitle_corner: string;
+	    type_corner: string;
+	    quality_corner: string;
+	    size: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new PosterWatermarkConfig(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.subtitle = source["subtitle"];
+	        this.type_mark = source["type_mark"];
+	        this.quality_mark = source["quality_mark"];
+	        this.subtitle_corner = source["subtitle_corner"];
+	        this.type_corner = source["type_corner"];
+	        this.quality_corner = source["quality_corner"];
+	        this.size = source["size"];
+	    }
+	}
+	export class PosterEditorState {
+	    source_path: string;
+	    current_poster_path: string;
+	    can_restore: boolean;
+	    config: PosterWatermarkConfig;
+	    watermark_assets: Record<string, string>;
+	
+	    static createFrom(source: any = {}) {
+	        return new PosterEditorState(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.source_path = source["source_path"];
+	        this.current_poster_path = source["current_poster_path"];
+	        this.can_restore = source["can_restore"];
+	        this.config = this.convertValues(source["config"], PosterWatermarkConfig);
+	        this.watermark_assets = source["watermark_assets"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	
 	export class SaveMediaPosterRequest {
 	    media_id: string;
 	    source_kind: string;
@@ -315,11 +445,11 @@ export namespace main {
 	    crop_width: number;
 	    crop_height: number;
 	    watermarks: PosterWatermarkConfig;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new SaveMediaPosterRequest(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.media_id = source["media_id"];
@@ -332,7 +462,7 @@ export namespace main {
 	        this.crop_height = source["crop_height"];
 	        this.watermarks = this.convertValues(source["watermarks"], PosterWatermarkConfig);
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -1039,6 +1169,26 @@ export namespace service {
 	    }
 	}
 	
+	export class ResourceCandidate {
+	    Provider: string;
+	    ExternalID: string;
+	    Number: string;
+	    DetailURL: string;
+	    MatchScore: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new ResourceCandidate(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.Provider = source["Provider"];
+	        this.ExternalID = source["ExternalID"];
+	        this.Number = source["Number"];
+	        this.DetailURL = source["DetailURL"];
+	        this.MatchScore = source["MatchScore"];
+	    }
+	}
 	export class ThumbnailTaskEventData {
 	    task_id: string;
 	    media_id: string;

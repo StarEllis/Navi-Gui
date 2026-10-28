@@ -3,10 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -71,6 +75,12 @@ type App struct {
 	shutdownOnce       sync.Once
 	shutdownTimeout    time.Duration
 	mediaStateRevision atomic.Uint64
+	resourceMu         sync.Mutex
+	resourceTasks      map[string]*MediaResourceBackfillTask
+	resourceCancels    map[string]context.CancelFunc
+	resourceActive     map[string]string
+	resourceLatest     map[string]string
+	resourceSlots      chan struct{}
 }
 
 const (
@@ -2038,6 +2048,9 @@ func (a *App) getMediaFilesByPath(filePath string) []string {
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
+			if isAdjacentTrailerFile(entry.Name()) {
+				continue
+			}
 			if exts[strings.ToLower(filepath.Ext(entry.Name()))] {
 				files = append(files, filepath.Join(dir, entry.Name()))
 			}
@@ -2120,6 +2133,9 @@ func (a *App) getMediaPreviewsByPath(filePath string) []string {
 	}
 
 	if a.scanner != nil {
+		// Detail views must reflect the current directory contents even on
+		// drives whose directory mtime does not change when files are added.
+		a.scanner.InvalidateDirectorySidecars(filepath.Dir(filePath))
 		if previews := a.scanner.CollectMediaPreviews(filePath); len(previews) > 0 {
 			return previews
 		}
@@ -2595,17 +2611,22 @@ func (a *App) OpenMediaFolder(mediaID string) error {
 		return err
 	}
 	dir := filepath.Dir(media.FilePath)
-	var cmd *exec.Cmd
+	cmd := buildOpenFolderCommand(dir)
+	return cmd.Start()
+}
 
+func buildOpenFolderCommand(dir string) *exec.Cmd {
+	dir = filepath.Clean(strings.TrimSpace(dir))
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("explorer", dir)
+		// Use the Windows shell protocol handler instead of Explorer's command
+		// line parser. This keeps mapped drives and commas in folder names intact.
+		return exec.Command("rundll32.exe", "url.dll,FileProtocolHandler", dir)
 	case "darwin":
-		cmd = exec.Command("open", dir)
+		return exec.Command("open", dir)
 	default:
-		cmd = exec.Command("xdg-open", dir)
+		return exec.Command("xdg-open", dir)
 	}
-	return cmd.Start()
 }
 
 func (a *App) ToggleFavorite(mediaID string) error {
@@ -3093,6 +3114,11 @@ func isPreviewImage(path string) bool {
 	return previewImageExts[strings.ToLower(filepath.Ext(path))]
 }
 
+func isAdjacentTrailerFile(name string) bool {
+	stem := strings.ToLower(strings.TrimSuffix(filepath.Base(name), filepath.Ext(name)))
+	return stem == "trailer" || strings.HasSuffix(stem, "-trailer")
+}
+
 func countVideoFilesInDirectory(dir string) int {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -3101,6 +3127,9 @@ func countVideoFilesInDirectory(dir string) int {
 	count := 0
 	for _, entry := range entries {
 		if entry.IsDir() {
+			continue
+		}
+		if isAdjacentTrailerFile(entry.Name()) {
 			continue
 		}
 		if previewVideoExts[strings.ToLower(filepath.Ext(entry.Name()))] {
@@ -3143,8 +3172,8 @@ func isTrailerVideo(name string) bool {
 	return false
 }
 
-// getMediaTrailerByPath 找刮削器下载的预告片。MDCx 有两种落盘方式：同级的
-// <片名>-trailer.mp4，以及 trailers/trailer.mp4（同目录的分集共用一份）。
+// getMediaTrailerByPath 找刮削器下载的预告片。新约定是 trailers/trailer.mp4；
+// 同级的 <片名>-trailer.mp4 只作为旧版本文件的兼容回退。
 func getMediaTrailerByPath(filePath string) string {
 	filePath = strings.TrimSpace(filePath)
 	if filePath == "" {
@@ -3153,38 +3182,45 @@ func getMediaTrailerByPath(filePath string) string {
 
 	dir := filepath.Dir(filePath)
 	stem := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
+	trailerDir := filepath.Join(dir, "trailers")
 	for _, ext := range trailerVideoExts {
-		candidate := filepath.Join(dir, stem+"-trailer"+ext)
+		candidate := filepath.Join(trailerDir, "trailer"+ext)
 		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
 			return candidate
 		}
 	}
 
-	trailerDir := filepath.Join(dir, "trailers")
 	entries, err := os.ReadDir(trailerDir)
-	if err != nil {
-		return ""
-	}
-	// 带片名的归属明确，优先于目录内共用的那份。
-	var owned, shared []string
-	for _, entry := range entries {
-		if entry.IsDir() || !isTrailerVideo(entry.Name()) {
-			continue
+	if err == nil {
+		// 带片名的归属明确，优先于目录内共用的那份。
+		var owned, shared []string
+		for _, entry := range entries {
+			if entry.IsDir() || !isTrailerVideo(entry.Name()) {
+				continue
+			}
+			path := filepath.Join(trailerDir, entry.Name())
+			if previewBelongsToMediaFile(entry.Name(), filePath, true) {
+				owned = append(owned, path)
+			} else {
+				shared = append(shared, path)
+			}
 		}
-		path := filepath.Join(trailerDir, entry.Name())
-		if previewBelongsToMediaFile(entry.Name(), filePath, true) {
-			owned = append(owned, path)
-		} else {
-			shared = append(shared, path)
+		sort.Strings(owned)
+		sort.Strings(shared)
+		if len(owned) > 0 {
+			return owned[0]
+		}
+		if len(shared) > 0 {
+			return shared[0]
 		}
 	}
-	sort.Strings(owned)
-	sort.Strings(shared)
-	if len(owned) > 0 {
-		return owned[0]
-	}
-	if len(shared) > 0 {
-		return shared[0]
+
+	// 兼容此前已经下载到媒体目录旁边的旧文件；新下载不会再走这里。
+	for _, ext := range trailerVideoExts {
+		candidate := filepath.Join(dir, stem+"-trailer"+ext)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
 	}
 	return ""
 }
@@ -3645,4 +3681,871 @@ func (a *App) SelectProgram() (string, error) {
 		DefaultDirectory: defaultDirectory,
 		Filters:          filters,
 	})
+}
+
+// BackfillMediaPreviews downloads missing preview images beside the media file.
+func (a *App) BackfillMediaPreviews(mediaID string, urls []string, limit int) (int, error) {
+	media, err := a.GetMediaDetail(mediaID)
+	if err != nil {
+		return 0, err
+	}
+	if media == nil || strings.TrimSpace(media.FilePath) == "" {
+		return 0, fmt.Errorf("media file path is empty")
+	}
+	if limit <= 0 || limit > len(urls) {
+		limit = len(urls)
+	}
+	dir := filepath.Join(filepath.Dir(media.FilePath), "extrafanart")
+	client := service.NewHTTPClient(30 * time.Second)
+	done := 0
+	for i, raw := range urls[:limit] {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		dest := filepath.Join(dir, fmt.Sprintf("%s-preview-%03d.jpg", filepath.Base(strings.TrimSuffix(media.FilePath, filepath.Ext(media.FilePath))), i+1))
+		if _, e := os.Stat(dest); e == nil {
+			continue
+		}
+		if err := service.DownloadResource(context.Background(), client, raw, dest, service.ValidateImageBytes); err != nil {
+			return done, err
+		}
+		done++
+	}
+	return done, nil
+}
+
+// BackfillMediaTrailer downloads one provider trailer into the media folder's trailers subdirectory.
+func (a *App) BackfillMediaTrailer(mediaID, trailerURL string) (string, error) {
+	return a.backfillMediaTrailerContext(context.Background(), mediaID, trailerURL)
+}
+func (a *App) backfillMediaTrailerContext(ctx context.Context, mediaID, trailerURL string) (string, error) {
+	return a.backfillMediaTrailerContextWithOptions(ctx, mediaID, trailerURL, nil, true)
+}
+
+func (a *App) backfillMediaTrailerContextWithOptions(ctx context.Context, mediaID, trailerURL string, headers http.Header, replaceInvalid bool) (string, error) {
+	media, err := a.GetMediaDetail(mediaID)
+	if err != nil {
+		return "", err
+	}
+	if media == nil || strings.TrimSpace(media.FilePath) == "" {
+		return "", fmt.Errorf("media file path is empty")
+	}
+	dest := mediaTrailerPath(media.FilePath)
+	ffmpegPath, ffprobePath := "", ""
+	if cfg := a.currentConfig(); cfg != nil {
+		ffmpegPath = resolveExecutable(cfg.App.FFmpegPath)
+		ffprobePath = resolveExecutable(cfg.App.FFprobePath)
+	}
+	if err := service.DownloadTrailerWithOptions(ctx, service.NewHTTPClient(30*time.Second), trailerURL, dest, headers, ffmpegPath, ffprobePath, replaceInvalid); err != nil {
+		return "", err
+	}
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	default:
+	}
+	return dest, nil
+}
+
+func mediaTrailerPath(filePath string) string {
+	return filepath.Join(filepath.Dir(filePath), "trailers", "trailer.mp4")
+}
+
+// BackfillMediaTrailers processes a batch and returns successful paths.
+func (a *App) BackfillMediaTrailers(mediaIDs []string, urls map[string]string) ([]string, error) {
+	var done []string
+	var failures []string
+	for _, id := range mediaIDs {
+		u := strings.TrimSpace(urls[id])
+		if u == "" {
+			failures = append(failures, id+": empty trailer url")
+			continue
+		}
+		p, err := a.BackfillMediaTrailer(id, u)
+		if err != nil {
+			failures = append(failures, id+": "+err.Error())
+			continue
+		}
+		done = append(done, p)
+	}
+	if len(failures) > 0 {
+		return done, fmt.Errorf("%d trailer(s) failed: %s", len(failures), strings.Join(failures, "; "))
+	}
+	return done, nil
+}
+
+type BackfillOptions struct {
+	WantTrailer       bool `json:"want_trailer"`
+	WantPreviewImages bool `json:"want_preview_images"`
+	OnlyMissing       bool `json:"only_missing"`
+	ReplaceInvalid    bool `json:"replace_invalid"`
+	MaxImages         int  `json:"max_images"`
+	MaxRetries        int  `json:"max_retries"`
+}
+type MediaResourceBackfillPlan struct {
+	MediaID        string                      `json:"media_id"`
+	Code           string                      `json:"code"`
+	Candidates     []service.ResourceCandidate `json:"candidates"`
+	TrailerMissing bool                        `json:"trailer_missing"`
+	PreviewMissing bool                        `json:"preview_missing"`
+}
+type MediaResourceBackfillResult struct {
+	TrailerStatus string   `json:"trailer_status"`
+	ImageTotal    int      `json:"image_total"`
+	ImageSuccess  int      `json:"image_success"`
+	ImageSkipped  int      `json:"image_skipped"`
+	ImageFailed   int      `json:"image_failed"`
+	Stage         string   `json:"stage,omitempty"`
+	Current       int      `json:"current"`
+	Total         int      `json:"total"`
+	Errors        []string `json:"errors,omitempty"`
+}
+type MediaResourceBackfillTask struct {
+	ID      string                       `json:"id"`
+	MediaID string                       `json:"media_id"`
+	Status  string                       `json:"status"`
+	Message string                       `json:"message"`
+	Options BackfillOptions              `json:"options"`
+	Result  *MediaResourceBackfillResult `json:"result,omitempty"`
+	Plan    *MediaResourceBackfillPlan   `json:"plan,omitempty"`
+}
+
+func mediaResourceCode(m *model.Media) string {
+	if m == nil {
+		return ""
+	}
+	if strings.TrimSpace(m.Code) != "" {
+		return strings.TrimSpace(m.Code)
+	}
+	base := strings.TrimSuffix(filepath.Base(m.FilePath), filepath.Ext(m.FilePath))
+	return strings.TrimSpace(base)
+}
+
+// PlanMediaResourceBackfill discovers candidates without downloading anything.
+func (a *App) PlanMediaResourceBackfill(mediaID string, options BackfillOptions) (*MediaResourceBackfillPlan, error) {
+	return a.planMediaResourceBackfill(context.Background(), mediaID, options, true)
+}
+
+func (a *App) planMediaResourceBackfill(ctx context.Context, mediaID string, options BackfillOptions, firstOnly bool) (*MediaResourceBackfillPlan, error) {
+	m, err := a.GetMediaDetail(mediaID)
+	if err != nil {
+		return nil, err
+	}
+	code := mediaResourceCode(m)
+	if code == "" {
+		return nil, fmt.Errorf("media code is empty")
+	}
+	query := service.ResourceQuery{Code: code, Title: m.Title, UseBuiltIn: true}
+	var cands []service.ResourceCandidate
+	if firstOnly {
+		cands, err = service.SearchFirstConfiguredProvider(ctx, query)
+	} else {
+		cands, err = service.SearchConfiguredProviders(ctx, query)
+	}
+	if err != nil && len(cands) == 0 {
+		return nil, err
+	}
+	trailerMissing := true
+	if p := getMediaTrailerByPath(m.FilePath); p != "" {
+		trailerMissing = false
+	}
+	return &MediaResourceBackfillPlan{MediaID: mediaID, Code: code, Candidates: cands, TrailerMissing: trailerMissing, PreviewMissing: len(cands) > 0}, nil
+}
+
+func (a *App) StartMediaResourceBackfill(mediaID string, options BackfillOptions) (string, error) {
+	// Validate the media synchronously, but defer provider I/O to the task
+	// context.  This makes cancellation effective during the plan/query phase.
+	if _, err := a.GetMediaDetail(mediaID); err != nil {
+		return "", err
+	}
+	if !options.WantTrailer && !options.WantPreviewImages {
+		options.WantTrailer = true
+		options.WantPreviewImages = true
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	id := uuid.NewString()
+	task := &MediaResourceBackfillTask{ID: id, MediaID: mediaID, Status: "running", Options: options}
+	a.resourceMu.Lock()
+	if a.resourceTasks == nil {
+		a.resourceTasks = map[string]*MediaResourceBackfillTask{}
+	}
+	if a.resourceCancels == nil {
+		a.resourceCancels = map[string]context.CancelFunc{}
+	}
+	if a.resourceActive == nil {
+		a.resourceActive = map[string]string{}
+	}
+	if a.resourceLatest == nil {
+		a.resourceLatest = map[string]string{}
+	}
+	if previous := a.resourceActive[mediaID]; previous != "" {
+		a.resourceMu.Unlock()
+		cancel()
+		return "", fmt.Errorf("media resource task already running for %s", mediaID)
+	}
+	if a.resourceSlots == nil {
+		a.resourceSlots = make(chan struct{}, 2)
+	}
+	a.resourceTasks[id] = task
+	a.resourceCancels[id] = cancel
+	a.resourceActive[mediaID] = id
+	a.resourceLatest[mediaID] = id
+	a.resourceMu.Unlock()
+	if a.eventHub != nil {
+		snapshot := *task
+		a.eventHub.BroadcastEvent("media-resource-backfill-progress", &snapshot)
+	}
+	go a.runMediaResourceBackfill(ctx, task, options)
+	return id, nil
+}
+
+// StartMediaResourceBackfillBatch starts independent tasks and continues after
+// individual provider failures. The caller can inspect each task separately.
+func (a *App) StartMediaResourceBackfillBatch(mediaIDs []string, options BackfillOptions) ([]string, error) {
+	ids := make([]string, 0, len(mediaIDs))
+	var failures []string
+	seen := make(map[string]struct{}, len(mediaIDs))
+	for _, mediaID := range mediaIDs {
+		mediaID = strings.TrimSpace(mediaID)
+		if mediaID == "" {
+			failures = append(failures, "<empty media id>")
+			continue
+		}
+		if _, ok := seen[mediaID]; ok {
+			continue
+		}
+		seen[mediaID] = struct{}{}
+		id, err := a.StartMediaResourceBackfill(mediaID, options)
+		if err != nil {
+			failures = append(failures, mediaID+": "+err.Error())
+			continue
+		}
+		ids = append(ids, id)
+	}
+	if len(failures) > 0 {
+		return ids, fmt.Errorf("%d media task(s) failed to start: %s", len(failures), strings.Join(failures, "; "))
+	}
+	return ids, nil
+}
+func (a *App) CancelMediaResourceBackfill(taskID string) error {
+	a.resourceMu.Lock()
+	c := a.resourceCancels[taskID]
+	a.resourceMu.Unlock()
+	if c == nil {
+		return fmt.Errorf("resource task not found")
+	}
+	c()
+	return nil
+}
+func (a *App) GetMediaResourceBackfill(taskID string) (*MediaResourceBackfillTask, error) {
+	a.resourceMu.Lock()
+	defer a.resourceMu.Unlock()
+	t := a.resourceTasks[taskID]
+	if t == nil {
+		return nil, fmt.Errorf("resource task not found")
+	}
+	cp := *t
+	if t.Result != nil {
+		result := *t.Result
+		result.Errors = append([]string(nil), t.Result.Errors...)
+		cp.Result = &result
+	}
+	if t.Plan != nil {
+		plan := *t.Plan
+		plan.Candidates = append([]service.ResourceCandidate(nil), t.Plan.Candidates...)
+		cp.Plan = &plan
+	}
+	return &cp, nil
+}
+
+// GetLatestMediaResourceBackfill lets a remounted detail view reconnect to the
+// task that continues running after the user navigates back to the library.
+func (a *App) GetLatestMediaResourceBackfill(mediaID string) (*MediaResourceBackfillTask, error) {
+	a.resourceMu.Lock()
+	defer a.resourceMu.Unlock()
+	taskID := a.resourceLatest[mediaID]
+	t := a.resourceTasks[taskID]
+	if t == nil {
+		return nil, nil
+	}
+	cp := *t
+	if t.Result != nil {
+		result := *t.Result
+		result.Errors = append([]string(nil), t.Result.Errors...)
+		cp.Result = &result
+	}
+	if t.Plan != nil {
+		plan := *t.Plan
+		plan.Candidates = append([]service.ResourceCandidate(nil), t.Plan.Candidates...)
+		cp.Plan = &plan
+	}
+	return &cp, nil
+}
+
+func (a *App) tryMediaResourceTrailer(ctx context.Context, mediaID string, cand service.ResourceCandidate, raw string, retries int, replaceInvalid bool) error {
+	if strings.TrimSpace(raw) == "" {
+		return fmt.Errorf("empty trailer url")
+	}
+	headers := resourceProviderHeaders(cand)
+	var trailerErr error
+	for attempt := 0; attempt <= retries; attempt++ {
+		if attempt > 0 {
+			// Signed JavDB App manifests are short-lived; refresh the provider
+			// response instead of retrying an expired URL.
+			headers = resourceProviderHeaders(cand)
+			if refreshed := fetchResourceCandidate(ctx, cand); refreshed.TrailerURL != "" {
+				raw = refreshed.TrailerURL
+			}
+		}
+		_, trailerErr = a.backfillMediaTrailerContextWithOptions(ctx, mediaID, raw, headers, replaceInvalid)
+		if trailerErr == nil || ctx.Err() != nil || attempt == retries {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
+		}
+	}
+	return trailerErr
+}
+
+var trailerResourceProviderOrder = []string{"thejavdb_api", "javdb_app", "javdb"}
+var previewResourceProviderOrder = []string{"javdb_api", "javdb", "thejavdb_api", "javbus", "avmoo", "freejavbt", "iqqtv", "libredmm"}
+
+func mergeResourceCandidates(groups ...[]service.ResourceCandidate) []service.ResourceCandidate {
+	var merged []service.ResourceCandidate
+	seen := make(map[string]struct{})
+	for _, group := range groups {
+		for _, candidate := range group {
+			key := candidate.Provider + "\x00" + candidate.DetailURL
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			merged = append(merged, candidate)
+		}
+	}
+	return merged
+}
+
+func orderedResourceCandidates(candidates []service.ResourceCandidate, providers []string) []service.ResourceCandidate {
+	ordered := make([]service.ResourceCandidate, 0, len(candidates))
+	for _, provider := range providers {
+		for _, candidate := range candidates {
+			if candidate.Provider == provider {
+				ordered = append(ordered, candidate)
+			}
+		}
+	}
+	return ordered
+}
+
+func previewSourceAccepted(result *MediaResourceBackfillResult) bool {
+	return result != nil && (result.ImageSuccess > 0 || result.ImageSkipped > 0)
+}
+
+func limitPreviewSourceURLs(urls []string, max int) []string {
+	if max <= 0 {
+		max = 20
+	}
+	if len(urls) <= max {
+		return urls
+	}
+	return urls[:max]
+}
+
+func (a *App) runMediaResourceBackfill(ctx context.Context, task *MediaResourceBackfillTask, options BackfillOptions) {
+	if a.resourceSlots != nil {
+		select {
+		case a.resourceSlots <- struct{}{}:
+		case <-ctx.Done():
+			a.finishMediaResourceTask(task, &MediaResourceBackfillResult{TrailerStatus: "canceled"}, "canceled", ctx.Err().Error())
+			return
+		}
+		defer func() { <-a.resourceSlots }()
+	}
+	r := &MediaResourceBackfillResult{TrailerStatus: "skipped", Stage: "starting"}
+	a.resourceMu.Lock()
+	task.Result = r
+	a.resourceMu.Unlock()
+	defer func() {
+		a.resourceMu.Lock()
+		if a.resourceCancels != nil {
+			delete(a.resourceCancels, task.ID)
+		}
+		if a.resourceActive != nil && a.resourceActive[task.MediaID] == task.ID {
+			delete(a.resourceActive, task.MediaID)
+		}
+		finished := *task
+		if task.Result != nil {
+			result := *task.Result
+			result.Errors = append([]string(nil), task.Result.Errors...)
+			finished.Result = &result
+		}
+		a.resourceMu.Unlock()
+		if a.eventHub != nil {
+			a.eventHub.BroadcastEvent("media-resource-backfill-finished", &finished)
+		}
+	}()
+	m, err := a.GetMediaDetail(task.MediaID)
+	if err != nil {
+		r.Errors = []string{err.Error()}
+		a.setMediaResourceTaskState(task, "failed", err.Error())
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		a.setMediaResourceTaskState(task, "canceled", err.Error())
+		return
+	}
+	if task.Plan == nil {
+		plan, planErr := a.planMediaResourceBackfill(ctx, task.MediaID, options, true)
+		if planErr != nil {
+			if ctx.Err() != nil {
+				a.setMediaResourceTaskState(task, "canceled", ctx.Err().Error())
+			} else {
+				r.Errors = append(r.Errors, planErr.Error())
+				a.setMediaResourceTaskState(task, "failed", planErr.Error())
+			}
+			return
+		}
+		a.resourceMu.Lock()
+		task.Plan = plan
+		a.resourceMu.Unlock()
+	}
+	max := options.MaxImages
+	if max <= 0 {
+		max = 20
+	}
+	previews := a.getMediaPreviews(m)
+	r.ImageTotal = 0
+	fanartOrdinal := 1
+	retries := options.MaxRetries
+	if retries <= 0 {
+		retries = 1
+	}
+	if retries > 3 {
+		retries = 3
+	}
+	r.Stage = "provider"
+	a.publishMediaResourceResult(task, r)
+	fullCandidates, searchErr := service.SearchConfiguredProviders(ctx, service.ResourceQuery{Code: mediaResourceCode(m), Title: m.Title, UseBuiltIn: true})
+	if searchErr != nil {
+		r.Errors = append(r.Errors, searchErr.Error())
+	}
+	if err := ctx.Err(); err != nil {
+		a.setMediaResourceTaskState(task, "canceled", err.Error())
+		return
+	}
+	candidates := mergeResourceCandidates(fullCandidates, task.Plan.Candidates)
+	r.Total = len(candidates)
+	a.resourceMu.Lock()
+	if task.Plan != nil {
+		task.Plan.Candidates = append([]service.ResourceCandidate(nil), candidates...)
+	}
+	a.resourceMu.Unlock()
+
+	type cachedResource struct {
+		resource service.MediaResource
+	}
+	resourceCache := make(map[string]cachedResource, len(candidates))
+	fetchCandidate := func(cand service.ResourceCandidate) service.MediaResource {
+		key := cand.Provider + "\x00" + cand.DetailURL
+		if cached, ok := resourceCache[key]; ok {
+			return cached.resource
+		}
+		r.Current++
+		r.Stage = "provider"
+		a.publishMediaResourceResult(task, r)
+		var resource service.MediaResource
+		for attempt := 0; attempt <= retries; attempt++ {
+			resource = fetchResourceCandidate(ctx, cand)
+			if resource.Error == "" || ctx.Err() != nil || attempt == retries {
+				break
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
+			}
+		}
+		if resource.Error != "" && ctx.Err() == nil {
+			r.Errors = append(r.Errors, cand.Provider+": "+resource.Error)
+		}
+		resourceCache[key] = cachedResource{resource: resource}
+		return resource
+	}
+
+	type pendingTrailer struct {
+		candidate service.ResourceCandidate
+		url       string
+	}
+	var pendingHLS []pendingTrailer
+	if options.WantTrailer {
+		for _, cand := range orderedResourceCandidates(candidates, trailerResourceProviderOrder) {
+			res := fetchCandidate(cand)
+			if err := ctx.Err(); err != nil {
+				a.setMediaResourceTaskState(task, "canceled", err.Error())
+				return
+			}
+			if res.TrailerURL == "" {
+				continue
+			}
+			if service.IsHLSURL(res.TrailerURL) {
+				// Keep HLS as a fallback. Continue probing later providers so a
+				// directly downloadable MP4 wins even when it appears later.
+				pendingHLS = append(pendingHLS, pendingTrailer{candidate: cand, url: res.TrailerURL})
+			} else {
+				r.Stage = "trailer"
+				a.publishMediaResourceResult(task, r)
+				trailerErr := a.tryMediaResourceTrailer(ctx, task.MediaID, cand, res.TrailerURL, retries, options.ReplaceInvalid)
+				if trailerErr == nil {
+					r.TrailerStatus = "success"
+					break
+				} else if errors.Is(trailerErr, context.Canceled) || errors.Is(trailerErr, context.DeadlineExceeded) {
+					a.setMediaResourceTaskState(task, "canceled", trailerErr.Error())
+					return
+				} else {
+					r.Errors = append(r.Errors, cand.Provider+" trailer: "+trailerErr.Error())
+				}
+			}
+		}
+	}
+	if options.WantTrailer && r.TrailerStatus != "success" {
+		for _, pending := range pendingHLS {
+			r.Stage = "trailer"
+			a.publishMediaResourceResult(task, r)
+			trailerErr := a.tryMediaResourceTrailer(ctx, task.MediaID, pending.candidate, pending.url, retries, options.ReplaceInvalid)
+			if trailerErr == nil {
+				r.TrailerStatus = "success"
+				break
+			}
+			if errors.Is(trailerErr, context.Canceled) || errors.Is(trailerErr, context.DeadlineExceeded) {
+				a.setMediaResourceTaskState(task, "canceled", trailerErr.Error())
+				return
+			}
+			r.Errors = append(r.Errors, pending.candidate.Provider+" trailer: "+trailerErr.Error())
+		}
+	}
+
+	if options.WantPreviewImages {
+		for _, cand := range orderedResourceCandidates(candidates, previewResourceProviderOrder) {
+			res := fetchCandidate(cand)
+			if err := ctx.Err(); err != nil {
+				a.setMediaResourceTaskState(task, "canceled", err.Error())
+				return
+			}
+			if len(res.PreviewURLs) == 0 {
+				continue
+			}
+			previewURLs := limitPreviewSourceURLs(res.PreviewURLs, max)
+			r.ImageTotal = len(previewURLs)
+			r.ImageSuccess = 0
+			r.ImageSkipped = 0
+			r.ImageFailed = 0
+			r.Stage = "preview_images"
+			a.publishMediaResourceResult(task, r)
+			headers := resourceProviderHeaders(cand)
+			for _, u := range previewURLs {
+				if err := ctx.Err(); err != nil {
+					a.setMediaResourceTaskState(task, "canceled", err.Error())
+					return
+				}
+				ext := resourceImageExtension(u)
+				dest := numberedFanartPath(filepath.Join(filepath.Dir(m.FilePath), "extrafanart"), fanartOrdinal, ext)
+				if info, e := os.Stat(dest); e == nil {
+					existingValid := false
+					if !info.IsDir() && info.Size() > 0 {
+						if imageBytes, readErr := os.ReadFile(dest); readErr == nil && service.ValidateImageBytes(imageBytes) == nil {
+							existingValid = true
+						}
+					}
+					if options.OnlyMissing && existingValid {
+						r.ImageSkipped++
+						if !containsResourcePath(previews, dest) {
+							previews = append(previews, dest)
+						}
+						fanartOrdinal++
+						a.publishMediaResourceResult(task, r)
+						continue
+					}
+					if options.ReplaceInvalid || !options.OnlyMissing {
+						_ = os.Remove(dest)
+					} else {
+						r.ImageFailed++
+						r.Errors = append(r.Errors, cand.Provider+" image: existing file is invalid")
+						fanartOrdinal++
+						continue
+					}
+				}
+				var imageErr error
+				for attempt := 0; attempt <= retries; attempt++ {
+					download := service.DownloadResourceWithHeaders
+					if !options.OnlyMissing {
+						download = service.DownloadResourceWithHeadersReplacing
+					}
+					imageErr = download(ctx, service.NewHTTPClient(30*time.Second), u, dest, service.ValidateImageBytes, headers)
+					if imageErr == nil || ctx.Err() != nil || attempt == retries {
+						break
+					}
+					select {
+					case <-ctx.Done():
+					case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
+					}
+				}
+				if imageErr != nil {
+					if errors.Is(imageErr, context.Canceled) || errors.Is(imageErr, context.DeadlineExceeded) {
+						a.setMediaResourceTaskState(task, "canceled", imageErr.Error())
+						return
+					}
+					r.ImageFailed++
+					r.Errors = append(r.Errors, cand.Provider+" image: "+imageErr.Error())
+					a.publishMediaResourceResult(task, r)
+					continue
+				}
+				if imageBytes, readErr := os.ReadFile(dest); readErr == nil {
+					if actualExt, detectErr := service.DetectImageExtension(imageBytes); detectErr == nil && actualExt != ext {
+						actualDest := strings.TrimSuffix(dest, ext) + actualExt
+						if renameErr := replaceFile(dest, actualDest); renameErr == nil {
+							dest = actualDest
+						}
+					}
+				}
+				duplicate := false
+				if sum, readErr := fileSHA256(dest); readErr == nil {
+					for _, prior := range previews {
+						if filepath.Clean(prior) == filepath.Clean(dest) {
+							continue
+						}
+						if priorSum, e2 := fileSHA256(prior); e2 == nil && priorSum == sum {
+							duplicate = true
+							break
+						}
+					}
+				}
+				if duplicate {
+					_ = os.Remove(dest)
+					r.ImageSkipped++
+				} else {
+					r.ImageSuccess++
+					if !containsResourcePath(previews, dest) {
+						previews = append(previews, dest)
+					}
+					fanartOrdinal++
+				}
+				a.publishMediaResourceResult(task, r)
+			}
+			if previewSourceAccepted(r) {
+				break
+			}
+		}
+	}
+	a.publishMediaResourceResult(task, r)
+	if err := ctx.Err(); err != nil {
+		a.setMediaResourceTaskState(task, "canceled", err.Error())
+	} else {
+		var missing []string
+		if options.WantTrailer && r.TrailerStatus != "success" {
+			missing = append(missing, "trailer was not downloaded")
+		}
+		if options.WantPreviewImages && r.ImageSuccess == 0 && r.ImageSkipped == 0 {
+			missing = append(missing, "preview images were not downloaded")
+		}
+		if len(missing) > 0 {
+			a.setMediaResourceTaskState(task, "failed", strings.Join(missing, "; "))
+		} else {
+			a.setMediaResourceTaskState(task, "completed", "resource backfill completed")
+		}
+	}
+}
+
+func (a *App) publishMediaResourceResult(task *MediaResourceBackfillTask, result *MediaResourceBackfillResult) {
+	a.resourceMu.Lock()
+	copyResult := *result
+	copyResult.Errors = append([]string(nil), result.Errors...)
+	task.Result = &copyResult
+	snapshot := *task
+	snapshot.Result = &copyResult
+	if task.Plan != nil {
+		plan := *task.Plan
+		plan.Candidates = append([]service.ResourceCandidate(nil), task.Plan.Candidates...)
+		snapshot.Plan = &plan
+	}
+	a.resourceMu.Unlock()
+	if a.eventHub != nil {
+		a.eventHub.BroadcastEvent("media-resource-backfill-progress", &snapshot)
+	}
+}
+
+func (a *App) setMediaResourceTaskState(task *MediaResourceBackfillTask, status, message string) {
+	a.resourceMu.Lock()
+	task.Status = status
+	task.Message = message
+	a.resourceMu.Unlock()
+}
+
+func (a *App) finishMediaResourceTask(task *MediaResourceBackfillTask, result *MediaResourceBackfillResult, status, message string) {
+	a.resourceMu.Lock()
+	task.Result = result
+	task.Status = status
+	task.Message = message
+	if a.resourceCancels != nil {
+		delete(a.resourceCancels, task.ID)
+	}
+	if a.resourceActive != nil && a.resourceActive[task.MediaID] == task.ID {
+		delete(a.resourceActive, task.MediaID)
+	}
+	snapshot := *task
+	if result != nil {
+		copyResult := *result
+		copyResult.Errors = append([]string(nil), result.Errors...)
+		snapshot.Result = &copyResult
+	}
+	a.resourceMu.Unlock()
+	if a.eventHub != nil {
+		a.eventHub.BroadcastEvent("media-resource-backfill-finished", &snapshot)
+	}
+}
+
+func resourceImageExtension(raw string) string {
+	lower := strings.ToLower(strings.Split(raw, "?")[0])
+	for _, ext := range []string{".png", ".webp", ".jpeg", ".jpg"} {
+		if strings.HasSuffix(lower, ext) {
+			return ext
+		}
+	}
+	return ".jpg"
+}
+
+func numberedFanartPath(dir string, ordinal int, preferredExt string) string {
+	for _, ext := range []string{".jpg", ".jpeg", ".png", ".webp", ".gif"} {
+		candidate := filepath.Join(dir, fmt.Sprintf("fanart%d%s", ordinal, ext))
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return filepath.Join(dir, fmt.Sprintf("fanart%d%s", ordinal, preferredExt))
+}
+
+func containsResourcePath(paths []string, target string) bool {
+	for _, path := range paths {
+		if filepath.Clean(path) == filepath.Clean(target) {
+			return true
+		}
+	}
+	return false
+}
+
+func resourceProviderHeaders(c service.ResourceCandidate) http.Header {
+	headers := make(http.Header)
+	cookie := ""
+	for _, item := range []struct{ provider, env string }{{"thejavdb_api", "NAVI_THEJAVDB_COOKIE"}, {"javdb_app", "NAVI_JAVDB_COOKIE"}, {"javdb_api", "NAVI_JAVDB_COOKIE"}, {"javdb", "NAVI_JAVDB_COOKIE"}, {"javbus", "NAVI_JAVBUS_COOKIE"}, {"avmoo", "NAVI_AVMOO_COOKIE"}, {"freejavbt", "NAVI_FREEJAVBT_COOKIE"}, {"iqqtv", "NAVI_IQQTV_COOKIE"}, {"libredmm", "NAVI_LIBREDMM_COOKIE"}} {
+		if c.Provider == item.provider {
+			cookie = os.Getenv(item.env)
+			break
+		}
+	}
+	if cookie != "" {
+		headers.Set("Cookie", cookie)
+	}
+	referer := c.DetailURL
+	if referer != "" {
+		headers.Set("Referer", referer)
+	}
+	if c.Provider == "javdb_app" {
+		for key, values := range service.JavDBAppHeaders() {
+			for _, value := range values {
+				headers.Set(key, value)
+			}
+		}
+	}
+	return headers
+}
+
+func fileSHA256(path string) ([32]byte, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return sha256.Sum256(b), nil
+}
+
+func fetchResourceCandidate(ctx context.Context, c service.ResourceCandidate) service.MediaResource {
+	method := http.MethodGet
+	var requestBody io.Reader
+	if c.Provider == "avmoo" {
+		if parsed, parseErr := url.Parse(c.DetailURL); parseErr == nil {
+			movieID := parsed.Query().Get("movieId")
+			if movieID != "" {
+				method = http.MethodPost
+				requestBody = strings.NewReader("movieId=" + url.QueryEscape(movieID))
+			}
+		}
+	}
+	req, e := http.NewRequestWithContext(ctx, method, c.DetailURL, requestBody)
+	if e != nil {
+		return service.MediaResource{Error: e.Error()}
+	}
+	for key, values := range resourceProviderHeaders(c) {
+		for _, value := range values {
+			req.Header.Add(key, value)
+		}
+	}
+	if c.Provider == "avmoo" {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Accept", "application/json")
+	}
+	resp, e := service.NewHTTPClient(30 * time.Second).Do(req)
+	if e != nil {
+		return service.MediaResource{Error: e.Error()}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return service.MediaResource{Error: fmt.Sprintf("login_required: http %s", resp.Status)}
+		}
+		return service.MediaResource{Error: fmt.Sprintf("http %s", resp.Status)}
+	}
+	b, e := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if e != nil {
+		return service.MediaResource{Error: e.Error()}
+	}
+	contentType := strings.ToLower(resp.Header.Get("content-type"))
+	trimmed := strings.TrimSpace(string(b))
+	if strings.Contains(contentType, "mpegurl") || strings.HasPrefix(trimmed, "#EXTM3U") {
+		return service.MediaResource{TrailerURL: c.DetailURL}
+	}
+	if looksLikeLoginPage(trimmed) {
+		return service.MediaResource{Error: "login_required: provider returned a login page"}
+	}
+	isJSON := strings.Contains(contentType, "json") || strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")
+	if isJSON {
+		if c.Provider == "javdb_app" {
+			if r, parseErr := service.ParseJavDBAppResource(b); parseErr == nil {
+				return r
+			}
+		}
+		if c.Provider == "avmoo" {
+			if r, parseErr := service.ParseAioMovieJSON(b); parseErr == nil {
+				return r
+			}
+		}
+		if h, parseErr := service.ParseJavDBAppHLS(b); parseErr == nil {
+			return service.MediaResource{TrailerURL: h}
+		}
+		if r, parseErr := service.ParseTheJavDBJSON(b); parseErr == nil {
+			return r
+		} else {
+			return service.MediaResource{Error: parseErr.Error()}
+		}
+	}
+	r, parseErr := service.ParseProviderHTML(c.Provider, bytes.NewReader(b), c.DetailURL)
+	if parseErr != nil {
+		return service.MediaResource{Error: parseErr.Error()}
+	}
+	return r
+}
+
+func looksLikeLoginPage(body string) bool {
+	body = strings.ToLower(body)
+	return (strings.Contains(body, "<form") || strings.Contains(body, "login")) &&
+		(strings.Contains(body, "password") || strings.Contains(body, "sign in") || strings.Contains(body, "登录"))
 }

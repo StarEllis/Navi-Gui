@@ -1108,6 +1108,11 @@ func previewBelongsToMediaFile(name string, mediaFilePath string, requirePrefix 
 	return strings.HasPrefix(imageStem, mediaStem+"-")
 }
 
+func isTrailerSidecarVideo(name string) bool {
+	stem := strings.ToLower(strings.TrimSuffix(filepath.Base(name), filepath.Ext(name)))
+	return stem == "trailer" || strings.HasSuffix(stem, "-trailer")
+}
+
 func isASCIIDigit(value byte) bool {
 	return value >= '0' && value <= '9'
 }
@@ -1290,7 +1295,7 @@ func collectDirectorySidecarFilesWithReadDir(dir string, readDir func(string) ([
 			})
 		}
 
-		if supportedExts[ext] {
+		if supportedExts[ext] && !isTrailerSidecarVideo(name) {
 			result.videoCount++
 			result.videoFiles = append(result.videoFiles, path)
 			if info, infoErr := os.Lstat(path); infoErr == nil && info.Mode()&os.ModeSymlink != 0 {
@@ -1560,6 +1565,19 @@ func (s *ScannerService) ListMediaFiles(mediaPath string) []string {
 	files := make([]string, len(sidecars.videoFiles))
 	copy(files, sidecars.videoFiles)
 	return files
+}
+
+// InvalidateDirectorySidecars forces the next detail read to observe files
+// added to sidecar folders. Some Windows/network drives do not update the
+// directory modification time when extrafanart files are created.
+func (s *ScannerService) InvalidateDirectorySidecars(dir string) {
+	dir = filepath.Clean(strings.TrimSpace(dir))
+	if s == nil || dir == "." || dir == "" {
+		return
+	}
+	s.sidecarCacheMu.Lock()
+	delete(s.sidecarCache, dir)
+	s.sidecarCacheMu.Unlock()
 }
 
 func (s *ScannerService) CollectMediaPreviews(mediaPath string) []string {

@@ -3,6 +3,7 @@ module navi-desktop
 go 1.23.0
 
 require (
+	github.com/PuerkitoBio/goquery v1.10.2
 	github.com/disintegration/imaging v1.6.2
 	github.com/gen2brain/jpegn v0.5.0
 	github.com/glebarez/sqlite v1.11.0
@@ -20,6 +21,7 @@ require (
 
 require (
 	git.sr.ht/~jackmordaunt/go-toast/v2 v2.0.3 // indirect
+	github.com/andybalholm/cascadia v1.3.3 // indirect
 	github.com/bep/debounce v1.2.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/glebarez/go-sqlite v1.21.2 // indirect
@@ -44,6 +46,7 @@ require (
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/samber/lo v1.49.1 // indirect
+	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/tkrajina/go-reflector v0.5.8 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasttemplate v1.2.2 // indirect

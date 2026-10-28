@@ -1,6 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
     DeleteMedia,
+    BackfillMediaTrailer,
+    PlanMediaResourceBackfill,
+    StartMediaResourceBackfill,
+    GetMediaResourceBackfill,
+    GetLatestMediaResourceBackfill,
+    CancelMediaResourceBackfill,
     GetDetailRecommendations,
     GetMediaDetail,
     GetNFOEditorData,
@@ -19,19 +25,25 @@ import {
     ChevronDown,
     ChevronLeft,
     ChevronRight,
+    Circle,
     Copy,
+    Download,
     Eye,
     EyeOff,
     FilePenLine,
     FileVideo,
+    Film,
     FolderOpen,
     Heart,
+    Image as ImageIcon,
     ImagePlus,
+    Loader2,
     Play,
     Plus,
     RotateCcw,
     Trash2,
     UserRound,
+    X,
 } from 'lucide-react';
 import NFOEditModal from './NFOEditModal';
 import PosterEditorModal from './PosterEditorModal';
@@ -441,6 +453,19 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     const [files, setFiles] = useState<string[]>([]);
     const [previews, setPreviews] = useState<string[]>([]);
     const [trailer, setTrailer] = useState('');
+    const [backfillLoading, setBackfillLoading] = useState(false);
+    const [backfillDialogOpen, setBackfillDialogOpen] = useState(false);
+    const [backfillPlanLoading, setBackfillPlanLoading] = useState(false);
+    const [backfillDialogBusy, setBackfillDialogBusy] = useState(false);
+    const [backfillPlan, setBackfillPlan] = useState<any>(null);
+    const [backfillOptions, setBackfillOptions] = useState({ want_trailer: true, want_preview_images: true, only_missing: true, replace_invalid: false, max_images: 20, max_retries: 1 });
+    const [backfillTask, setBackfillTask] = useState<any>(null);
+    const [backfillToast, setBackfillToast] = useState<{ kind: 'running' | 'success' | 'error'; title: string; meta: string; progress?: number } | null>(null);
+    const [isFullscreen, setIsFullscreen] = useState(Boolean(document.fullscreenElement));
+    const backfillTaskIDRef = useRef<string | null>(null);
+    const backfillPollVersionRef = useRef(0);
+    const backfillAutoCloseRef = useRef<number | null>(null);
+    const backfillImageSuccessRef = useRef(0);
     const prefetchTrailerRef = useRef(createAssetPrefetcher());
     const [recommendations, setRecommendations] = useState<RecommendationGroups>(emptyRecommendations);
     const [recommendationLoading, setRecommendationLoading] = useState(false);
@@ -474,12 +499,274 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
         onStatus?.(message, kind);
     };
 
+    const handleBackfillTrailer = async () => {
+        setBackfillLoading(true);
+        try {
+            // Prefer configured providers; retain manual URL as a useful fallback
+            // for installations that have not configured provider endpoints.
+            let started = false;
+            try {
+                const plan = await PlanMediaResourceBackfill(detail.id, {
+                    want_trailer: true,
+                    want_preview_images: true,
+                    only_missing: true,
+                    replace_invalid: false,
+                    max_images: 0,
+                } as any);
+                if (plan?.candidates?.length) {
+                    const taskID = await StartMediaResourceBackfill(detail.id, {
+                        want_trailer: true,
+                        want_preview_images: true,
+                        only_missing: true,
+                        replace_invalid: false,
+                        max_images: 0,
+                    } as any);
+                    started = true;
+                    showMsg('正在从 provider 获取预告片…', 'info');
+                    let finished = false;
+                    for (let i = 0; i < 900; i += 1) {
+                        const task = await GetMediaResourceBackfill(taskID);
+                        if (task.status === 'completed') {
+                            const result = task.result;
+                            if (result?.trailer_status === 'success' || (result?.image_success || 0) > 0) { finished = true; break; }
+                            throw new Error('provider returned no downloadable resources');
+                        }
+                        if (task.status === 'failed' || task.status === 'canceled') throw new Error(task.message || task.status);
+                        await new Promise((resolve) => window.setTimeout(resolve, 400));
+                    }
+                    if (!finished) throw new Error('resource backfill timed out');
+                }
+            } catch (providerError) {
+                if (started) throw providerError;
+            }
+            if (!started) {
+                const url = window.prompt('未配置可用 provider。输入预告片 MP4 或 HLS 地址');
+                if (!url || !url.trim()) return;
+                showMsg('正在下载预告片…', 'info');
+                await BackfillMediaTrailer(detail.id, url.trim());
+            }
+            const refreshed = await fetchMediaDetailCacheEntry(detail.id);
+            setTrailer(refreshed.trailer || '');
+            setPreviews(refreshed.previews || []);
+            showMsg('预告片下载完成', 'info');
+        } catch (error) {
+            showMsg(`预告片下载失败：${formatError(error)}`, 'error');
+        } finally {
+            setBackfillLoading(false);
+        }
+    };
+
     const clearCodeCopyFeedbackTimer = () => {
         if (codeCopyTimerRef.current !== null) {
             window.clearTimeout(codeCopyTimerRef.current);
             codeCopyTimerRef.current = null;
         }
     };
+
+    const openBackfillDialog = async () => {
+        if (backfillDialogBusy) {
+            setBackfillDialogOpen(true);
+            return;
+        }
+        if (backfillPlanLoading) {
+            return;
+        }
+        setBackfillPlan(null);
+        setBackfillDialogOpen(true);
+        setBackfillPlanLoading(true);
+        try {
+            const plan = await PlanMediaResourceBackfill(detail.id, backfillOptions as any);
+            setBackfillPlan(plan);
+            setBackfillOptions((current) => ({
+                ...current,
+                want_trailer: Boolean(plan?.trailer_missing),
+                want_preview_images: Boolean(plan?.preview_missing),
+            }));
+            setBackfillTask(null);
+        } catch (error) {
+            setBackfillPlan({ media_id: detail.id, code: detail.code || mediaCode || filename, candidates: [], trailer_missing: true, preview_missing: true });
+            showMsg(`无法查询资源候选：${formatError(error)}`, 'error');
+        } finally {
+            setBackfillPlanLoading(false);
+        }
+    };
+
+    const cancelBackfillDialogTask = async () => {
+        const taskID = backfillTaskIDRef.current;
+        if (!taskID) return;
+        try {
+            await CancelMediaResourceBackfill(taskID);
+            setBackfillToast({ kind: 'running', title: '正在停止补齐', meta: '正在等待当前下载结束' });
+        } catch (error) {
+            showMsg(`取消失败：${formatError(error)}`, 'error');
+        }
+    };
+
+    const refreshBackfillMedia = async (mediaID: string) => {
+        removeMediaDetailCacheEntry(mediaID);
+        const refreshed = await fetchMediaDetailCacheEntry(mediaID);
+        setTrailer(refreshed.trailer || '');
+        setPreviews(refreshed.previews || []);
+    };
+
+    const pollBackfillDialogTask = async (taskID: string, mediaID: string, taskOptions: typeof backfillOptions, taskPlan: any) => {
+        const pollVersion = ++backfillPollVersionRef.current;
+        backfillTaskIDRef.current = taskID;
+        setBackfillDialogBusy(true);
+        try {
+            for (let poll = 0; poll < 300; poll += 1) {
+                const task = await GetMediaResourceBackfill(taskID);
+                if (pollVersion !== backfillPollVersionRef.current) return;
+                setBackfillTask(task);
+                const result: any = task.result || {};
+                const completed = (result.image_success || 0) + (result.image_skipped || 0) + (result.image_failed || 0) + (result.trailer_status === 'success' ? 1 : 0);
+                const total = Math.max(1, (taskOptions.want_trailer ? 1 : 0) + (result.image_total || 0));
+                if (result.image_success > backfillImageSuccessRef.current) {
+                    backfillImageSuccessRef.current = result.image_success;
+                    try {
+                        await refreshBackfillMedia(mediaID);
+                    } catch {
+                        // The task result remains authoritative while the next disk refresh is pending.
+                    }
+                }
+                setBackfillToast({
+                    kind: task.status === 'failed' ? 'error' : 'running',
+                    title: task.status === 'failed' ? '补齐失败' : '正在补齐媒体资源',
+                    meta: result.image_success
+                        ? `剧照 已补 ${result.image_success} 张`
+                        : result.trailer_status === 'success'
+                            ? '预告片已完成'
+                            : result.stage === 'provider'
+                                ? '正在查询下一个来源'
+                                : '下载中',
+                    progress: Math.min(1, completed / total),
+                });
+                if (task.status === 'completed') {
+                    const trailerOK = !taskOptions.want_trailer || result.trailer_status === 'success' || result.trailer_status === 'skipped';
+                    const imageOK = !taskOptions.want_preview_images || (result.image_success || 0) + (result.image_skipped || 0) > 0;
+                    const success = trailerOK && imageOK;
+                    setBackfillToast({
+                        kind: success ? 'success' : 'error',
+                        title: success ? '补齐完成' : '补齐未完成',
+                        meta: `新增 ${result.trailer_status === 'success' ? '1 个预告片' : '0 个预告片'}、${result.image_success || 0} 张剧照${result.image_failed ? ` · ${result.image_failed} 张失败` : ''}`,
+                        progress: 1,
+                    });
+                    await refreshBackfillMedia(mediaID);
+                    if (success) {
+                        if (backfillAutoCloseRef.current !== null) window.clearTimeout(backfillAutoCloseRef.current);
+                        backfillAutoCloseRef.current = window.setTimeout(() => {
+                            setBackfillDialogOpen(false);
+                            backfillAutoCloseRef.current = null;
+                        }, 1500);
+                    }
+                    return;
+                }
+                if (task.status === 'failed' || task.status === 'canceled') {
+                    setBackfillToast({
+                        kind: 'error',
+                        title: task.status === 'canceled' ? '已停止补齐' : '补齐失败',
+                        meta: task.message || (task.result?.errors || []).join('；') || '没有可下载的资源',
+                        progress: 1,
+                    });
+                    await refreshBackfillMedia(mediaID).catch(() => undefined);
+                    return;
+                }
+                await new Promise((resolve) => window.setTimeout(resolve, 400));
+            }
+            setBackfillToast({ kind: 'error', title: '补齐超时', meta: '可重新打开明细继续处理' });
+        } catch (error) {
+            if (pollVersion !== backfillPollVersionRef.current) return;
+            setBackfillTask({ status: 'failed', message: formatError(error), result: { errors: [formatError(error)] } });
+            setBackfillToast({ kind: 'error', title: '补齐失败', meta: formatError(error), progress: 1 });
+        } finally {
+            if (pollVersion === backfillPollVersionRef.current) {
+                backfillTaskIDRef.current = null;
+                setBackfillDialogBusy(false);
+            }
+        }
+    };
+
+    const startBackfillDialogTask = async () => {
+        if (!backfillPlan?.candidates?.length || backfillDialogBusy) return;
+        const taskOptions = { ...backfillOptions };
+        const taskPlan = backfillPlan;
+        setBackfillDialogBusy(true);
+        setBackfillTask({
+            status: 'running',
+            result: { trailer_status: taskOptions.want_trailer ? 'waiting' : 'skipped', image_success: 0, image_skipped: 0, image_failed: 0, errors: [] },
+        });
+        backfillImageSuccessRef.current = 0;
+        setBackfillToast({ kind: 'running', title: '正在补齐媒体资源', meta: '准备下载', progress: 0 });
+        try {
+            const taskID = await StartMediaResourceBackfill(detail.id, taskOptions as any);
+            await pollBackfillDialogTask(taskID, detail.id, taskOptions, taskPlan);
+        } catch (error) {
+            setBackfillTask({ status: 'failed', message: formatError(error), result: { errors: [formatError(error)] } });
+            setBackfillToast({ kind: 'error', title: '补齐失败', meta: formatError(error), progress: 1 });
+            setBackfillDialogBusy(false);
+        }
+    };
+
+    useEffect(() => {
+        let active = true;
+        GetLatestMediaResourceBackfill(media.id)
+            .then((task: any) => {
+                if (!active || !task || task.status !== 'running') return;
+                const restoredOptions = {
+                    ...backfillOptions,
+                    ...(task.options || task.Options || {}),
+                };
+                const restoredPlan = task.plan || task.Plan || null;
+                setBackfillOptions(restoredOptions);
+                setBackfillPlan(restoredPlan);
+                setBackfillTask(task);
+                setBackfillDialogBusy(true);
+                backfillImageSuccessRef.current = task.result?.image_success || 0;
+                setBackfillToast({
+                    kind: 'running',
+                    title: '正在补齐媒体资源',
+                    meta: task.result?.image_success ? `剧照 已补 ${task.result.image_success} 张` : '正在恢复补齐进度',
+                    progress: 0,
+                });
+                void pollBackfillDialogTask(task.id, media.id, restoredOptions, restoredPlan);
+            })
+            .catch((error: unknown) => {
+                if (active) console.error(error);
+            });
+        return () => {
+            active = false;
+            backfillPollVersionRef.current += 1;
+        };
+    }, [media.id]);
+
+    useEffect(() => {
+        const onFullscreenChange = () => setIsFullscreen(Boolean(document.fullscreenElement));
+        document.addEventListener('fullscreenchange', onFullscreenChange);
+        return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
+    }, []);
+
+    useEffect(() => {
+        if (backfillToast?.kind !== 'success') return undefined;
+        const timer = window.setTimeout(() => setBackfillToast(null), 3000);
+        return () => window.clearTimeout(timer);
+    }, [backfillToast?.kind, backfillToast?.title, backfillToast?.meta]);
+
+    useEffect(() => {
+        if (!backfillDialogOpen) return undefined;
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                setBackfillDialogOpen(false);
+                return;
+            }
+            if (event.key === 'Enter' && !backfillDialogBusy && backfillPlan?.candidates?.length && (backfillOptions.want_trailer || backfillOptions.want_preview_images)) {
+                event.preventDefault();
+                void startBackfillDialogTask();
+            }
+        };
+        document.addEventListener('keydown', onKeyDown);
+        return () => document.removeEventListener('keydown', onKeyDown);
+    }, [backfillDialogOpen, backfillDialogBusy, backfillPlan, backfillOptions]);
 
     const applyResolvedDetail = (nextDetail: AppMedia) => {
         const knownState = mediaStateByIDRef.current.get(nextDetail.id);
@@ -826,7 +1113,8 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
             console.error(error);
             const message = formatError(error);
             if (message.includes('UnsupportedNFOLayout')) {
-                showMsg('为避免数据丢失，此 NFO 结构暂不支持编辑', 'error');
+                const reason = message.match(/UnsupportedNFOLayout:\s*(.+)$/)?.[1]?.trim();
+                showMsg(`为避免数据丢失，此 NFO 结构暂不支持编辑${reason ? `：${reason}` : ''}`, 'error');
             } else {
                 showMsg(`保存 NFO 失败：${message}`, 'error');
             }
@@ -1081,6 +1369,30 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     const addedDateLabel = formatDateOnly(detail.created_at);
     const hasFileFacts = Boolean(fileSizeLabel || addedDateLabel);
     const isOverviewCollapsible = overviewText.length > 90;
+    const backfillCandidates = backfillPlan?.candidates || [];
+    const backfillResult: any = backfillTask?.result || {};
+    const backfillPlannedCount = backfillOptions.want_preview_images && !backfillPlan?.preview_count
+        ? 0
+        : (backfillOptions.want_trailer && backfillPlan?.trailer_missing ? 1 : 0)
+            + (backfillOptions.want_preview_images && backfillPlan?.preview_count ? Math.max(0, backfillPlan.preview_count - previews.length) : 0);
+    const backfillCanStart = Boolean(backfillCandidates.length && (backfillOptions.want_trailer || backfillOptions.want_preview_images));
+    const backfillIsTerminal = backfillTask?.status === 'completed' || backfillTask?.status === 'failed' || backfillTask?.status === 'canceled';
+    const backfillProgressLabel = backfillResult.image_success
+        ? `已补 ${backfillResult.image_success} 张`
+        : backfillResult.trailer_status === 'success'
+            ? '已补 1 个'
+            : '下载中';
+    const backfillProgressTotal = Math.max(1, (backfillOptions.want_trailer ? 1 : 0) + (backfillResult.image_total || 0));
+    const backfillProgressDone = Math.min(
+        backfillProgressTotal,
+        (backfillResult.image_success || 0) + (backfillResult.image_skipped || 0) + (backfillResult.image_failed || 0) + (backfillResult.trailer_status === 'success' ? 1 : 0),
+    );
+    const backfillProgressPercent = Math.round((backfillProgressDone / backfillProgressTotal) * 100);
+    const backfillPendingSlots = backfillDialogBusy && backfillOptions.want_preview_images && backfillResult.stage === 'preview_images' && backfillResult.image_success === 0 ? 1 : 0;
+    const backfillMissingLabel = [
+        backfillPlan?.trailer_missing ? '缺预告片' : '',
+        backfillPlan?.preview_missing ? '缺剧照' : '',
+    ].filter(Boolean).join('、') || '本地资源已齐全';
 
     return (
         <>
@@ -1451,11 +1763,26 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                     </div>
 
                     <div className="navi-detail-wide">
-                        {previewItems.length > 0 && (
+                        {(previewItems.length > 0 || true) && (
                             <div className="navi-detail-block">
                                 <div className="navi-detail-block-head">
                                     <span className="navi-detail-block-title">预览剧照</span>
                                     <span className="navi-detail-block-meta">{previewItems.length}</span>
+                                    <button
+                                        type="button"
+                                        className={`navi-backfill-entry${backfillDialogBusy ? ' busy' : ''}`}
+                                        onClick={openBackfillDialog}
+                                        disabled={backfillPlanLoading}
+                                        aria-label={backfillDialogBusy ? '查看补齐进度' : '补齐媒体资源'}
+                                    >
+                                        {backfillDialogBusy ? (
+                                            <><Loader2 size={13} className="navi-spin" /><span>{backfillProgressLabel}</span></>
+                                        ) : backfillPlanLoading ? (
+                                            <><Loader2 size={13} className="navi-spin" /><span>查询中</span></>
+                                        ) : (
+                                            <><Download size={13} /><span>补齐</span></>
+                                        )}
+                                    </button>
                                 </div>
                                 <div className="navi-stills-grid">
                                     {previewItems.map((item, index) => (
@@ -1483,6 +1810,11 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                                                 <img src={toLocalAssetUrl(item.path)} alt="preview" loading="lazy" />
                                             )}
                                         </button>
+                                    ))}
+                                    {Array.from({ length: backfillPendingSlots }).map((_, index) => (
+                                        <div key={`backfill-pending-${index}`} className={`navi-still pending${index === 0 ? ' downloading' : ''}`}>
+                                            {index === 0 ? '下载中' : '排队中'}
+                                        </div>
                                     ))}
                                 </div>
                             </div>
@@ -1678,6 +2010,177 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                     onClose={() => !nfoSaving && setShowNFOEditor(false)}
                     onSave={handleSaveNFO}
                 />
+            )}
+
+            {backfillDialogOpen && (
+                <div className="modal-overlay" onClick={() => setBackfillDialogOpen(false)}>
+                    <section className="backfill-modal" role="dialog" aria-modal="true" aria-labelledby="resource-backfill-title" onClick={(event) => event.stopPropagation()}>
+                        <div className="backfill-head">
+                            <div className="backfill-head-copy">
+                                <h2 id="resource-backfill-title">
+                                    {backfillDialogBusy ? <Loader2 size={15} className="navi-spin" /> : backfillIsTerminal && backfillToast?.kind === 'success' ? <Check size={16} /> : null}
+                                    {backfillDialogBusy ? '正在补齐' : backfillIsTerminal && backfillToast?.kind === 'success' ? '补齐完成' : backfillIsTerminal ? '补齐结果' : '补齐媒体资源'}
+                                </h2>
+                                <span className="backfill-head-sub">
+                                    {detail.code || mediaCode || filename}
+                                    {backfillDialogBusy
+                                        ? ` · 已完成 ${backfillProgressDone}${backfillResult.image_total ? ` / ${backfillProgressTotal}` : ''}`
+                                        : backfillIsTerminal
+                                            ? (backfillToast?.meta || backfillTask?.message || '请检查失败项')
+                                            : ` · ${backfillMissingLabel}`}
+                                </span>
+                            </div>
+                            <button type="button" className="backfill-close" onClick={() => setBackfillDialogOpen(false)} aria-label="关闭">
+                                <X size={15} />
+                            </button>
+                        </div>
+
+                        {backfillDialogBusy && (
+                            <div className="backfill-progress-bar" aria-label={`已完成 ${backfillProgressPercent}%`}><i style={{ width: `${backfillProgressPercent}%` }} /></div>
+                        )}
+
+                        <div className="backfill-body">
+                            {backfillPlanLoading ? (
+                                <div className="backfill-query-state" aria-live="polite">
+                                    <Loader2 size={17} className="navi-spin" />
+                                    <span>正在查询可用来源…</span>
+                                </div>
+                            ) : !backfillDialogBusy && !backfillIsTerminal ? (
+                                <>
+                                    <div className="backfill-group">
+                                        <div className="backfill-group-label">补什么</div>
+                                        <div className="backfill-items">
+                                            <label className={`backfill-item${backfillOptions.want_trailer ? ' on' : ''}${backfillPlan?.trailer_missing ? '' : ' done'}`}>
+                                                <input type="checkbox" checked={backfillOptions.want_trailer} disabled={!backfillPlan?.trailer_missing} onChange={(event) => setBackfillOptions((current) => ({ ...current, want_trailer: event.target.checked }))} />
+                                                <span className="backfill-box"><Check size={11} /></span>
+                                                <Film size={14} className="backfill-item-icon" />
+                                                <span className="backfill-item-name">预告片</span>
+                                                <span className={`backfill-item-state${backfillPlan?.trailer_missing ? ' missing' : ''}`}>{backfillPlan?.trailer_missing ? '缺失' : '本地已有'}</span>
+                                            </label>
+                                            <label className={`backfill-item${backfillOptions.want_preview_images ? ' on' : ''}${backfillPlan?.preview_missing ? '' : ' done'}`}>
+                                                <input type="checkbox" checked={backfillOptions.want_preview_images} disabled={!backfillPlan?.preview_missing} onChange={(event) => setBackfillOptions((current) => ({ ...current, want_preview_images: event.target.checked }))} />
+                                                <span className="backfill-box"><Check size={11} /></span>
+                                                <ImageIcon size={14} className="backfill-item-icon" />
+                                                <span className="backfill-item-name">剧照</span>
+                                                <span className={`backfill-item-state${backfillPlan?.preview_missing ? ' missing' : ''}`}>{backfillPlan?.preview_missing ? `本地 ${previews.length} 张` : '本地已有'}</span>
+                                            </label>
+                                        </div>
+                                    </div>
+
+                                    <div className="backfill-group">
+                                        <div className="backfill-group-label">已有文件</div>
+                                        <div className="backfill-segment" role="group" aria-label="已有文件处理方式">
+                                            <button type="button" aria-pressed={backfillOptions.only_missing && !backfillOptions.replace_invalid} onClick={() => setBackfillOptions((current) => ({ ...current, only_missing: true, replace_invalid: false }))}>只补缺失</button>
+                                            <button type="button" aria-pressed={backfillOptions.only_missing && backfillOptions.replace_invalid} onClick={() => setBackfillOptions((current) => ({ ...current, only_missing: true, replace_invalid: true }))}>连带损坏</button>
+                                            <button type="button" aria-pressed={!backfillOptions.only_missing && backfillOptions.replace_invalid} onClick={() => setBackfillOptions((current) => ({ ...current, only_missing: false, replace_invalid: true }))}>全部重下</button>
+                                        </div>
+                                        <div className="backfill-segment-note">
+                                            {backfillOptions.only_missing && !backfillOptions.replace_invalid
+                                                ? '已有且能正常打开的文件不动，只下载缺的文件。'
+                                                : backfillOptions.only_missing
+                                                    ? '缺的下载，已有但打不开的重新下载。'
+                                                    : '忽略本地已有文件，整套重新下载。'}
+                                        </div>
+                                    </div>
+
+                                    <div className="backfill-group">
+                                        <div className="backfill-group-label backfill-group-label-row"><span>来源</span><button type="button" className="backfill-all-sources" disabled={backfillPlanLoading} onClick={() => void openBackfillDialog()}>{backfillPlanLoading ? '查询中…' : '全部来源'}</button></div>
+                                        {backfillCandidates.length ? (
+                                            <div className="backfill-sources">
+                                                {backfillCandidates.map((candidate: any, index: number) => {
+                                                    const provider = candidate.provider || candidate.Provider || '来源';
+                                                    const detailURL = candidate.detail_url || candidate.DetailURL || '';
+                                                    const matchScore = candidate.match_score ?? candidate.MatchScore ?? 0;
+                                                    const exact = matchScore >= 0.99;
+                                                    return (
+                                                        <div className="backfill-source" key={`${provider}-${detailURL}`} aria-label={provider}>
+                                                            <span className="backfill-source-order">{index + 1}</span>
+                                                            <span className="backfill-source-copy">
+                                                                <span className="backfill-source-name">{provider}</span>
+                                                                <span className="backfill-source-meta">{detailURL || '可提供预告片与剧照'}</span>
+                                                            </span>
+                                                            <span className={`backfill-badge${exact ? ' exact' : ''}`}>{exact ? '编号精确匹配' : `相似度 ${Math.round(matchScore * 100)}%`}</span>
+                                                        </div>
+                                                    );
+                                                })}
+                                            </div>
+                                        ) : (
+                                            <div className="backfill-empty">
+                                                <div className="backfill-empty-title">没有找到严格匹配的来源</div>
+                                                <div className="backfill-empty-why">编号是从文件名 <code>{filename}</code> 猜的，可能需要换一个编号。</div>
+                                                <div className="backfill-empty-actions">
+                                                    <button type="button" className="backfill-btn primary" onClick={() => void openBackfillDialog()}>改编号重搜</button>
+                                                    <button type="button" className="backfill-btn" onClick={() => showMsg('将按标题模糊搜索当前配置的来源', 'info')}>按标题模糊搜</button>
+                                                    <button type="button" className="backfill-btn" onClick={() => showMsg('请在海报编辑器中选择本地图片', 'info')}>选本地图片</button>
+                                                </div>
+                                                <div className="backfill-empty-why">已尝试当前配置的来源。可在 设置 → 抓取来源 里加站点或调整顺序。</div>
+                                            </div>
+                                        )}
+                                        {backfillCandidates.length ? <div className="backfill-segment-note">已找到可用来源，可立即开始；补齐时会继续查询其余来源并按接口顺序自动尝试。预告片优先直接 MP4，HLS 仅在直链失败后转成 MP4。</div> : null}
+                                    </div>
+                                </>
+                            ) : (
+                                <div className="backfill-task" aria-live="polite">
+                                    <div className={`backfill-task-row ${backfillResult.trailer_status === 'success' ? 'ok' : backfillDialogBusy && backfillResult.stage === 'trailer' ? 'run' : backfillResult.trailer_status === 'failed' ? 'fail' : ''}`}>
+                                        {backfillResult.trailer_status === 'success' ? <Check size={15} /> : backfillDialogBusy && backfillResult.stage === 'trailer' ? <Loader2 size={15} className="navi-spin" /> : <Circle size={12} />}
+                                        <span className="name">预告片</span>
+                                        <span className="meta">{backfillResult.trailer_status === 'success' ? '已完成' : backfillDialogBusy && backfillResult.stage === 'provider' ? '正在查询来源' : backfillDialogBusy ? '等待下载' : backfillResult.trailer_status || '未完成'}</span>
+                                    </div>
+                                    <div className={`backfill-task-row ${backfillResult.image_success || backfillResult.image_skipped ? 'ok' : backfillDialogBusy && backfillResult.stage === 'preview_images' ? 'run' : backfillResult.image_failed ? 'fail' : ''}`}>
+                                        {backfillResult.image_success || backfillResult.image_skipped ? <Check size={15} /> : backfillDialogBusy && backfillResult.stage === 'preview_images' ? <Loader2 size={15} className="navi-spin" /> : <Circle size={12} />}
+                                        <span className="name">剧照</span>
+                                        <span className="meta">{backfillResult.image_success ? `已补 ${backfillResult.image_success} 张` : backfillDialogBusy && backfillResult.stage === 'provider' ? '正在查询来源' : backfillDialogBusy ? '等待下载' : `${backfillResult.image_failed || 0} 张失败`}</span>
+                                    </div>
+                                    <div className="backfill-task-path" title={currFilePath}>{currFilePath || '资源将保存到媒体所在文件夹'}</div>
+                                    {backfillTask?.result?.errors?.length ? <div className="backfill-task-error">{backfillTask.result.errors.join('；')}</div> : null}
+                                </div>
+                            )}
+                        </div>
+
+                        <div className="backfill-foot">
+                            {backfillDialogBusy ? (
+                                <span className="backfill-hint">关掉弹窗也会继续下</span>
+                            ) : backfillIsTerminal ? (
+                                <button type="button" className="backfill-btn quiet" onClick={() => void OpenMediaFolder(detail.id)}><FolderOpen size={14} />打开目录</button>
+                            ) : (
+                                <span className="backfill-hint">↵ 开始 · esc 关闭</span>
+                            )}
+                            <div className="backfill-foot-actions">
+                                {backfillDialogBusy ? (
+                                    <>
+                                        <button type="button" className="backfill-btn danger" onClick={cancelBackfillDialogTask}>停止</button>
+                                        <button type="button" className="backfill-btn" onClick={() => setBackfillDialogOpen(false)}>后台运行</button>
+                                    </>
+                                ) : backfillIsTerminal ? (
+                                    <>
+                                        <button type="button" className="backfill-btn" onClick={() => { setBackfillTask(null); setBackfillToast(null); void startBackfillDialogTask(); }} disabled={!backfillCanStart}><RotateCcw size={14} />再补一次</button>
+                                        <button type="button" className="backfill-btn primary" onClick={() => setBackfillDialogOpen(false)}>完成</button>
+                                    </>
+                                ) : (
+                                    <>
+                                        <button type="button" className="backfill-btn quiet" onClick={() => setBackfillDialogOpen(false)}>取消</button>
+                                        <button type="button" className="backfill-btn primary" disabled={!backfillCanStart} onClick={() => void startBackfillDialogTask()}>
+                                            <Download size={14} />{backfillPlannedCount > 0 ? `补齐 ${backfillPlannedCount} 个文件` : '开始补齐'}
+                                        </button>
+                                    </>
+                                )}
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            )}
+
+            {backfillToast && !isFullscreen && (
+                <div className={`backfill-toast ${backfillToast.kind}`} role="status">
+                    {backfillToast.kind === 'running' ? (
+                        <svg className="backfill-ring" width="22" height="22" viewBox="0 0 22 22" aria-hidden="true">
+                            <circle cx="11" cy="11" r="8" fill="none" stroke="rgba(255,255,255,.12)" strokeWidth="2" />
+                            <circle cx="11" cy="11" r="8" fill="none" strokeDasharray="50.3" strokeDashoffset={`${50.3 * (1 - (backfillToast.progress || 0))}`} strokeWidth="2" transform="rotate(-90 11 11)" />
+                        </svg>
+                    ) : backfillToast.kind === 'success' ? <Check size={18} /> : <X size={18} />}
+                    <div className="backfill-toast-copy"><div className="title">{backfillToast.title}</div><div className="meta">{backfillToast.meta}</div></div>
+                    <button type="button" className="backfill-toast-btn" onClick={() => setBackfillDialogOpen(true)}>{backfillToast.kind === 'running' ? '明细' : '查看'}</button>
+                </div>
             )}
         </>
     );
