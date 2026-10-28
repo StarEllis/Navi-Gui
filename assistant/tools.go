@@ -92,6 +92,8 @@ type turnState struct {
 	steps []Step
 	media []MediaCard
 	shown map[string]bool
+	// queriedMedia 记下这一轮有没有查出过带 id 列的结果，用来判断是不是找片的问题。
+	queriedMedia bool
 }
 
 func (s *Session) runTool(ctx context.Context, call toolCall, turn *turnState) toolResult {
@@ -100,7 +102,7 @@ func (s *Session) runTool(ctx context.Context, call toolCall, turn *turnState) t
 	var err error
 	switch call.Name {
 	case toolRunSQL:
-		step, content, err = s.runSQL(ctx, call.Input)
+		step, content, err = s.runSQL(ctx, call.Input, turn)
 	case toolShowMedia:
 		step, content, err = s.showMedia(ctx, call.Input, turn)
 	default:
@@ -122,7 +124,7 @@ func (s *Session) recordStep(turn *turnState, step Step) {
 	}
 }
 
-func (s *Session) runSQL(ctx context.Context, raw json.RawMessage) (Step, string, error) {
+func (s *Session) runSQL(ctx context.Context, raw json.RawMessage, turn *turnState) (Step, string, error) {
 	var input struct {
 		SQL string `json:"sql"`
 	}
@@ -133,6 +135,9 @@ func (s *Session) runSQL(ctx context.Context, raw json.RawMessage) (Step, string
 	result, err := s.sandbox.Query(ctx, input.SQL)
 	if err != nil {
 		return step, "", err
+	}
+	if len(result.Rows) > 0 && len(result.Columns) > 0 && strings.EqualFold(result.Columns[0], "id") {
+		turn.queriedMedia = true
 	}
 
 	note := ""

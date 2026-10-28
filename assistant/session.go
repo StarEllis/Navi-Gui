@@ -37,6 +37,9 @@ type backend interface {
 	rollback(mark int)
 }
 
+// showMediaNudge 在模型查到片子却忘了展示时追加一句，让它补调 show_media。
+const showMediaNudge = "（系统提示：你刚才的回答提到了具体影片，但没有调用 show_media，用户看不到卡片。请调用 show_media 展示你回答里提到的那些影片；如果回答其实不涉及具体影片，回复「无」即可。）"
+
 var errBusy = errors.New("上一句还没处理完")
 
 // Session 管着当前打开的会话。同一时间只处理一句话。
@@ -120,6 +123,7 @@ func (s *Session) runTurn(ctx context.Context, b backend, text string) ChatItem 
 	mark := b.mark()
 	b.addUser(text)
 	turn := &turnState{steps: []Step{}, media: []MediaCard{}, shown: map[string]bool{}}
+	pending := ""
 	for round := 0; round < maxRounds; round++ {
 		result, err := b.next(ctx)
 		if err != nil {
@@ -150,8 +154,17 @@ func (s *Session) runTurn(ctx context.Context, b backend, text string) ChatItem 
 			if result.Stop == stopMaxTokens {
 				answer += "\n\n（回答太长，后面被截断了）"
 			}
+			if pending != "" {
+				answer = pending // 催过一次：用第一次的回答，这一轮只为补卡片
+			}
 			if len(turn.media) == 0 {
 				s.showMediaFromAnswer(ctx, answer, turn)
+			}
+			// 查出了片子却既没展示、回答里也没番号：催模型补调一次 show_media，只催一次。
+			if len(turn.media) == 0 && turn.queriedMedia && pending == "" {
+				pending = answer
+				b.addUser(showMediaNudge)
+				continue
 			}
 			return ChatItem{Role: "assistant", Text: answer, Steps: turn.steps, Media: turn.media}
 		}
