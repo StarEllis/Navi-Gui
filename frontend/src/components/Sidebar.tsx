@@ -7,6 +7,7 @@ import {
     Plus,
     Settings,
     Shapes,
+    Sparkles,
     UserRound,
 } from 'lucide-react';
 import { Quit, WindowIsMaximised, WindowMinimise, WindowToggleMaximise } from '../../wailsjs/runtime/runtime';
@@ -19,7 +20,7 @@ interface SidebarProps {
     currentView: string;
     onSelectLib: (lib: any) => void;
     onOpenSettings: () => void;
-    onSelectView: (view: 'libs' | 'actor' | 'genre' | 'watched' | 'favorite') => void;
+    onSelectView: (view: 'libs' | 'actor' | 'genre' | 'watched' | 'favorite' | 'assistant') => void;
     onAddLib: () => void;
     onEditLib: (lib: any) => void;
 }
@@ -29,6 +30,7 @@ const navItems = [
     { key: 'favorite', label: '收藏', icon: Heart },
     { key: 'actor', label: '演员', icon: UserRound },
     { key: 'genre', label: '类别', icon: Shapes },
+    { key: 'assistant', label: '助手', icon: Sparkles },
 ] as const;
 
 const shouldIgnoreHeaderDoubleClick = (target: EventTarget | null) => {

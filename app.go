@@ -28,6 +28,7 @@ import (
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
+	"navi-desktop/assistant"
 	"navi-desktop/config"
 	"navi-desktop/database"
 	"navi-desktop/model"
@@ -81,6 +82,8 @@ type App struct {
 	resourceActive     map[string]string
 	resourceLatest     map[string]string
 	resourceSlots      chan struct{}
+	assistantMu        sync.Mutex
+	assistant          *assistant.Session
 }
 
 const (

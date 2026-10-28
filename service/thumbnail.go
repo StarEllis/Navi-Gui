@@ -151,7 +151,7 @@ func (t *ThumbnailService) EnsurePrimaryArtworkContext(ctx context.Context, medi
 	}
 
 	if len(warnings) > 0 {
-		return changed, fmt.Errorf(strings.Join(warnings, "; "))
+		return changed, errors.New(strings.Join(warnings, "; "))
 	}
 	return changed, nil
 }
@@ -196,7 +196,7 @@ func (t *ThumbnailService) GeneratePreviewsContext(ctx context.Context, media *m
 	}
 
 	if len(warnings) > 0 {
-		return generated, fmt.Errorf(strings.Join(warnings, "; "))
+		return generated, errors.New(strings.Join(warnings, "; "))
 	}
 	return generated, nil
 }

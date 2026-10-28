@@ -32,6 +32,7 @@ import CategoryGrid, {
 } from './components/CategoryGrid';
 import SettingsPage from './components/SettingsPage';
 import TagsPage from './components/TagsPage';
+import AssistantPage from './components/AssistantPage';
 import { FilterConditionBar, FilterPanel, type FilterFacets } from './components/FilterPanel';
 import LibraryModal from './components/LibraryModal';
 import LibraryEditModal from './components/LibraryEditModal';
@@ -90,7 +91,7 @@ import {
     scanEventIdentity,
 } from './utils/scanTaskEvents';
 
-type ViewName = 'libs' | 'settings' | 'actor' | 'genre' | 'watched' | 'favorite' | 'tags';
+type ViewName = 'libs' | 'settings' | 'actor' | 'genre' | 'watched' | 'favorite' | 'tags' | 'assistant';
 type StatusAction = { label: string; onClick: () => void };
 type StatusToast = { text: string; kind: StatusKind; action?: StatusAction } | null;
 type GlobalBackfillToast = {
@@ -124,6 +125,7 @@ const VIEW_LABELS: Record<Exclude<ViewName, 'libs'>, string> = {
     genre: '类别',
     watched: '已看',
     favorite: '收藏',
+    assistant: 'AI 助手',
 };
 
 const FILTER_KIND_LABELS: Record<string, string> = {
@@ -888,6 +890,13 @@ function App() {
             .catch((error: unknown) => showStatus(`无法打开补齐明细：${formatError(error)}`, 'error'));
     }, [handleSelectMedia, showStatus]);
 
+    const openAssistantMedia = useCallback((mediaID: string) => {
+        GetMediaDetail(mediaID)
+            .then((media: any) => {
+                if (media) handleSelectMedia(media);
+            })
+            .catch((error: unknown) => showStatus(`无法打开影片：${formatError(error)}`, 'error'));
+    }, [handleSelectMedia, showStatus]);
 
     const handleDetailMediaChange = useCallback((media: any) => {
         seedMediaDetailCache(media);
@@ -1174,7 +1183,9 @@ function App() {
                 ? 'Navi 1.4.0 · 配置已同步'
                 : view === 'tags'
                     ? `${userTags.length} 个 · 覆盖 ${taggedMediaCount.toLocaleString()} 部`
-                    : (view === 'libs' && !activeFilter && !searchKeyword.trim())
+                    : view === 'assistant'
+                        ? '用大白话查片库'
+                        : (view === 'libs' && !activeFilter && !searchKeyword.trim())
                         ? libraryOverview
                         : `${(headerCount || 0).toLocaleString()} 部`;
     const topBarBackLabel = view === 'settings' ? '返回媒体库' : getTopBarBackLabel(filterReturnContext, view);
@@ -1301,6 +1312,8 @@ function App() {
                 );
             case 'settings':
                 return <SettingsPage />;
+            case 'assistant':
+                return <AssistantPage onOpenMedia={openAssistantMedia} onStatus={showStatus} />;
             case 'libs':
             default:
                 return (
@@ -1349,7 +1362,7 @@ function App() {
                             stats={headerStats}
                             filterKind={activeFilter ? (FILTER_KIND_LABELS[activeFilter.type] || '筛选') : undefined}
                             filterValue={activeFilter?.label}
-                            showSearch={view !== 'settings' && view !== 'tags'}
+                            showSearch={view !== 'settings' && view !== 'tags' && view !== 'assistant'}
                             searchValue={searchKeyword}
                             onSearch={handleSearchChange}
                             searchPlaceholder={searchPlaceholder}

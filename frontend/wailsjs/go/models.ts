@@ -1,3 +1,229 @@
+export namespace assistant {
+	
+	export class MediaCard {
+	    id: string;
+	    code: string;
+	    title: string;
+	    year: number;
+	    resolution: string;
+	    duration: number;
+	    poster_path: string;
+	    backdrop_path: string;
+	    updated_at: string;
+	    file_path: string;
+	    is_favorite: boolean;
+	    is_watched: boolean;
+	    my_rating: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new MediaCard(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.code = source["code"];
+	        this.title = source["title"];
+	        this.year = source["year"];
+	        this.resolution = source["resolution"];
+	        this.duration = source["duration"];
+	        this.poster_path = source["poster_path"];
+	        this.backdrop_path = source["backdrop_path"];
+	        this.updated_at = source["updated_at"];
+	        this.file_path = source["file_path"];
+	        this.is_favorite = source["is_favorite"];
+	        this.is_watched = source["is_watched"];
+	        this.my_rating = source["my_rating"];
+	    }
+	}
+	export class Step {
+	    tool: string;
+	    input: string;
+	    summary: string;
+	    error?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Step(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.tool = source["tool"];
+	        this.input = source["input"];
+	        this.summary = source["summary"];
+	        this.error = source["error"];
+	    }
+	}
+	export class ChatItem {
+	    role: string;
+	    text: string;
+	    steps?: Step[];
+	    media?: MediaCard[];
+	
+	    static createFrom(source: any = {}) {
+	        return new ChatItem(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.role = source["role"];
+	        this.text = source["text"];
+	        this.steps = this.convertValues(source["steps"], Step);
+	        this.media = this.convertValues(source["media"], MediaCard);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class Config {
+	    api_type: string;
+	    base_url: string;
+	    api_key: string;
+	    model: string;
+	    effort: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Config(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.api_type = source["api_type"];
+	        this.base_url = source["base_url"];
+	        this.api_key = source["api_key"];
+	        this.model = source["model"];
+	        this.effort = source["effort"];
+	    }
+	}
+	export class Conversation {
+	    id: string;
+	    title: string;
+	    updated_at: number;
+	    items: ChatItem[];
+	
+	    static createFrom(source: any = {}) {
+	        return new Conversation(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.title = source["title"];
+	        this.updated_at = source["updated_at"];
+	        this.items = this.convertValues(source["items"], ChatItem);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class ConversationSummary {
+	    id: string;
+	    title: string;
+	    updated_at: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new ConversationSummary(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.title = source["title"];
+	        this.updated_at = source["updated_at"];
+	    }
+	}
+	
+	export class Preset {
+	    id: string;
+	    name: string;
+	    api_type: string;
+	    base_url: string;
+	    api_key: string;
+	    models: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new Preset(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.api_type = source["api_type"];
+	        this.base_url = source["base_url"];
+	        this.api_key = source["api_key"];
+	        this.models = source["models"];
+	    }
+	}
+	export class Settings {
+	    presets: Preset[];
+	    active_preset: string;
+	    active_model: string;
+	    effort: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Settings(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.presets = this.convertValues(source["presets"], Preset);
+	        this.active_preset = source["active_preset"];
+	        this.active_model = source["active_model"];
+	        this.effort = source["effort"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+
+}
+
 export namespace gorm {
 	
 	export class DeletedAt {
