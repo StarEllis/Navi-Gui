@@ -150,6 +150,9 @@ func (s *Session) runTurn(ctx context.Context, b backend, text string) ChatItem 
 			if result.Stop == stopMaxTokens {
 				answer += "\n\n（回答太长，后面被截断了）"
 			}
+			if len(turn.media) == 0 {
+				s.showMediaFromAnswer(ctx, answer, turn)
+			}
 			return ChatItem{Role: "assistant", Text: answer, Steps: turn.steps, Media: turn.media}
 		}
 

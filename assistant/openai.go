@@ -96,28 +96,9 @@ func (b *openAIBackend) next(ctx context.Context) (roundResult, error) {
 	if err != nil {
 		return roundResult{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.endpoint, bytes.NewReader(body))
+	data, err := b.post(ctx, body)
 	if err != nil {
 		return roundResult{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+b.apiKey)
-
-	resp, err := b.httpClient.Do(req)
-	if err != nil {
-		return roundResult{}, err
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return roundResult{}, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		snippet := strings.TrimSpace(string(data))
-		if len(snippet) > 500 {
-			snippet = snippet[:500] + "…"
-		}
-		return roundResult{}, fmt.Errorf("接口返回 %d：%s", resp.StatusCode, snippet)
 	}
 
 	var parsed openAIResponse
@@ -170,6 +151,55 @@ func (b *openAIBackend) next(ctx context.Context) (roundResult, error) {
 		result.Stop = stopDone
 	}
 	return result, nil
+}
+
+// 中转站偶尔断线（EOF、连接被重置）或上游临时不可用（429/502/503/504），
+// 这些重发一次多半就好；其他错误（Key 不对、模型不存在）重发也没用，直接报。
+var openAIRetryDelays = []time.Duration{time.Second, 3 * time.Second}
+
+func (b *openAIBackend) post(ctx context.Context, body []byte) ([]byte, error) {
+	for attempt := 0; ; attempt++ {
+		data, retryable, err := b.postOnce(ctx, body)
+		if err == nil || !retryable || attempt >= len(openAIRetryDelays) || ctx.Err() != nil {
+			return data, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(openAIRetryDelays[attempt]):
+		}
+	}
+}
+
+func (b *openAIBackend) postOnce(ctx context.Context, body []byte) ([]byte, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+b.apiKey)
+
+	resp, err := b.httpClient.Do(req)
+	if err != nil {
+		return nil, true, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, true, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		snippet := strings.TrimSpace(string(data))
+		if len(snippet) > 500 {
+			snippet = snippet[:500] + "…"
+		}
+		switch resp.StatusCode {
+		case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return nil, true, fmt.Errorf("接口返回 %d：%s", resp.StatusCode, snippet)
+		}
+		return nil, false, fmt.Errorf("接口返回 %d：%s", resp.StatusCode, snippet)
+	}
+	return data, false, nil
 }
 
 func (b *openAIBackend) addToolResults(results []toolResult) {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -250,4 +251,78 @@ WHERE m.deleted_at IS NULL AND m.id IN (`+placeholders+`)`, args...)
 		}
 	}
 	return cards, nil
+}
+
+// 番号的样子：FC2-1234567 / FC2-PPV-1234567，或 2~6 个字母加 2~5 位数字（SSIS-338）。
+var mediaCodePattern = regexp.MustCompile(`(?i)\b(?:FC2-(?:PPV-)?\d{5,8}|[A-Z]{2,6}-\d{2,5})\b`)
+
+// showMediaFromAnswer 兜底：模型回答里点了番号却忘了调用 show_media，
+// 就按番号把片库里有的卡片补上，免得界面上一张卡都没有。
+func (s *Session) showMediaFromAnswer(ctx context.Context, answer string, turn *turnState) {
+	var codes []string
+	seen := map[string]bool{}
+	for _, code := range mediaCodePattern.FindAllString(answer, -1) {
+		code = strings.ToUpper(code)
+		if !seen[code] {
+			seen[code] = true
+			codes = append(codes, code)
+		}
+	}
+	if len(codes) == 0 {
+		return
+	}
+	ids, err := s.sandbox.mediaIDsByCode(ctx, codes)
+	if err != nil || len(ids) == 0 {
+		return
+	}
+	if len(ids) > maxShowMedia {
+		ids = ids[:maxShowMedia]
+	}
+	cards, err := s.sandbox.loadMediaCards(ctx, ids, s.userID)
+	if err != nil || len(cards) == 0 {
+		return
+	}
+	turn.media = append(turn.media, cards...)
+	s.recordStep(turn, Step{
+		Tool:    toolShowMedia,
+		Input:   fmt.Sprintf("%d 部", len(cards)),
+		Summary: fmt.Sprintf("按回答里的番号补上 %d 部", len(cards)),
+	})
+}
+
+// mediaIDsByCode 按番号找片，顺序跟传入一致；同一番号有多个文件时只取一个。
+func (s *Sandbox) mediaIDsByCode(ctx context.Context, codes []string) ([]string, error) {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(codes)), ",")
+	args := make([]any, len(codes))
+	for i, code := range codes {
+		args[i] = code
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT UPPER(code), id FROM media
+WHERE deleted_at IS NULL AND UPPER(code) IN (`+placeholders+`)
+ORDER BY library_added_at DESC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	byCode := map[string]string{}
+	for rows.Next() {
+		var code, id string
+		if err := rows.Scan(&code, &id); err != nil {
+			return nil, err
+		}
+		if _, ok := byCode[code]; !ok {
+			byCode[code] = id
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(byCode))
+	for _, code := range codes {
+		if id, ok := byCode[code]; ok {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
 }
