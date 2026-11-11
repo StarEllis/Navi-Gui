@@ -1195,7 +1195,7 @@ function App() {
         : view === 'genre'
             ? `${categoryStats.total} 个类别`
             : view === 'settings'
-                ? 'Navi 1.4.0 · 配置已同步'
+                ? 'Navi 3.0 · 配置已同步'
                 : view === 'tags'
                     ? `${userTags.length} 个 · 覆盖 ${taggedMediaCount.toLocaleString()} 部`
                     : view === 'assistant'
