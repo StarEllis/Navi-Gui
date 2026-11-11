@@ -160,6 +160,7 @@ type turnState struct {
 	queriedMedia bool
 	changes      []Proposal
 	permission   string
+	embedding    EmbeddingConfig
 }
 
 func (s *Session) runTool(ctx context.Context, call toolCall, turn *turnState) toolResult {
@@ -177,6 +178,8 @@ func (s *Session) runTool(ctx context.Context, call toolCall, turn *turnState) t
 		step, content, err = s.openFolder(call.Input)
 	case toolPlayMedia:
 		step, content, err = s.playMedia(ctx, call.Input, turn)
+	case toolSemanticSearch:
+		step, content, err = s.semanticSearch(ctx, call.Input, turn)
 	default:
 		step = Step{Tool: call.Name}
 		err = fmt.Errorf("没有这个工具：%s", call.Name)

@@ -55,6 +55,8 @@ type Session struct {
 	Executor Executor
 	// OnConfirm 在要用户确认修改时触发，界面据此弹出确认卡片。
 	OnConfirm func(Proposal)
+	// Index 是按意思找片用的坐标；为 nil 时没有这个功能。
+	Index *VectorIndex
 
 	mu         sync.Mutex
 	busy       bool
@@ -106,9 +108,11 @@ func (s *Session) SendAbout(ctx context.Context, cfg Config, text, mediaID strin
 	}
 	conv := s.conv
 	// 换了接口、地址、模型或 Key：新开一份历史，把之前的问答当纯文本补进去。
-	key := strings.Join([]string{cfg.APIType, cfg.BaseURL, cfg.Model, cfg.APIKey}, "\x00")
+	// 配好向量模型、坐标也建好了，才把按意思找片的工具给模型。开关变了也要换一份历史。
+	semantic := s.Index != nil && cfg.Embedding.Enabled() && s.Index.Usable(cfg.Embedding.withDefaults().Model)
+	key := strings.Join([]string{cfg.APIType, cfg.BaseURL, cfg.Model, cfg.APIKey, fmt.Sprint(semantic)}, "\x00")
 	if s.backend == nil || s.backendKey != key {
-		s.backend = newBackend(cfg)
+		s.backend = newBackend(cfg, toolsFor(semantic))
 		s.backendKey = key
 		seedHistory(s.backend, conv.Items)
 	}
@@ -136,7 +140,7 @@ func (s *Session) SendAbout(ctx context.Context, cfg Config, text, mediaID strin
 	if err := cfg.validate(); err != nil {
 		reply = ChatItem{Role: "error", Text: err.Error()}
 	} else {
-		reply = s.runTurn(ctx, b, questionFor(question), normalizePermission(cfg.Permission))
+		reply = s.runTurn(ctx, b, questionFor(question), cfg)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -150,16 +154,17 @@ func (s *Session) SendAbout(ctx context.Context, cfg Config, text, mediaID strin
 // runTurn 处理完一句话后，把这句话里的工具调用、查询结果、补卡片的催促都截掉，
 // 只留问答的纯文本（和重开会话时一样）：历史不会被查询结果越撑越大，
 // 中途出错但已经改过东西时，模型也记得改过什么。
-func (s *Session) runTurn(ctx context.Context, b backend, text, permission string) ChatItem {
+func (s *Session) runTurn(ctx context.Context, b backend, text string, cfg Config) ChatItem {
 	mark := b.mark()
-	item := s.runRounds(ctx, b, text, permission)
+	item := s.runRounds(ctx, b, text, cfg)
 	b.rollback(mark)
 	replayTurn(b, text, item)
 	return item
 }
 
-func (s *Session) runRounds(ctx context.Context, b backend, text, permission string) ChatItem {
-	turn := &turnState{steps: []Step{}, media: []MediaCard{}, shown: map[string]bool{}, permission: permission}
+func (s *Session) runRounds(ctx context.Context, b backend, text string, cfg Config) ChatItem {
+	permission := normalizePermission(cfg.Permission)
+	turn := &turnState{steps: []Step{}, media: []MediaCard{}, shown: map[string]bool{}, permission: permission, embedding: cfg.Embedding}
 	// 这句话中途失败，但前面已经改过东西了：得在出错消息里说清楚，不能当没发生。
 	fail := func(message string) ChatItem {
 		item := ChatItem{Role: "error", Text: message, Changes: turn.changes}
@@ -310,9 +315,9 @@ func copyConversation(conv *Conversation) *Conversation {
 	return &c
 }
 
-func newBackend(cfg Config) backend {
+func newBackend(cfg Config, specs []toolSpec) backend {
 	if cfg.APIType == APITypeOpenAI {
-		return newOpenAIBackend(cfg)
+		return newOpenAIBackend(cfg, specs)
 	}
-	return newAnthropicBackend(cfg)
+	return newAnthropicBackend(cfg, specs)
 }

@@ -38,6 +38,8 @@ type Config struct {
 	Effort string `json:"effort"`
 	// Permission 是 readonly / edit / full，空当 edit。
 	Permission string `json:"permission"`
+	// Embedding 是按意思找片用的向量模型，没填 Key 就不开这个功能。
+	Embedding EmbeddingConfig `json:"embedding"`
 }
 
 // Preset 是一套命名的接口配置，下面挂着拉到或手填的模型。
@@ -57,6 +59,8 @@ type Settings struct {
 	ActiveModel  string   `json:"active_model"`
 	Effort       string   `json:"effort"`
 	Permission   string   `json:"permission"`
+	// Embedding 跟聊天预设分开：聊天换哪个预设，按意思找片都用这一组。
+	Embedding EmbeddingConfig `json:"embedding"`
 }
 
 func LoadSettings(path string) (Settings, error) {
@@ -127,6 +131,7 @@ func (s Settings) normalized() Settings {
 		s.Effort = ""
 	}
 	s.Permission = normalizePermission(s.Permission)
+	s.Embedding = s.Embedding.normalized()
 	for i, p := range s.Presets {
 		p.ID = strings.TrimSpace(p.ID)
 		p.Name = strings.TrimSpace(p.Name)
@@ -182,7 +187,7 @@ func (s Settings) Active() (Config, error) {
 	if preset == nil {
 		return Config{}, errors.New("还没有接口预设，先到助手设置里新建一个")
 	}
-	cfg := Config{APIType: preset.APIType, BaseURL: preset.BaseURL, APIKey: preset.APIKey, Model: s.ActiveModel, Effort: s.Effort, Permission: s.Permission}
+	cfg := Config{APIType: preset.APIType, BaseURL: preset.BaseURL, APIKey: preset.APIKey, Model: s.ActiveModel, Effort: s.Effort, Permission: s.Permission, Embedding: s.Embedding}
 	return cfg, cfg.validate()
 }
 

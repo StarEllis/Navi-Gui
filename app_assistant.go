@@ -12,11 +12,14 @@ import (
 const (
 	assistantStepEvent    = "assistant-step"
 	assistantConfirmEvent = "assistant-confirm"
+	assistantIndexEvent   = "assistant-index-progress"
 )
 
 var (
 	assistantSettingsPath     = config.DataPath("assistant.json")
 	assistantConversationsDir = config.DataPath("assistant", "conversations")
+	// 按意思找片的坐标单独存一个文件，不往影片表里塞。
+	assistantVectorsPath = config.DataPath("assistant", "vectors.gob")
 )
 
 func (a *App) GetAssistantSettings() (*assistant.Settings, error) {
@@ -145,9 +148,69 @@ func (a *App) assistantSession() (*assistant.Session, error) {
 		wailsRuntime.EventsEmit(a.ctx, assistantStepEvent, step)
 	}
 	session.Executor = assistantExecutor{app: a}
+	session.Index = assistant.NewVectorIndex(assistantVectorsPath)
 	session.OnConfirm = func(proposal assistant.Proposal) {
 		wailsRuntime.EventsEmit(a.ctx, assistantConfirmEvent, proposal)
 	}
 	a.assistant = session
 	return session, nil
+}
+
+// AssistantTestEmbedding 用编辑中的向量模型设置发一句话试试（不需要先保存），返回坐标的维数。
+func (a *App) AssistantTestEmbedding(cfg *assistant.EmbeddingConfig) (int, error) {
+	if cfg == nil {
+		return 0, errors.New("设置为空")
+	}
+	return assistant.TestEmbedding(a.ctx, *cfg)
+}
+
+// AssistantIndexStatus 返回按意思找片的坐标建到哪一步了。
+func (a *App) AssistantIndexStatus() (*assistant.IndexStatus, error) {
+	session, err := a.assistantSession()
+	if err != nil {
+		return nil, err
+	}
+	settings, err := assistant.LoadSettings(assistantSettingsPath)
+	if err != nil {
+		return nil, err
+	}
+	status, err := session.IndexStatus(a.ctx, settings.Embedding)
+	return &status, err
+}
+
+// AssistantBuildIndex 在后台建坐标，已经建好又没变的不重建。
+// 每建完一批推一次 assistant-index-progress（只有 building、done、todo），建完再推一次完整状态。
+func (a *App) AssistantBuildIndex() error {
+	session, err := a.assistantSession()
+	if err != nil {
+		return err
+	}
+	settings, err := assistant.LoadSettings(assistantSettingsPath)
+	if err != nil {
+		return err
+	}
+	if !settings.Embedding.Enabled() {
+		return errors.New("先填向量/嵌入模型的 API Key 并保存")
+	}
+	if status, err := session.IndexStatus(a.ctx, settings.Embedding); err != nil {
+		return err
+	} else if status.Building {
+		return errors.New("坐标正在建，等这次建完再说")
+	}
+	go func() {
+		_ = session.BuildIndex(a.ctx, settings.Embedding, func(done, todo int) {
+			wailsRuntime.EventsEmit(a.ctx, assistantIndexEvent, assistant.IndexStatus{Building: true, Done: done, Todo: todo})
+		})
+		if status, err := session.IndexStatus(a.ctx, settings.Embedding); err == nil {
+			wailsRuntime.EventsEmit(a.ctx, assistantIndexEvent, status)
+		}
+	}()
+	return nil
+}
+
+// AssistantStopIndex 停掉正在建的坐标，建好的部分会留下。
+func (a *App) AssistantStopIndex() {
+	if session := a.currentAssistantSession(); session != nil {
+		session.StopIndex()
+	}
 }

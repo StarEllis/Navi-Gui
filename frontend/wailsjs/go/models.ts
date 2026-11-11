@@ -136,6 +136,22 @@ export namespace assistant {
 		    return a;
 		}
 	}
+	export class EmbeddingConfig {
+	    base_url: string;
+	    api_key: string;
+	    model: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new EmbeddingConfig(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.base_url = source["base_url"];
+	        this.api_key = source["api_key"];
+	        this.model = source["model"];
+	    }
+	}
 	export class Config {
 	    api_type: string;
 	    base_url: string;
@@ -143,6 +159,7 @@ export namespace assistant {
 	    model: string;
 	    effort: string;
 	    permission: string;
+	    embedding: EmbeddingConfig;
 	
 	    static createFrom(source: any = {}) {
 	        return new Config(source);
@@ -156,7 +173,26 @@ export namespace assistant {
 	        this.model = source["model"];
 	        this.effort = source["effort"];
 	        this.permission = source["permission"];
+	        this.embedding = this.convertValues(source["embedding"], EmbeddingConfig);
 	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
 	export class Conversation {
 	    id: string;
@@ -211,6 +247,41 @@ export namespace assistant {
 	    }
 	}
 	
+	export class IndexStatus {
+	    model: string;
+	    configured_model: string;
+	    dims: number;
+	    total: number;
+	    indexed: number;
+	    pending: number;
+	    model_mismatch: boolean;
+	    building: boolean;
+	    done: number;
+	    todo: number;
+	    error: string;
+	    updated_at: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new IndexStatus(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.model = source["model"];
+	        this.configured_model = source["configured_model"];
+	        this.dims = source["dims"];
+	        this.total = source["total"];
+	        this.indexed = source["indexed"];
+	        this.pending = source["pending"];
+	        this.model_mismatch = source["model_mismatch"];
+	        this.building = source["building"];
+	        this.done = source["done"];
+	        this.todo = source["todo"];
+	        this.error = source["error"];
+	        this.updated_at = source["updated_at"];
+	    }
+	}
+	
 	export class Preset {
 	    id: string;
 	    name: string;
@@ -240,6 +311,7 @@ export namespace assistant {
 	    active_model: string;
 	    effort: string;
 	    permission: string;
+	    embedding: EmbeddingConfig;
 	
 	    static createFrom(source: any = {}) {
 	        return new Settings(source);
@@ -252,6 +324,7 @@ export namespace assistant {
 	        this.active_model = source["active_model"];
 	        this.effort = source["effort"];
 	        this.permission = source["permission"];
+	        this.embedding = this.convertValues(source["embedding"], EmbeddingConfig);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {

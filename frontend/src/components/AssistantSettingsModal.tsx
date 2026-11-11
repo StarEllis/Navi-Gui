@@ -1,7 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Check, Eye, EyeOff, Plus, RefreshCw, Trash2, X } from 'lucide-react';
-import { ListAssistantModels, SaveAssistantSettings } from '../../wailsjs/go/main/App';
+import { Check, Eye, EyeOff, Plus, RefreshCw, Sparkles, Trash2, X } from 'lucide-react';
+import { AssistantIndexStatus, ListAssistantModels, SaveAssistantSettings } from '../../wailsjs/go/main/App';
 import { assistant } from '../../wailsjs/go/models';
+import { EventsOn } from '../../wailsjs/runtime/runtime';
+import AssistantSemanticPanel, { indexPhase, indexPhaseLabel } from './AssistantSemanticPanel';
+
+// 左边列表里"按意思找片"那一项的编号，不会跟预设撞。
+const SEMANTIC_ID = '__semantic';
 
 const API_TYPES = [
     { value: 'openai', label: 'OpenAI 兼容', hint: 'DeepSeek、OpenRouter、中转站等' },
@@ -42,12 +47,41 @@ const AssistantSettingsModal: React.FC<Props> = ({ settings, onClose, onSaved })
     const [notice, setNotice] = useState<Notice>(null);
     const [dirty, setDirty] = useState(false);
     const noticeTimer = useRef<number | null>(null);
+    const [embedding, setEmbedding] = useState<assistant.EmbeddingConfig>(() => assistant.EmbeddingConfig.createFrom(
+        settings.embedding || { base_url: '', api_key: '', model: '' },
+    ));
+    const [indexStatus, setIndexStatus] = useState<assistant.IndexStatus | null>(null);
+    const [indexError, setIndexError] = useState('');
 
     const selected = draft.find((p) => p.id === selectedID) || null;
 
     useEffect(() => () => {
         if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
     }, []);
+
+    const refreshIndexStatus = () => {
+        AssistantIndexStatus()
+            .then((status) => {
+                setIndexStatus(status);
+                setIndexError('');
+            })
+            .catch((error: unknown) => setIndexError(`读不到坐标状态：${formatError(error)}`));
+    };
+
+    useEffect(() => {
+        refreshIndexStatus();
+        // 建的过程中只推进度；建完推一次完整状态，整个换掉。
+        return EventsOn('assistant-index-progress', (next: assistant.IndexStatus) => {
+            setIndexStatus((prev) => (next.building
+                ? assistant.IndexStatus.createFrom({ ...(prev || {}), building: true, done: next.done, todo: next.todo, error: '' })
+                : next));
+        });
+    }, []);
+
+    const updateEmbedding = (patch: Partial<assistant.EmbeddingConfig>) => {
+        setEmbedding((current) => assistant.EmbeddingConfig.createFrom({ ...current, ...patch }));
+        setDirty(true);
+    };
 
     useEffect(() => {
         setConfirmDelete(false);
@@ -126,9 +160,11 @@ const AssistantSettingsModal: React.FC<Props> = ({ settings, onClose, onSaved })
                 presets: draft,
                 active_preset: settings.active_preset,
                 active_model: settings.active_model,
+                embedding,
             }));
             onSaved(saved);
             setDirty(false);
+            refreshIndexStatus(); // 换了模型的话，状态要重新对一遍
             flash({ kind: 'ok', text: '已保存' });
         } catch (error) {
             flash({ kind: 'error', text: `保存失败：${formatError(error)}` });
@@ -171,9 +207,37 @@ const AssistantSettingsModal: React.FC<Props> = ({ settings, onClose, onSaved })
                             <Plus size={14} />
                             新建预设
                         </button>
+
+                        <div className="asst-preset-section">功能</div>
+                        <button
+                            type="button"
+                            className={`asst-preset-item asst-semantic-item ${selectedID === SEMANTIC_ID ? 'active' : ''}`.trim()}
+                            onClick={() => setSelectedID(SEMANTIC_ID)}
+                        >
+                            <span className="asst-preset-name"><Sparkles size={13} />按意思找片</span>
+                            <span className={`asst-preset-meta phase-${indexPhase(embedding, indexStatus)}`}>
+                                <i />
+                                {indexPhaseLabel(indexPhase(embedding, indexStatus), indexStatus)}
+                            </span>
+                        </button>
                     </div>
 
-                    {selected ? (
+                    {selectedID === SEMANTIC_ID ? (
+                        <AssistantSemanticPanel
+                            embedding={embedding}
+                            onChange={updateEmbedding}
+                            status={indexStatus}
+                            statusError={indexError}
+                            dirty={dirty}
+                            onBuildStarted={() => setIndexStatus((prev) => assistant.IndexStatus.createFrom({
+                                ...(prev || {}),
+                                building: true,
+                                done: 0,
+                                todo: prev?.model_mismatch ? prev.total : (prev?.pending || 0),
+                                error: '',
+                            }))}
+                        />
+                    ) : selected ? (
                         <div className="asst-preset-editor">
                             <label className="asst-field">
                                 <span>名称</span>

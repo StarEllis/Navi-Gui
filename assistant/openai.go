@@ -23,13 +23,13 @@ type openAIBackend struct {
 	history    []map[string]any
 }
 
-func newOpenAIBackend(cfg Config) *openAIBackend {
+func newOpenAIBackend(cfg Config, specs []toolSpec) *openAIBackend {
 	baseURL := cfg.BaseURL
 	if baseURL == "" {
 		baseURL = defaultOpenAIBaseURL
 	}
-	tools := make([]map[string]any, 0, len(toolSpecs))
-	for _, spec := range toolSpecs {
+	tools := make([]map[string]any, 0, len(specs))
+	for _, spec := range specs {
 		tools = append(tools, map[string]any{
 			"type": "function",
 			"function": map[string]any{

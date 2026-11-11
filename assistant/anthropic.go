@@ -42,15 +42,15 @@ type anthropicBackend struct {
 	history  []anthropic.MessageParam
 }
 
-func newAnthropicBackend(cfg Config) *anthropicBackend {
+func newAnthropicBackend(cfg Config, specs []toolSpec) *anthropicBackend {
 	options := []option.RequestOption{option.WithAPIKey(cfg.APIKey)}
 	official := cfg.BaseURL == "" || strings.Contains(cfg.BaseURL, "api.anthropic.com")
 	if cfg.BaseURL != "" {
 		options = append(options, option.WithBaseURL(cfg.BaseURL))
 	}
 
-	tools := make([]anthropic.ToolUnionParam, 0, len(toolSpecs))
-	for _, spec := range toolSpecs {
+	tools := make([]anthropic.ToolUnionParam, 0, len(specs))
+	for _, spec := range specs {
 		tool := anthropic.ToolParam{
 			Name:        spec.Name,
 			Description: anthropic.String(spec.Description),

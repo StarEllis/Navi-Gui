@@ -6,11 +6,15 @@ import {repository} from '../models';
 import {model} from '../models';
 import {service} from '../models';
 
+export function AssistantBuildIndex():Promise<void>;
+
 export function AssistantCurrentConversation():Promise<assistant.Conversation>;
 
 export function AssistantDecide(arg1:string,arg2:boolean):Promise<void>;
 
 export function AssistantDeleteConversation(arg1:string):Promise<void>;
+
+export function AssistantIndexStatus():Promise<assistant.IndexStatus>;
 
 export function AssistantListConversations():Promise<Array<assistant.ConversationSummary>>;
 
@@ -23,6 +27,10 @@ export function AssistantPendingProposal():Promise<assistant.Proposal>;
 export function AssistantSend(arg1:string,arg2:string):Promise<assistant.Conversation>;
 
 export function AssistantStop():Promise<void>;
+
+export function AssistantStopIndex():Promise<void>;
+
+export function AssistantTestEmbedding(arg1:assistant.EmbeddingConfig):Promise<number>;
 
 export function BackfillActorAvatars(arg1:string):Promise<main.ActorAvatarBackfillResult>;
 
