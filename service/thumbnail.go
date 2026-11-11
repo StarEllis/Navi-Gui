@@ -131,7 +131,7 @@ func (t *ThumbnailService) EnsurePrimaryArtworkContext(ctx context.Context, medi
 
 	var warnings []string
 	posterPath := t.generatedPosterPath(media)
-	if err := t.captureFrameContext(ctx, media.FilePath, mediaDurationSeconds(media)*0.25, posterPath, thumbnailPrimaryHeight); err != nil {
+	if err := t.captureFrameContext(ctx, media.FilePath, mediaDurationSeconds(media)*0.25, posterPath, thumbnailPrimaryHeight, true); err != nil {
 		warnings = append(warnings, fmt.Sprintf("poster: %v", err))
 	} else if fileExists(posterPath) {
 		if !samePath(media.PosterPath, posterPath) {
@@ -141,7 +141,7 @@ func (t *ThumbnailService) EnsurePrimaryArtworkContext(ctx context.Context, medi
 	}
 
 	backdropPath := t.generatedBackdropPath(media)
-	if err := t.captureFrameContext(ctx, media.FilePath, mediaDurationSeconds(media)*0.58, backdropPath, thumbnailPrimaryHeight); err != nil {
+	if err := t.captureFrameContext(ctx, media.FilePath, mediaDurationSeconds(media)*0.58, backdropPath, thumbnailPrimaryHeight, false); err != nil {
 		warnings = append(warnings, fmt.Sprintf("fanart: %v", err))
 	} else if fileExists(backdropPath) {
 		if !samePath(media.BackdropPath, backdropPath) {
@@ -186,7 +186,7 @@ func (t *ThumbnailService) GeneratePreviewsContext(ctx context.Context, media *m
 		if fileExists(outputPath) {
 			continue
 		}
-		if err := t.captureFrameContext(ctx, media.FilePath, seekSeconds, outputPath, thumbnailPreviewHeight); err != nil {
+		if err := t.captureFrameContext(ctx, media.FilePath, seekSeconds, outputPath, thumbnailPreviewHeight, false); err != nil {
 			warnings = append(warnings, fmt.Sprintf("preview-%02d: %v", index+1, err))
 			continue
 		}
@@ -436,10 +436,10 @@ func (t *ThumbnailService) resolveThumbnailState(media *model.Media, sidecars *d
 }
 
 func (t *ThumbnailService) captureFrame(mediaPath string, seekSeconds float64, outputPath string, outputHeight int) error {
-	return t.captureFrameContext(context.Background(), mediaPath, seekSeconds, outputPath, outputHeight)
+	return t.captureFrameContext(context.Background(), mediaPath, seekSeconds, outputPath, outputHeight, false)
 }
 
-func (t *ThumbnailService) captureFrameContext(ctx context.Context, mediaPath string, seekSeconds float64, outputPath string, outputHeight int) error {
+func (t *ThumbnailService) captureFrameContext(ctx context.Context, mediaPath string, seekSeconds float64, outputPath string, outputHeight int, portrait bool) error {
 	if t == nil {
 		return fmt.Errorf("thumbnail service is unavailable")
 	}
@@ -461,12 +461,12 @@ func (t *ThumbnailService) captureFrameContext(ctx context.Context, mediaPath st
 	}
 	key := filepath.Clean(outputPath)
 	_, err := t.ffmpegGovernor.runKeyed(ctx, key, func(processCtx context.Context) ([]byte, error) {
-		return nil, t.captureFrameUnshared(processCtx, mediaPath, seekSeconds, outputPath, outputHeight)
+		return nil, t.captureFrameUnshared(processCtx, mediaPath, seekSeconds, outputPath, outputHeight, portrait)
 	})
 	return err
 }
 
-func (t *ThumbnailService) captureFrameUnshared(ctx context.Context, mediaPath string, seekSeconds float64, outputPath string, outputHeight int) error {
+func (t *ThumbnailService) captureFrameUnshared(ctx context.Context, mediaPath string, seekSeconds float64, outputPath string, outputHeight int, portrait bool) error {
 	if strings.TrimSpace(mediaPath) == "" || strings.TrimSpace(outputPath) == "" {
 		return fmt.Errorf("empty media or output path")
 	}
@@ -505,7 +505,7 @@ func (t *ThumbnailService) captureFrameUnshared(ctx context.Context, mediaPath s
 			"-ss", strconv.FormatFloat(maxFloat(seekSeconds, 0), 'f', 3, 64),
 			"-i", mediaPath,
 			"-frames:v", "1",
-			"-vf", fmt.Sprintf("scale=-2:%d:force_original_aspect_ratio=decrease", outputHeight),
+			"-vf", captureFrameFilter(outputHeight, portrait),
 			"-q:v", "2",
 			tempPath,
 		)
@@ -551,6 +551,16 @@ func (t *ThumbnailService) FFmpegDiagnostics() ProcessDiagnostics {
 		return ProcessDiagnostics{}
 	}
 	return t.ffmpegGovernor.diagnostics()
+}
+
+// captureFrameFilter scales the frame to outputHeight; portrait first takes a
+// centered 2:3 slice so generated posters match the poster editor's ratio.
+func captureFrameFilter(outputHeight int, portrait bool) string {
+	scale := fmt.Sprintf("scale=-2:%d:force_original_aspect_ratio=decrease", outputHeight)
+	if !portrait {
+		return scale
+	}
+	return "crop='min(iw,ih*2/3)':'min(ih,iw*3/2)'," + scale
 }
 
 func mediaDurationSeconds(media *model.Media) float64 {
