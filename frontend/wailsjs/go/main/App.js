@@ -6,6 +6,10 @@ export function AssistantCurrentConversation() {
   return window['go']['main']['App']['AssistantCurrentConversation']();
 }
 
+export function AssistantDecide(arg1, arg2) {
+  return window['go']['main']['App']['AssistantDecide'](arg1, arg2);
+}
+
 export function AssistantDeleteConversation(arg1) {
   return window['go']['main']['App']['AssistantDeleteConversation'](arg1);
 }
@@ -22,8 +26,12 @@ export function AssistantOpenConversation(arg1) {
   return window['go']['main']['App']['AssistantOpenConversation'](arg1);
 }
 
-export function AssistantSend(arg1) {
-  return window['go']['main']['App']['AssistantSend'](arg1);
+export function AssistantPendingProposal() {
+  return window['go']['main']['App']['AssistantPendingProposal']();
+}
+
+export function AssistantSend(arg1, arg2) {
+  return window['go']['main']['App']['AssistantSend'](arg1, arg2);
 }
 
 export function AssistantStop() {

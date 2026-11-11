@@ -37,6 +37,7 @@ type anthropicBackend struct {
 	model    string
 	fallback bool
 	effort   string
+	forced   string // 下一轮强制调用的工具，用一次就清掉
 	tools    []anthropic.ToolUnionParam
 	history  []anthropic.MessageParam
 }
@@ -79,6 +80,8 @@ func (b *anthropicBackend) addAssistant(text string) {
 
 func (b *anthropicBackend) setEffort(effort string) { b.effort = effort }
 
+func (b *anthropicBackend) forceTool(name string) { b.forced = name }
+
 func (b *anthropicBackend) next(ctx context.Context) (roundResult, error) {
 	// effort 只在用户选了推理强度时才带，默认时用模型自己的（Claude Opus 5.5 默认 medium），
 	// 也免得不认这个参数的模型报错。
@@ -96,7 +99,11 @@ func (b *anthropicBackend) next(ctx context.Context) (roundResult, error) {
 		params.Thinking = anthropic.ThinkingConfigParamUnion{OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{
 			Display: anthropic.ThinkingConfigAdaptiveDisplaySummarized,
 		}}
+	} else if b.forced != "" {
+		// 开着思考时接口不允许指定工具，只能靠追加的那句提示。
+		params.ToolChoice = anthropic.ToolChoiceParamOfTool(b.forced)
 	}
+	b.forced = ""
 	if b.effort != "" {
 		params.OutputConfig = anthropic.OutputConfigParam{Effort: anthropic.OutputConfigEffort(b.effort)}
 	}

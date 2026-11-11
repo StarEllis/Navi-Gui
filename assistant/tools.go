@@ -48,6 +48,70 @@ var toolSpecs = []toolSpec{
 		},
 		Required: []string{"media_ids"},
 	},
+	{
+		Name: toolProposeChange,
+		Description: "提出一次修改。界面会先给用户看确认卡片，用户点了执行才会真的改，然后把执行结果返回给你。" +
+			"一次只做一种 action。action 取值：" +
+			"favorite / unfavorite（收藏、取消收藏）；watched / unwatched（标成已看、未看）；" +
+			"set_rating（我的评分，rating 1~5，0 表示清掉）；add_tag / remove_tag（用户自建标签，tag 传标签名，加的时候没有就新建）；" +
+			"edit_fields（改影片信息，写进影片旁边的 NFO 文件：fields 里放要整体替换的字段，add_genres / remove_genres 增删单个分类）；" +
+			"backfill_resources（联网补预告片和剧照，只补缺的）；" +
+			"rescan_library（重新扫描媒体库，传 library_id 和 scan_mode）；" +
+			"remove_from_library（把影片记录从库里移除，不删视频文件）；" +
+			"rename_tag（标签改名：tag 原名，new_name 新名）；merge_tags（把 tag 并进 into_tag，tag 删掉，打过它的片都改打 into_tag）；" +
+			"delete_tag（删掉标签 tag，片子本身不动）。这三个不用传 media_ids；" +
+			"delete_files（删视频文件：连同封面、NFO 挪到同一个盘的 Navi回收站 文件夹，再从库里移除。只有完全权限能用，一次最多 20 部）。",
+		Properties: map[string]any{
+			"action": map[string]any{
+				"type": "string",
+				"enum": []string{"favorite", "unfavorite", "watched", "unwatched", "set_rating", "add_tag", "remove_tag",
+					"edit_fields", "backfill_resources", "rescan_library", "remove_from_library", "delete_files",
+					"rename_tag", "merge_tags", "delete_tag"},
+			},
+			"media_ids": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "要改的影片 media.id，rescan_library 和标签管理不用传",
+			},
+			"rating":     map[string]any{"type": "integer", "description": "set_rating 用，1~5，0 表示清掉"},
+			"tag":        map[string]any{"type": "string", "description": "标签名：add_tag / remove_tag 要加或去的，rename_tag / merge_tags / delete_tag 要处理的那个"},
+			"new_name":   map[string]any{"type": "string", "description": "rename_tag 用，新名字"},
+			"into_tag":   map[string]any{"type": "string", "description": "merge_tags 用，并进去的那个标签名（留下的）"},
+			"library_id": map[string]any{"type": "string", "description": "rescan_library 用，libraries.id"},
+			"scan_mode": map[string]any{
+				"type":        "string",
+				"enum":        []string{"incremental", "delete_update", "overwrite"},
+				"description": "rescan_library 用：incremental 只加新片（默认）；delete_update 加新片、清掉已不存在的、更新改过的；overwrite 全部重新读一遍",
+			},
+			"fields": map[string]any{
+				"type":                 "object",
+				"additionalProperties": map[string]any{"type": "string"},
+				"description": "edit_fields 用，字段名 → 新值，整体替换。可用字段：title 标题、code 番号、release_date 发行日期（YYYY-MM-DD）、" +
+					"director 导演、series 系列、publisher 发行商、maker 片商、genres 分类（多个用 / 分隔）、actors 演员（多个用 / 分隔）、" +
+					"plot 简介、runtime 片长（分钟）、rating 网站评分",
+			},
+			"add_genres":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "edit_fields 用，要加的分类"},
+			"remove_genres": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "edit_fields 用，要去掉的分类"},
+		},
+		Required: []string{"action"},
+	},
+	{
+		Name:        toolOpenFolder,
+		Description: "在资源管理器里打开影片所在的文件夹，不用确认。用户想删视频文件时用它，让用户自己删。一次最多 10 部。",
+		Properties: map[string]any{
+			"media_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+		},
+		Required: []string{"media_ids"},
+	},
+	{
+		Name: toolPlayMedia,
+		Description: "用播放器播放一部影片，不用确认。用户说「放」「播」「看一部」时用它；" +
+			"要随便挑一部就先用 run_sql 加 ORDER BY RANDOM() LIMIT 1 选出来。一次只放一部。",
+		Properties: map[string]any{
+			"media_id": map[string]any{"type": "string", "description": "media 表的 id"},
+		},
+		Required: []string{"media_id"},
+	},
 }
 
 type toolCall struct {
@@ -94,6 +158,8 @@ type turnState struct {
 	shown map[string]bool
 	// queriedMedia 记下这一轮有没有查出过带 id 列的结果，用来判断是不是找片的问题。
 	queriedMedia bool
+	changes      []Proposal
+	permission   string
 }
 
 func (s *Session) runTool(ctx context.Context, call toolCall, turn *turnState) toolResult {
@@ -105,6 +171,12 @@ func (s *Session) runTool(ctx context.Context, call toolCall, turn *turnState) t
 		step, content, err = s.runSQL(ctx, call.Input, turn)
 	case toolShowMedia:
 		step, content, err = s.showMedia(ctx, call.Input, turn)
+	case toolProposeChange:
+		step, content, err = s.proposeChange(ctx, call.Input, turn)
+	case toolOpenFolder:
+		step, content, err = s.openFolder(call.Input)
+	case toolPlayMedia:
+		step, content, err = s.playMedia(ctx, call.Input, turn)
 	default:
 		step = Step{Tool: call.Name}
 		err = fmt.Errorf("没有这个工具：%s", call.Name)

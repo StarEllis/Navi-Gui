@@ -41,6 +41,7 @@ import {
     Play,
     Plus,
     RotateCcw,
+    Sparkles,
     Trash2,
     UserRound,
     X,
@@ -94,6 +95,7 @@ interface MediaDetailProps {
     onSelectFilter: (filter: MediaFilter) => void;
     onMediaChange?: (media: AppMedia) => void;
     onMediaDelete?: (mediaID: string) => void;
+    onAskAssistant?: (media: AppMedia) => void;
 }
 
 interface DetailActor {
@@ -447,6 +449,7 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
     onSelectFilter,
     onMediaChange,
     onMediaDelete,
+    onAskAssistant,
 }) => {
     const [detail, setDetail] = useState(media);
     const [isOverviewExpanded, setIsOverviewExpanded] = useState(false);
@@ -1527,6 +1530,17 @@ const MediaDetail: React.FC<MediaDetailProps> = ({
                                     {detail.is_watched ? <EyeOff size={16} /> : <Eye size={16} />}
                                     <span>{detail.is_watched ? '标记未看' : '标记已看'}</span>
                                 </button>
+                                {onAskAssistant && (
+                                    <button
+                                        type="button"
+                                        className="navi-outline-btn navi-ask-btn"
+                                        title="带着这部片去问助手：找类似的、查同演员的片……"
+                                        onClick={() => onAskAssistant(detail)}
+                                    >
+                                        <Sparkles size={16} />
+                                        <span>问助手</span>
+                                    </button>
+                                )}
 
                                 <span className="navi-detail-rating-divider" aria-hidden="true" />
 

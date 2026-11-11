@@ -100,9 +100,12 @@ const AssistantSettingsModal: React.FC<Props> = ({ settings, onClose, onSaved })
                 api_key: selected.api_key,
                 model: '',
             }));
-            const fresh = models.filter((m) => !selected.models.includes(m)).length;
-            addModels(models);
-            flash({ kind: 'ok', text: fresh > 0 ? `新增 ${fresh} 个模型` : '没有新模型' });
+            // 以接口这次返回的为准，整个替换掉，不和上次的叠在一起
+            const added = models.filter((m) => !selected.models.includes(m)).length;
+            const removed = selected.models.filter((m) => !models.includes(m)).length;
+            updateSelected({ models });
+            const changes = [added > 0 && `新增 ${added}`, removed > 0 && `移除 ${removed}`].filter(Boolean).join('，');
+            flash({ kind: 'ok', text: `拉取到 ${models.length} 个模型${changes ? `（${changes}）` : ''}` });
         } catch (error) {
             flash({ kind: 'error', text: `拉取失败：${formatError(error)}` });
         } finally {
@@ -119,6 +122,7 @@ const AssistantSettingsModal: React.FC<Props> = ({ settings, onClose, onSaved })
         try {
             // 当前在用的预设被删了，后端会退回第一个
             const saved = await SaveAssistantSettings(assistant.Settings.createFrom({
+                ...settings, // 推理强度、权限这些不在弹窗里改，原样带上
                 presets: draft,
                 active_preset: settings.active_preset,
                 active_model: settings.active_model,

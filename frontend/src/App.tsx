@@ -32,7 +32,7 @@ import CategoryGrid, {
 } from './components/CategoryGrid';
 import SettingsPage from './components/SettingsPage';
 import TagsPage from './components/TagsPage';
-import AssistantPage from './components/AssistantPage';
+import AssistantPage, { askAssistantAbout } from './components/AssistantPage';
 import { FilterConditionBar, FilterPanel, type FilterFacets } from './components/FilterPanel';
 import LibraryModal from './components/LibraryModal';
 import LibraryEditModal from './components/LibraryEditModal';
@@ -482,6 +482,14 @@ function App() {
         }, 5000);
     }, []);
 
+    // 助手要你确认修改时人不在助手页：提醒一下，不然助手会一直等着。
+    useEffect(() => {
+        if (view === 'assistant') return;
+        return EventsOn('assistant-confirm', () => {
+            showStatus('助手在等你确认一项修改', 'info', { label: '去确认', onClick: () => setView('assistant') });
+        });
+    }, [view, showStatus]);
+
     const startScanForLibrary = async (libraryId: string, mode: string) => {
         scanModeRef.current = mode;
         const generation = beginScanRequest(scanTaskLifecycleRef.current, libraryId);
@@ -897,6 +905,13 @@ function App() {
             })
             .catch((error: unknown) => showStatus(`无法打开影片：${formatError(error)}`, 'error'));
     }, [handleSelectMedia, showStatus]);
+
+    // 详情页"问助手"：片子挂到助手输入框上，关掉详情，切到助手页。
+    const askAssistantFromDetail = useCallback((media: any) => {
+        askAssistantAbout(media);
+        setSelectedMedia(null);
+        setView('assistant');
+    }, []);
 
     const handleDetailMediaChange = useCallback((media: any) => {
         seedMediaDetailCache(media);
@@ -1448,6 +1463,7 @@ function App() {
                                     onSelectFilter={applyFilterFromDetail}
                                     onMediaChange={handleDetailMediaChange}
                                     onMediaDelete={handleDetailDelete}
+                                    onAskAssistant={askAssistantFromDetail}
                                 />
                             </div>
                         )}

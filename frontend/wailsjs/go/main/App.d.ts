@@ -8,6 +8,8 @@ import {service} from '../models';
 
 export function AssistantCurrentConversation():Promise<assistant.Conversation>;
 
+export function AssistantDecide(arg1:string,arg2:boolean):Promise<void>;
+
 export function AssistantDeleteConversation(arg1:string):Promise<void>;
 
 export function AssistantListConversations():Promise<Array<assistant.ConversationSummary>>;
@@ -16,7 +18,9 @@ export function AssistantNewConversation():Promise<void>;
 
 export function AssistantOpenConversation(arg1:string):Promise<assistant.Conversation>;
 
-export function AssistantSend(arg1:string):Promise<assistant.Conversation>;
+export function AssistantPendingProposal():Promise<assistant.Proposal>;
+
+export function AssistantSend(arg1:string,arg2:string):Promise<assistant.Conversation>;
 
 export function AssistantStop():Promise<void>;
 

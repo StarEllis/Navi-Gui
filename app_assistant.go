@@ -9,7 +9,10 @@ import (
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-const assistantStepEvent = "assistant-step"
+const (
+	assistantStepEvent    = "assistant-step"
+	assistantConfirmEvent = "assistant-confirm"
+)
 
 var (
 	assistantSettingsPath     = config.DataPath("assistant.json")
@@ -41,7 +44,8 @@ func (a *App) ListAssistantModels(cfg *assistant.Config) ([]string, error) {
 }
 
 // AssistantSend 把一句话交给助手，等它查完再返回整段会话。查询过程通过 assistant-step 事件实时推给前端。
-func (a *App) AssistantSend(text string) (*assistant.Conversation, error) {
+// mediaID 不为空表示这句话是从这部片的详情页问的。
+func (a *App) AssistantSend(text, mediaID string) (*assistant.Conversation, error) {
 	session, err := a.assistantSession()
 	if err != nil {
 		return nil, err
@@ -51,13 +55,30 @@ func (a *App) AssistantSend(text string) (*assistant.Conversation, error) {
 		return nil, err
 	}
 	cfg, _ := settings.Active() // 配置不完整时由 Send 记成一条出错消息
-	return session.Send(a.ctx, cfg, text)
+	return session.SendAbout(a.ctx, cfg, text, mediaID)
 }
 
 func (a *App) AssistantStop() {
 	if session := a.currentAssistantSession(); session != nil {
 		session.Stop()
 	}
+}
+
+// AssistantDecide 是确认卡片上的"执行"（approve=true）和"取消"。
+func (a *App) AssistantDecide(proposalID string, approve bool) error {
+	session := a.currentAssistantSession()
+	if session == nil {
+		return errors.New("这张确认卡片已经失效了")
+	}
+	return session.Decide(proposalID, approve)
+}
+
+// AssistantPendingProposal 返回正在等确认的卡片，没有就是 null。
+func (a *App) AssistantPendingProposal() *assistant.Proposal {
+	if session := a.currentAssistantSession(); session != nil {
+		return session.Pending()
+	}
+	return nil
 }
 
 // AssistantCurrentConversation 返回当前打开的会话，没有就是 null。
@@ -122,6 +143,10 @@ func (a *App) assistantSession() (*assistant.Session, error) {
 	session := assistant.NewSession(sandbox, desktopUserID, assistantConversationsDir)
 	session.OnStep = func(step assistant.Step) {
 		wailsRuntime.EventsEmit(a.ctx, assistantStepEvent, step)
+	}
+	session.Executor = assistantExecutor{app: a}
+	session.OnConfirm = func(proposal assistant.Proposal) {
+		wailsRuntime.EventsEmit(a.ctx, assistantConfirmEvent, proposal)
 	}
 	a.assistant = session
 	return session, nil

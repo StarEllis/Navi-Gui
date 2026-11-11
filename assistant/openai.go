@@ -18,6 +18,7 @@ type openAIBackend struct {
 	apiKey     string
 	model      string
 	effort     string
+	forced     string // 下一轮强制调用的工具，用一次就清掉
 	tools      []map[string]any
 	history    []map[string]any
 }
@@ -61,6 +62,8 @@ func (b *openAIBackend) addAssistant(text string) {
 
 func (b *openAIBackend) setEffort(effort string) { b.effort = effort }
 
+func (b *openAIBackend) forceTool(name string) { b.forced = name }
+
 type openAIResponse struct {
 	Choices []struct {
 		FinishReason string `json:"finish_reason"`
@@ -91,6 +94,10 @@ func (b *openAIBackend) next(ctx context.Context) (roundResult, error) {
 	// 只在用户选了推理强度时才带：不支持推理的模型见到这个字段可能报错。
 	if b.effort != "" {
 		request["reasoning_effort"] = b.effort
+	}
+	if b.forced != "" {
+		request["tool_choice"] = map[string]any{"type": "function", "function": map[string]any{"name": b.forced}}
+		b.forced = ""
 	}
 	body, err := json.Marshal(request)
 	if err != nil {

@@ -2599,6 +2599,21 @@ body {
   color: var(--navi-play-ink);
 }
 
+/* 问助手：和收藏同款外框，图标带一点淡紫，悬停时边框亮起来 */
+.navi-ask-btn svg {
+  color: #d8c4f2;
+  transition: transform 0.2s ease;
+}
+
+.navi-ask-btn:hover {
+  border-color: rgba(216, 196, 242, 0.45);
+  background: rgba(216, 196, 242, 0.1);
+}
+
+.navi-ask-btn:hover svg {
+  transform: rotate(-12deg) scale(1.08);
+}
+
 /* 三个文件操作跟播放/收藏同排，中间一条竖线分档 */
 .navi-detail-actions-divider {
   width: 1px;

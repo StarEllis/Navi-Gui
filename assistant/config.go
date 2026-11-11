@@ -15,7 +15,18 @@ const (
 
 	defaultAnthropicModel = "claude-opus-5-5"
 	defaultOpenAIBaseURL  = "https://api.openai.com/v1"
+
+	// 助手的三档权限。
+	PermissionReadOnly = "readonly" // 只能查
+	PermissionEdit     = "edit"     // 能改，每次都要用户确认
+	PermissionFull     = "full"     // 小改动直接做，还能删视频文件
 )
+
+var permissionLabels = map[string]string{
+	PermissionReadOnly: "仅可查看",
+	PermissionEdit:     "可以修改",
+	PermissionFull:     "完全权限",
+}
 
 // Config 是真正发请求要用的那一组：接口类型、地址、Key、模型。
 type Config struct {
@@ -25,6 +36,8 @@ type Config struct {
 	Model   string `json:"model"`
 	// Effort 是推理强度：low / medium / high，空表示不传、用模型默认。
 	Effort string `json:"effort"`
+	// Permission 是 readonly / edit / full，空当 edit。
+	Permission string `json:"permission"`
 }
 
 // Preset 是一套命名的接口配置，下面挂着拉到或手填的模型。
@@ -43,6 +56,7 @@ type Settings struct {
 	ActivePreset string   `json:"active_preset"`
 	ActiveModel  string   `json:"active_model"`
 	Effort       string   `json:"effort"`
+	Permission   string   `json:"permission"`
 }
 
 func LoadSettings(path string) (Settings, error) {
@@ -112,6 +126,7 @@ func (s Settings) normalized() Settings {
 	default:
 		s.Effort = ""
 	}
+	s.Permission = normalizePermission(s.Permission)
 	for i, p := range s.Presets {
 		p.ID = strings.TrimSpace(p.ID)
 		p.Name = strings.TrimSpace(p.Name)
@@ -167,7 +182,7 @@ func (s Settings) Active() (Config, error) {
 	if preset == nil {
 		return Config{}, errors.New("还没有接口预设，先到助手设置里新建一个")
 	}
-	cfg := Config{APIType: preset.APIType, BaseURL: preset.BaseURL, APIKey: preset.APIKey, Model: s.ActiveModel, Effort: s.Effort}
+	cfg := Config{APIType: preset.APIType, BaseURL: preset.BaseURL, APIKey: preset.APIKey, Model: s.ActiveModel, Effort: s.Effort, Permission: s.Permission}
 	return cfg, cfg.validate()
 }
 
@@ -192,6 +207,13 @@ func (c Config) validate() error {
 		return errors.New("这个预设下还没有模型，先拉取或手动添加一个")
 	}
 	return nil
+}
+
+func normalizePermission(permission string) string {
+	if _, ok := permissionLabels[permission]; ok {
+		return permission
+	}
+	return PermissionEdit
 }
 
 func contains(list []string, value string) bool {

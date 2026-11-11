@@ -1,5 +1,49 @@
 export namespace assistant {
 	
+	export class Proposal {
+	    id: string;
+	    title: string;
+	    lines: string[];
+	    media: MediaCard[];
+	    danger: boolean;
+	    auto: boolean;
+	    status: string;
+	    result: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Proposal(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.title = source["title"];
+	        this.lines = source["lines"];
+	        this.media = this.convertValues(source["media"], MediaCard);
+	        this.danger = source["danger"];
+	        this.auto = source["auto"];
+	        this.status = source["status"];
+	        this.result = source["result"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	export class MediaCard {
 	    id: string;
 	    code: string;
@@ -59,6 +103,7 @@ export namespace assistant {
 	    text: string;
 	    steps?: Step[];
 	    media?: MediaCard[];
+	    changes?: Proposal[];
 	
 	    static createFrom(source: any = {}) {
 	        return new ChatItem(source);
@@ -70,6 +115,7 @@ export namespace assistant {
 	        this.text = source["text"];
 	        this.steps = this.convertValues(source["steps"], Step);
 	        this.media = this.convertValues(source["media"], MediaCard);
+	        this.changes = this.convertValues(source["changes"], Proposal);
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -96,6 +142,7 @@ export namespace assistant {
 	    api_key: string;
 	    model: string;
 	    effort: string;
+	    permission: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new Config(source);
@@ -108,6 +155,7 @@ export namespace assistant {
 	        this.api_key = source["api_key"];
 	        this.model = source["model"];
 	        this.effort = source["effort"];
+	        this.permission = source["permission"];
 	    }
 	}
 	export class Conversation {
@@ -185,11 +233,13 @@ export namespace assistant {
 	        this.models = source["models"];
 	    }
 	}
+	
 	export class Settings {
 	    presets: Preset[];
 	    active_preset: string;
 	    active_model: string;
 	    effort: string;
+	    permission: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new Settings(source);
@@ -201,6 +251,7 @@ export namespace assistant {
 	        this.active_preset = source["active_preset"];
 	        this.active_model = source["active_model"];
 	        this.effort = source["effort"];
+	        this.permission = source["permission"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
