@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 )
@@ -134,13 +135,14 @@ func (s *Session) SendAbout(ctx context.Context, cfg Config, text, mediaID strin
 
 	// 改 conv.Items 都在锁里做，Current 同时来读也不会读到一半。
 	s.mu.Lock()
+	followUp := lastReplyShowedMedia(conv.Items)
 	conv.Items = append(conv.Items, question)
 	s.mu.Unlock()
 	var reply ChatItem
 	if err := cfg.validate(); err != nil {
 		reply = ChatItem{Role: "error", Text: err.Error()}
 	} else {
-		reply = s.runTurn(ctx, b, questionFor(question), cfg)
+		reply = s.runTurn(ctx, b, questionFor(question), cfg, followUp)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -154,15 +156,28 @@ func (s *Session) SendAbout(ctx context.Context, cfg Config, text, mediaID strin
 // runTurn 处理完一句话后，把这句话里的工具调用、查询结果、补卡片的催促都截掉，
 // 只留问答的纯文本（和重开会话时一样）：历史不会被查询结果越撑越大，
 // 中途出错但已经改过东西时，模型也记得改过什么。
-func (s *Session) runTurn(ctx context.Context, b backend, text string, cfg Config) ChatItem {
+func (s *Session) runTurn(ctx context.Context, b backend, text string, cfg Config, followUp bool) ChatItem {
 	mark := b.mark()
-	item := s.runRounds(ctx, b, text, cfg)
+	item := s.runRounds(ctx, b, text, cfg, followUp)
 	b.rollback(mark)
 	replayTurn(b, text, item)
 	return item
 }
 
-func (s *Session) runRounds(ctx context.Context, b backend, text string, cfg Config) ChatItem {
+// lastReplyShowedMedia 看上一句回答有没有摆出卡片：有的话，这句多半是在追问那批片。
+func lastReplyShowedMedia(items []ChatItem) bool {
+	for i := len(items) - 1; i >= 0; i-- {
+		if items[i].Role == "assistant" {
+			return len(items[i].Media) > 0
+		}
+	}
+	return false
+}
+
+// 回答里在数片子："剩下 13 部""这几部""这些片"。追问时靠它判断回答是不是在说一批片。
+var filmCountPattern = regexp.MustCompile(`[0-9０-９一二两三四五六七八九十百几]+\s*部|这些片|那些片|剩下的`)
+
+func (s *Session) runRounds(ctx context.Context, b backend, text string, cfg Config, followUp bool) ChatItem {
 	permission := normalizePermission(cfg.Permission)
 	turn := &turnState{steps: []Step{}, media: []MediaCard{}, shown: map[string]bool{}, permission: permission, embedding: cfg.Embedding}
 	// 这句话中途失败，但前面已经改过东西了：得在出错消息里说清楚，不能当没发生。
@@ -215,7 +230,9 @@ func (s *Session) runRounds(ctx context.Context, b backend, text string, cfg Con
 				s.showMediaFromAnswer(ctx, answer, turn)
 			}
 			// 查出了片子却既没展示、回答里也没番号：催模型补调一次 show_media，只催一次。
-			if len(turn.media) == 0 && turn.queriedMedia && pending == "" {
+			// 追问上一批片（"去掉 MIDV 的，剩下的呢"）时不用再查库，回答里在数片子也算。
+			aboutFilms := turn.queriedMedia || (followUp && filmCountPattern.MatchString(answer))
+			if len(turn.media) == 0 && aboutFilms && pending == "" {
 				pending = answer
 				b.addUser(showMediaNudge)
 				// 光提醒不够：有的模型只在文字里说「卡片在下面」却不调工具，这一轮直接强制它调。
